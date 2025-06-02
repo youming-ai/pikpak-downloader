@@ -1,6 +1,6 @@
 # PikPak Downloader
 
-[中文说明 (Chinese README)](./README.md)
+[English](./README.md) | [中文](./README_CN.md) | [日本語](./README_JA.md)
 
 A Python tool for batch downloading folders and files from PikPak share links.
 
