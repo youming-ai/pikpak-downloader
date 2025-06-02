@@ -14,16 +14,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 class PikPakDownloader:
     BASE_URL = "https://api-drive.mypikpak.com/v1"
-    SHARE_BASE_URL = "https://api-drive.mypikpak.com/v1"
-    
-    def __init__(self, max_workers: int = 3):
+    SHARE_BASE_URL = BASE_URL
+    def __init__(self, max_workers: int = 2):
         self.session = requests.Session()
-        self.max_workers = max_workers
-        # 设置请求头，模拟浏览器访问
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         })
-    
+        self.max_workers = max_workers
+
     def get_share_info(self, share_url: str) -> Dict:
         """获取分享链接信息"""
         parsed_url = urlparse(share_url)
@@ -150,114 +148,52 @@ class PikPakDownloader:
             print(f"✗ 下载失败 {filepath.name}: {e}")
             return False
     
-    def download_folder_recursive(self, share_id: str, folder_id: str, output_path: Path) -> None:
-        """递归下载文件夹内容"""
-        files = self.get_share_files(share_id, parent_id=folder_id)
-        
-        if not files:
-            print(f"文件夹为空: {output_path}")
-            return
-        
-        # 分离文件和文件夹
-        file_items = []
-        folder_items = []
-        
-        for item in files:
-            if item["kind"] == "drive#file":
-                file_items.append(item)
-            elif item["kind"] == "drive#folder":
-                folder_items.append(item)
-        
-        print(f"发现 {len(file_items)} 个文件，{len(folder_items)} 个文件夹")
-        
-        # 下载文件
-        if file_items:
-            self.download_files_batch(share_id, file_items, output_path)
-        
-        # 递归下载子文件夹
-        for folder in folder_items:
-            folder_path = output_path / folder["name"]
-            folder_path.mkdir(parents=True, exist_ok=True)
-            print(f"\n进入文件夹: {folder['name']}")
-            self.download_folder_recursive(share_id, folder["id"], folder_path)
-    
     def download_files_batch(self, share_id: str, files: List[Dict], output_path: Path) -> None:
-        """批量下载文件"""
         def download_single_file(file_info):
             try:
                 file_path = output_path / file_info["name"]
                 download_url = self.get_download_url(share_id, file_info["id"])
-                success = self.download_file(download_url, file_path)
-                return success, file_info["name"]
+                return self.download_file(download_url, file_path), file_info["name"]
             except Exception as e:
                 print(f"下载文件 {file_info['name']} 时出错: {e}")
                 return False, file_info["name"]
-        
-        # 使用线程池进行并发下载
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            future_to_file = {executor.submit(download_single_file, file): file for file in files}
-            
-            success_count = 0
-            total_count = len(files)
-            
-            for future in as_completed(future_to_file):
-                success, filename = future.result()
-                if success:
-                    success_count += 1
-                
-                # 添加延迟避免请求过于频繁
-                time.sleep(0.5)
-        
-        print(f"\n批量下载完成: {success_count}/{total_count} 个文件成功下载")
-    
-    def process_share(self, share_url: str, output_dir: str = "/Download") -> None:
-        """处理分享链接，下载所有内容"""
+            results = list(tqdm(executor.map(download_single_file, files), total=len(files), desc="批量下载"))
+        success_count = sum(1 for success, _ in results if success)
+        print(f"\n批量下载完成: {success_count}/{len(files)} 个文件成功下载")
+
+    def download_folder_recursive(self, share_id: str, folder_id: str, output_path: Path) -> None:
+        files = self.get_share_files(share_id, parent_id=folder_id)
+        if not files:
+            print(f"文件夹为空: {output_path}")
+            return
+        file_items = [f for f in files if f["kind"] == "drive#file"]
+        folder_items = [f for f in files if f["kind"] == "drive#folder"]
+        if file_items:
+            self.download_files_batch(share_id, file_items, output_path)
+        for folder in folder_items:
+            self.download_folder_recursive(share_id, folder["id"], output_path / folder["name"])
+
+    def process_share(self, share_url: str, output_dir: str = "Download") -> None:
         try:
-            print(f"正在解析分享链接: {share_url}")
             share_info = self.get_share_info(share_url)
-            
             share_id = share_info["share_id"]
             share_name = share_info.get("share_name", "PikPak_Download")
-            
-            # 创建输出目录
             output_path = Path(output_dir) / share_name
             output_path.mkdir(parents=True, exist_ok=True)
-            
-            print(f"下载目录: {output_path}")
-            print(f"分享名称: {share_name}")
-            
-            # 开始递归下载
             self.download_folder_recursive(share_id, share_info["file_id"], output_path)
-            
             print(f"\n🎉 所有文件已下载到: {output_path}")
-            
-        except requests.exceptions.RequestException as e:
-            print(f"❌ 网络请求错误: {e}")
-            print("提示: 可能需要检查网络连接或分享链接是否有效")
-            sys.exit(1)
         except Exception as e:
-            print(f"❌ 下载过程中发生错误: {e}")
+            print(f"❌ 错误: {e}")
             sys.exit(1)
 
 def main():
     if len(sys.argv) < 2:
-        print("使用方法: python pikpak_downloader.py <分享链接> [下载目录]")
-        print("示例: python pikpak_downloader.py https://mypikpak.com/s/xxx/xxx")
-        print("示例: python pikpak_downloader.py https://mypikpak.com/s/xxx/xxx /Users/username/Downloads")
+        print("用法: python pikpak_downloader.py <分享链接> [下载目录]")
         sys.exit(1)
-    
     share_url = sys.argv[1]
-    output_dir = sys.argv[2] if len(sys.argv) > 2 else "/Download"
-    
-    # 创建下载器实例，可以调整并发数
-    downloader = PikPakDownloader(max_workers=2)  # 降低并发数避免被限制
-    
-    print("=== PikPak 批量下载器 ===")
-    print(f"分享链接: {share_url}")
-    print(f"下载目录: {output_dir}")
-    print("开始下载...\n")
-    
-    downloader.process_share(share_url, output_dir)
+    output_dir = sys.argv[2] if len(sys.argv) > 2 else "Download"
+    PikPakDownloader().process_share(share_url, output_dir)
 
 if __name__ == "__main__":
     main()
