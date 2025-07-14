@@ -12,6 +12,12 @@ from tqdm import tqdm
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# 导入优化模块
+from config import config
+from exceptions import *
+from logger import init_logging, get_logger, DownloadLogger
+from utils import validate_share_url, sanitize_filename, format_size
+
 class PikPakDownloader:
     BASE_URL = "https://api-drive.mypikpak.com/v1"
     SHARE_BASE_URL = BASE_URL
