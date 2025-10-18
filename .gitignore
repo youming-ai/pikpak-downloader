@@ -1,4 +1,22 @@
-# Environment variables
-.env
+# Build
+pikpak-downloader
+*.exe
+*.so
+*.dylib
+*.test
+*.out
 
-.specstory
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Downloads
+downloads/
+
+# Environment
+.env*
