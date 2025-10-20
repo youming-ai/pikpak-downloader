@@ -10,14 +10,14 @@ import (
 	"time"
 )
 
-// PikPakClient PikPak客户端
+// PikPakClient PikPak client
 type PikPakClient struct {
 	cliPath    string
 	configPath string
 	debugMode  bool
 }
 
-// FileInfo 文件信息结构
+// FileInfo file information structure
 type FileInfo struct {
 	ID          string    `json:"id"`
 	Name        string    `json:"name"`
@@ -35,13 +35,13 @@ type FileInfo struct {
 	DownloadURL string    `json:"download_url"`
 }
 
-// QuotaInfo 配额信息
+// QuotaInfo quota information
 type QuotaInfo struct {
 	Total int64 `json:"total"`
 	Used  int64 `json:"used"`
 }
 
-// NewPikPakClient 创建PikPak客户端
+// NewPikPakClient create PikPak client
 func NewPikPakClient() *PikPakClient {
 	return &PikPakClient{
 		cliPath:    filepath.Join(os.Getenv("HOME"), "go", "bin", "pikpakcli"),
@@ -50,43 +50,43 @@ func NewPikPakClient() *PikPakClient {
 	}
 }
 
-// SetDebug 设置调试模式
+// SetDebug set debug mode
 func (p *PikPakClient) SetDebug(debug bool) {
 	p.debugMode = debug
 }
 
-// CheckConfig 检查配置
+// CheckConfig check configuration
 func (p *PikPakClient) CheckConfig() error {
-	// 加载配置
+	// Load configuration
 	config, err := LoadConfig()
 	if err != nil {
-		return fmt.Errorf("加载配置失败: %v", err)
+		return fmt.Errorf("Failed to load configuration: %v", err)
 	}
 
-	// 检查是否已配置
+	// Check if configured
 	if !config.IsConfigured() {
-		return fmt.Errorf("请先在 .env 文件中配置 PikPak 认证信息")
+		return fmt.Errorf("Please configure PikPak authentication in .env file")
 	}
 
-	// 生成配置文件
+	// Generate configuration file
 	if err := config.GeneratePikPakCLIConfig(); err != nil {
-		return fmt.Errorf("生成配置文件失败: %v", err)
+		return fmt.Errorf("Failed to generate configuration file: %v", err)
 	}
 
-	// 验证配置
+	// Validate configuration
 	cmd := exec.Command(p.cliPath, "quota")
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("配置验证失败: %v", err)
+		return fmt.Errorf("Configuration validation failed: %v", err)
 	}
 
 	return nil
 }
 
-// ListFiles 列出文件
+// ListFiles list files
 func (p *PikPakClient) ListFiles(path string, longFormat bool, humanReadable bool) ([]FileInfo, error) {
 	var files []FileInfo
 
-	// 构建命令参数
+	// Build command arguments
 	args := []string{"ls", "--path", path}
 	if longFormat {
 		args = append(args, "--long")
@@ -101,10 +101,10 @@ func (p *PikPakClient) ListFiles(path string, longFormat bool, humanReadable boo
 	cmd := exec.Command(p.cliPath, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return nil, fmt.Errorf("列出文件失败: %v, 输出: %s", err, string(output))
+		return nil, fmt.Errorf("Failed to list files: %v, output: %s", err, string(output))
 	}
 
-	// 解析输出
+	// Parse output
 	lines := strings.Split(string(output), "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -112,14 +112,14 @@ func (p *PikPakClient) ListFiles(path string, longFormat bool, humanReadable boo
 			continue
 		}
 
-		// 如果是长格式，解析详细信息
+		// If long format, parse detailed information
 		if longFormat {
 			file := p.parseLongFormatLine(line)
 			if file.Name != "" {
 				files = append(files, file)
 			}
 		} else {
-			// 简单格式，只解析文件名
+			// Simple format, only parse filename
 			if line != "" {
 				files = append(files, FileInfo{
 					Name: line,
@@ -132,14 +132,14 @@ func (p *PikPakClient) ListFiles(path string, longFormat bool, humanReadable boo
 	return files, nil
 }
 
-// parseLongFormatLine 解析长格式输出
+// parseLongFormatLine parse long format output
 func (p *PikPakClient) parseLongFormatLine(line string) FileInfo {
 	parts := strings.Fields(line)
 	if len(parts) < 6 {
 		return FileInfo{}
 	}
 
-	// 解析大小
+	// Parse size
 	var size int64
 	var err error
 	if strings.Contains(parts[2], "GB") {
@@ -164,7 +164,7 @@ func (p *PikPakClient) parseLongFormatLine(line string) FileInfo {
 		size, _ = strconv.ParseInt(parts[2], 10, 64)
 	}
 
-	// 解析时间 (简化处理)
+	// Parse time (simplified handling)
 	fileName := strings.Join(parts[5:], " ")
 
 	return FileInfo{
@@ -174,7 +174,7 @@ func (p *PikPakClient) parseLongFormatLine(line string) FileInfo {
 	}
 }
 
-// detectFileType 检测文件类型
+// detectFileType detect file type
 func (p *PikPakClient) detectFileType(filename string) string {
 	ext := strings.ToLower(filepath.Ext(filename))
 
@@ -185,37 +185,37 @@ func (p *PikPakClient) detectFileType(filename string) string {
 
 	for _, imgExt := range imageExts {
 		if ext == imgExt {
-			return "图片"
+			return "Image"
 		}
 	}
 
 	for _, vidExt := range videoExts {
 		if ext == vidExt {
-			return "视频"
+			return "Video"
 		}
 	}
 
 	for _, docExt := range docExts {
 		if ext == docExt {
-			return "文档"
+			return "Document"
 		}
 	}
 
 	for _, archExt := range archiveExts {
 		if ext == archExt {
-			return "压缩包"
+			return "Archive"
 		}
 	}
 
-	// 如果没有扩展名，可能是文件夹
+	// If no extension, might be a folder
 	if ext == "" {
-		return "文件夹"
+		return "Folder"
 	}
 
-	return "其他"
+	return "Other"
 }
 
-// GetQuota 获取配额信息
+// GetQuota get quota information
 func (p *PikPakClient) GetQuota() (*QuotaInfo, error) {
 	args := []string{"quota"}
 	if p.debugMode {
@@ -225,17 +225,17 @@ func (p *PikPakClient) GetQuota() (*QuotaInfo, error) {
 	cmd := exec.Command(p.cliPath, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return nil, fmt.Errorf("获取配额失败: %v, 输出: %s", err, string(output))
+		return nil, fmt.Errorf("Failed to get quota: %v, output: %s", err, string(output))
 	}
 
 	return p.parseQuotaOutput(string(output))
 }
 
-// parseQuotaOutput 解析配额输出
+// parseQuotaOutput parse quota output
 func (p *PikPakClient) parseQuotaOutput(output string) (*QuotaInfo, error) {
 	lines := strings.Split(output, "\n")
 
-	// 查找表头行和数据行
+	// Find header row and data row
 	var totalStr, usedStr string
 	for i, line := range lines {
 		line = strings.TrimSpace(line)
@@ -243,9 +243,9 @@ func (p *PikPakClient) parseQuotaOutput(output string) (*QuotaInfo, error) {
 			continue
 		}
 
-		// 找到包含 "total" 和 "used" 的表头行
+		// Find header row containing "total" and "used"
 		if strings.Contains(line, "total") && strings.Contains(line, "used") {
-			// 下一行应该是数据行
+			// Next row should be data row
 			if i+1 < len(lines) {
 				dataLine := strings.TrimSpace(lines[i+1])
 				parts := strings.Fields(dataLine)
@@ -258,7 +258,7 @@ func (p *PikPakClient) parseQuotaOutput(output string) (*QuotaInfo, error) {
 		}
 	}
 
-	// 解析大小
+	// Parse size
 	total, _ := p.parseSize(totalStr)
 	used, _ := p.parseSize(usedStr)
 
@@ -268,7 +268,7 @@ func (p *PikPakClient) parseQuotaOutput(output string) (*QuotaInfo, error) {
 	}, nil
 }
 
-// parseSize 解析大小字符串
+// parseSize parse size string
 func (p *PikPakClient) parseSize(sizeStr string) (int64, error) {
 	sizeStr = strings.TrimSpace(sizeStr)
 	if sizeStr == "" {
@@ -291,7 +291,7 @@ func (p *PikPakClient) parseSize(sizeStr string) (int64, error) {
 			return int64(num * 1024), nil
 		}
 	} else if strings.Contains(sizeStr, "e+") {
-		// 处理科学计数法
+		// Handle scientific notation
 		if num, err := strconv.ParseFloat(sizeStr, 64); err == nil {
 			return int64(num), nil
 		}
@@ -299,17 +299,17 @@ func (p *PikPakClient) parseSize(sizeStr string) (int64, error) {
 		return strconv.ParseInt(sizeStr, 10, 64)
 	}
 
-	return 0, fmt.Errorf("无法解析大小: %s", sizeStr)
+	return 0, fmt.Errorf("Unable to parse size: %s", sizeStr)
 }
 
-// DownloadFile 下载文件或文件夹
+// DownloadFile download file or folder
 func (p *PikPakClient) DownloadFile(path string, outputDir string, concurrency int, showProgress bool) error {
-	// 创建输出目录
+	// Create output directory
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		return fmt.Errorf("创建输出目录失败: %v", err)
+		return fmt.Errorf("Failed to create output directory: %v", err)
 	}
 
-	// 构建命令参数
+	// Build command arguments
 	args := []string{"download", "--path", path, "--output", outputDir, "--count", strconv.Itoa(concurrency)}
 	if showProgress {
 		args = append(args, "--progress")
@@ -325,15 +325,15 @@ func (p *PikPakClient) DownloadFile(path string, outputDir string, concurrency i
 	return cmd.Run()
 }
 
-// PrintFiles 打印文件列表
+// PrintFiles print file list
 func (p *PikPakClient) PrintFiles(files []FileInfo, longFormat bool, humanReadable bool) {
 	if len(files) == 0 {
-		fmt.Println("目录为空")
+		fmt.Println("Directory is empty")
 		return
 	}
 
 	if longFormat {
-		fmt.Printf("%-10s %-12s %-20s %s\n", "类型", "大小", "修改时间", "文件名")
+		fmt.Printf("%-10s %-12s %-20s %s\n", "Type", "Size", "Modified", "Name")
 		fmt.Println(strings.Repeat("-", 70))
 
 		for _, file := range files {
@@ -348,7 +348,7 @@ func (p *PikPakClient) PrintFiles(files []FileInfo, longFormat bool, humanReadab
 	}
 }
 
-// formatSize 格式化大小显示
+// formatSize format size display
 func (p *PikPakClient) formatSize(size int64, humanReadable bool) string {
 	if !humanReadable {
 		return strconv.FormatInt(size, 10)

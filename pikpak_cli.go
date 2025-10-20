@@ -7,20 +7,20 @@ import (
 	"os"
 )
 
-// Command 命令结构
+// Command command structure
 type Command struct {
 	Name        string
 	Description string
 	Handler     func(args []string) error
 }
 
-// CLI 命令行界面
+// CLI command line interface
 type CLI struct {
 	client   *PikPakClient
 	commands map[string]Command
 }
 
-// NewCLI 创建CLI实例
+// NewCLI create CLI instance
 func NewCLI() *CLI {
 	client := NewPikPakClient()
 
@@ -29,34 +29,34 @@ func NewCLI() *CLI {
 		commands: make(map[string]Command),
 	}
 
-	// 注册命令
+	// Register commands
 	cli.registerCommands()
 	return cli
 }
 
-// registerCommands 注册所有命令
+// registerCommands register all commands
 func (c *CLI) registerCommands() {
 	c.commands["ls"] = Command{
 		Name:        "ls",
-		Description: "列出文件和目录",
+		Description: "List files and directories",
 		Handler:     c.handleList,
 	}
 
 	c.commands["download"] = Command{
 		Name:        "download",
-		Description: "下载文件或文件夹",
+		Description: "Download files or folders",
 		Handler:     c.handleDownload,
 	}
 
 	c.commands["quota"] = Command{
 		Name:        "quota",
-		Description: "查看云盘配额",
+		Description: "View cloud storage quota",
 		Handler:     c.handleQuota,
 	}
 
 	c.commands["help"] = Command{
 		Name:        "help",
-		Description: "显示帮助信息",
+		Description: "Show help information",
 		Handler:     c.handleHelp,
 	}
 }
@@ -72,143 +72,143 @@ func (c *CLI) Run(args []string) error {
 		return command.Handler(args[1:])
 	}
 
-	return fmt.Errorf("未知命令: %s", commandName)
+	return fmt.Errorf("Unknown command: %s", commandName)
 }
 
-// handleList 处理列表命令
+// handleList handle list command
 func (c *CLI) handleList(args []string) error {
 	flags := flag.NewFlagSet("ls", flag.ExitOnError)
-	path := flags.String("path", "/", "目录路径")
-	longFormat := flags.Bool("l", false, "长格式显示")
-	humanReadable := flags.Bool("h", false, "人类可读格式")
+	path := flags.String("path", "/", "Directory path")
+	longFormat := flags.Bool("l", false, "Long format display")
+	humanReadable := flags.Bool("h", false, "Human readable format")
 
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 
-	// 检查配置
+	// Check configuration
 	if err := c.client.CheckConfig(); err != nil {
-		return fmt.Errorf("配置检查失败: %v", err)
+		return fmt.Errorf("Configuration check failed: %v", err)
 	}
 
-	// 列出文件
+	// List files
 	files, err := c.client.ListFiles(*path, *longFormat, *humanReadable)
 	if err != nil {
 		return err
 	}
 
-	// 显示文件
+	// Display files
 	c.client.PrintFiles(files, *longFormat, *humanReadable)
 	return nil
 }
 
-// handleDownload 处理下载命令
+// handleDownload handle download command
 func (c *CLI) handleDownload(args []string) error {
 	flags := flag.NewFlagSet("download", flag.ExitOnError)
-	path := flags.String("path", "/", "下载路径")
-	outputDir := flags.String("output", "./downloads", "输出目录")
-	concurrency := flags.Int("count", 3, "并发数")
-	progress := flags.Bool("progress", true, "显示进度")
+	path := flags.String("path", "/", "Download path")
+	outputDir := flags.String("output", "./downloads", "Output directory")
+	concurrency := flags.Int("count", 3, "Concurrency count")
+	progress := flags.Bool("progress", true, "Show progress")
 
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 
-	// 检查配置
+	// Check configuration
 	if err := c.client.CheckConfig(); err != nil {
-		return fmt.Errorf("配置检查失败: %v", err)
+		return fmt.Errorf("Configuration check failed: %v", err)
 	}
 
-	fmt.Printf("📥 开始下载: %s\n", *path)
-	fmt.Printf("📁 输出目录: %s\n", *outputDir)
-	fmt.Printf("⚡ 并发数: %d\n", *concurrency)
+	fmt.Printf("📥 Starting download: %s\n", *path)
+	fmt.Printf("📁 Output directory: %s\n", *outputDir)
+	fmt.Printf("⚡ Concurrency: %d\n", *concurrency)
 
-	// 开始下载
+	// Start download
 	return c.client.DownloadFile(*path, *outputDir, *concurrency, *progress)
 }
 
-// handleQuota 处理配额命令
+// handleQuota handle quota command
 func (c *CLI) handleQuota(args []string) error {
 	flags := flag.NewFlagSet("quota", flag.ExitOnError)
-	humanReadable := flags.Bool("h", true, "人类可读格式")
+	humanReadable := flags.Bool("h", true, "Human readable format")
 
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 
-	// 检查配置
+	// Check configuration
 	if err := c.client.CheckConfig(); err != nil {
-		return fmt.Errorf("配置检查失败: %v", err)
+		return fmt.Errorf("Configuration check failed: %v", err)
 	}
 
-	// 获取配额信息
+	// Get quota information
 	quota, err := c.client.GetQuota()
 	if err != nil {
 		return err
 	}
 
-	// 显示配额信息
-	fmt.Println("📊 云盘配额信息:")
-	fmt.Printf("总容量: %s\n", c.client.formatSize(quota.Total, *humanReadable))
-	fmt.Printf("已使用: %s\n", c.client.formatSize(quota.Used, *humanReadable))
+	// Display quota information
+	fmt.Println("📊 Cloud storage quota information:")
+	fmt.Printf("Total capacity: %s\n", c.client.formatSize(quota.Total, *humanReadable))
+	fmt.Printf("Used: %s\n", c.client.formatSize(quota.Used, *humanReadable))
 
 	if quota.Total > 0 {
 		percentage := float64(quota.Used) / float64(quota.Total) * 100
-		fmt.Printf("使用率: %.1f%%\n", percentage)
+		fmt.Printf("Usage rate: %.1f%%\n", percentage)
 	}
 
 	return nil
 }
 
-// handleHelp 处理帮助命令
+// handleHelp handle help command
 func (c *CLI) handleHelp(args []string) error {
-	fmt.Println("PikPak 个人云盘管理工具")
+	fmt.Println("PikPak Personal Cloud Storage Management Tool")
 	fmt.Println("")
-	fmt.Println("用法: pikpak-downloader <命令> [参数]")
+	fmt.Println("Usage: pikpak-downloader <command> [parameters]")
 	fmt.Println("")
-	fmt.Println("可用命令:")
+	fmt.Println("Available commands:")
 
 	for name, cmd := range c.commands {
 		fmt.Printf("  %-10s %s\n", name, cmd.Description)
 	}
 
 	fmt.Println("")
-	fmt.Println("命令详情:")
+	fmt.Println("Command details:")
 	fmt.Println("")
 
-	// ls 命令详情
-	fmt.Println("ls - 列出文件和目录")
-	fmt.Println("  选项:")
-	fmt.Println("    -path string     目录路径 (默认: \"/\")")
-	fmt.Println("    -l               长格式显示")
-	fmt.Println("    -h               人类可读格式")
-	fmt.Println("  示例:")
+	// ls command details
+	fmt.Println("ls - List files and directories")
+	fmt.Println("  Options:")
+	fmt.Println("    -path string     Directory path (default: \"/\")")
+	fmt.Println("    -l               Long format display")
+	fmt.Println("    -h               Human readable format")
+	fmt.Println("  Examples:")
 	fmt.Println("    pikpak-downloader ls")
 	fmt.Println("    pikpak-downloader ls -path \"/My Pack\" -l -h")
 	fmt.Println("")
 
-	// download 命令详情
-	fmt.Println("download - 下载文件或文件夹")
-	fmt.Println("  选项:")
-	fmt.Println("    -path string     下载路径 (默认: \"/\")")
-	fmt.Println("    -output string   输出目录 (默认: \"./downloads\")")
-	fmt.Println("    -count int       并发数 (默认: 3)")
-	fmt.Println("    -progress        显示进度 (默认: true)")
-	fmt.Println("  示例:")
+	// download command details
+	fmt.Println("download - Download files or folders")
+	fmt.Println("  Options:")
+	fmt.Println("    -path string     Download path (default: \"/\")")
+	fmt.Println("    -output string   Output directory (default: \"./downloads\")")
+	fmt.Println("    -count int       Concurrency count (default: 3)")
+	fmt.Println("    -progress        Show progress (default: true)")
+	fmt.Println("  Examples:")
 	fmt.Println("    pikpak-downloader download -path \"/My Pack/video.mp4\"")
 	fmt.Println("    pikpak-downloader download -path \"/My Pack\" -output \"./my_downloads\"")
 	fmt.Println("")
 
-	// quota 命令详情
-	fmt.Println("quota - 查看云盘配额")
-	fmt.Println("  选项:")
-	fmt.Println("    -h               人类可读格式 (默认: true)")
-	fmt.Println("  示例:")
+	// quota command details
+	fmt.Println("quota - View cloud storage quota")
+	fmt.Println("  Options:")
+	fmt.Println("    -h               Human readable format (default: true)")
+	fmt.Println("  Examples:")
 	fmt.Println("    pikpak-downloader quota")
 	fmt.Println("")
 
-	fmt.Println("配置:")
-	fmt.Println("  在 .env 文件中配置 PikPak 认证信息:")
+	fmt.Println("Configuration:")
+	fmt.Println("  Configure PikPak authentication in .env file:")
 	fmt.Println("    PIKPAK_USERNAME=your_email@example.com")
 	fmt.Println("    PIKPAK_PASSWORD=your_password")
 	fmt.Println("    PIKPAK_REFRESH_TOKEN=your_refresh_token")
@@ -226,6 +226,6 @@ func main() {
 
 	cli := NewCLI()
 	if err := cli.Run(os.Args[1:]); err != nil {
-		log.Fatalf("错误: %v", err)
+		log.Fatalf("Error: %v", err)
 	}
 }
