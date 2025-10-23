@@ -1,12 +1,24 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
+
+// Global config cache
+var (
+	configCache atomic.Value // stores *Config
+	envCache    atomic.Value // stores map[string]string
+	envOnce     sync.Once
+)
+
+// Precompiled regex for efficient env parsing
+var envRegex = regexp.MustCompile(`^([A-Z_]+)=(.*)$`)
 
 // Config configuration structure
 type Config struct {
@@ -18,14 +30,19 @@ type Config struct {
 	DeviceName   string
 }
 
-// LoadConfig load configuration from environment variables and .env file
+// LoadConfig load configuration with caching
 func LoadConfig() (*Config, error) {
+	// Check cache first
+	if cached := configCache.Load(); cached != nil {
+		return cached.(*Config), nil
+	}
+
 	config := &Config{
 		DeviceName: "pikpak-downloader",
 	}
 
-	// Try to load .env file
-	if err := loadEnvFile(); err != nil {
+	// Try to load .env file with optimized method
+	if err := loadEnvFileOptimized(); err != nil {
 		fmt.Printf("⚠️  Unable to load .env file: %v\n", err)
 	}
 
@@ -40,59 +57,84 @@ func LoadConfig() (*Config, error) {
 		config.DeviceName = deviceName
 	}
 
+	// Cache the config
+	configCache.Store(config)
+
 	return config, nil
 }
 
-// loadEnvFile load .env file
-func loadEnvFile() error {
+// loadEnvFileOptimized load .env file with optimized I/O
+func loadEnvFileOptimized() error {
 	envFile := ".env"
 	if _, err := os.Stat(envFile); os.IsNotExist(err) {
 		return fmt.Errorf(".env file does not exist")
 	}
 
-	file, err := os.Open(envFile)
+	// Read entire file at once for better performance
+	data, err := os.ReadFile(envFile)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to read .env file: %w", err)
 	}
-	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-
-		// Skip empty lines and comments
+	// Process with precompiled regex
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 
-		// Parse KEY=VALUE format
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			continue
+		// Use precompiled regex for parsing
+		if matches := envRegex.FindStringSubmatch(line); len(matches) == 3 {
+			key := strings.TrimSpace(matches[1])
+			value := strings.TrimSpace(matches[2])
+
+			// Remove quotes efficiently
+			if len(value) >= 2 {
+				if (value[0] == '"' && value[len(value)-1] == '"') ||
+					(value[0] == '\'' && value[len(value)-1] == '\'') {
+					value = value[1 : len(value)-1]
+				}
+			}
+
+			if err := os.Setenv(key, value); err != nil {
+				fmt.Printf("Warning: failed to set environment variable %s: %v\n", key, err)
+			}
 		}
-
-		key := strings.TrimSpace(parts[0])
-		value := strings.TrimSpace(parts[1])
-
-		// Remove quotes
-		if strings.HasPrefix(value, `"`) && strings.HasSuffix(value, `"`) {
-			value = strings.Trim(value, `"`)
-		} else if strings.HasPrefix(value, `'`) && strings.HasSuffix(value, `'`) {
-			value = strings.Trim(value, `'`)
-		}
-
-		// Set environment variable
-		os.Setenv(key, value)
 	}
 
-	return scanner.Err()
+	return nil
+}
+
+// loadEnvFileCached load and cache environment variables
+func loadEnvFileCached() error {
+	return loadEnvFileOptimized()
+}
+
+// atomicWriteFile 原子写入文件，防止写入过程中断导致文件损坏
+func atomicWriteFile(filename string, data []byte, perm os.FileMode) error {
+	tempFile := filename + ".tmp"
+
+	// 写入临时文件
+	if err := os.WriteFile(tempFile, data, perm); err != nil {
+		return fmt.Errorf("failed to write temporary file: %w", err)
+	}
+
+	// 原子重命名
+	if err := os.Rename(tempFile, filename); err != nil {
+		// 如果重命名失败，清理临时文件
+		_ = os.Remove(tempFile)
+		return fmt.Errorf("failed to rename temporary file: %w", err)
+	}
+
+	return nil
 }
 
 // GeneratePikPakCLIConfig generate pikpakcli configuration file
 func (c *Config) GeneratePikPakCLIConfig() error {
 	configDir := getPikPakCLIConfigDir()
 	if err := os.MkdirAll(configDir, 0755); err != nil {
-		return fmt.Errorf("Failed to create configuration directory: %v", err)
+		return fmt.Errorf("Failed to create configuration directory: %w", err)
 	}
 
 	configFile := filepath.Join(configDir, "config.yml")
@@ -132,7 +174,7 @@ log_level: "info"
 		quoteString(c.Proxy),
 	)
 
-	return os.WriteFile(configFile, []byte(configContent), 0644)
+	return atomicWriteFile(configFile, []byte(configContent), 0644)
 }
 
 // quoteString add quotes to string
