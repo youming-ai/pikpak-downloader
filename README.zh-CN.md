@@ -64,11 +64,7 @@ cp .env.example .env
 
 编辑 `.env` 文件，添加您的凭据：
 ```bash
-# 方式 1: 账户和密码
-PIKPAK_USERNAME=your_email@example.com
-PIKPAK_PASSWORD=your_password
-
-# 方式 2: RefreshToken（推荐 - 更稳定）
+# RefreshToken 认证
 PIKPAK_REFRESH_TOKEN=your_refresh_token
 
 # 可选：代理设置（如需要）
@@ -222,9 +218,6 @@ pikpak-downloader/
 ### 环境变量 (.env)
 ```bash
 # 身份验证
-PIKPAK_USERNAME=[your_email]
-PIKPAK_PASSWORD=[your_password]
-# 或者
 PIKPAK_REFRESH_TOKEN=[your_refresh_token]
 
 # 可选

@@ -64,11 +64,7 @@ cp .env.example .env
 
 `.env` ファイルを認証情報で編集：
 ```bash
-# 方法 1: アカウントとパスワード
-PIKPAK_USERNAME=your_email@example.com
-PIKPAK_PASSWORD=your_password
-
-# 方法 2: RefreshToken（推奨 - より安定）
+# RefreshToken 認証
 PIKPAK_REFRESH_TOKEN=your_refresh_token
 
 # オプション：プロキシ設定（必要な場合）
@@ -222,9 +218,6 @@ pikpak-downloader/
 ### 環境変数 (.env)
 ```bash
 # 認証
-PIKPAK_USERNAME=[your_email]
-PIKPAK_PASSWORD=[your_password]
-# または
 PIKPAK_REFRESH_TOKEN=[your_refresh_token]
 
 # オプション

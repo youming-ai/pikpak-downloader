@@ -209,8 +209,6 @@ func (c *CLI) handleHelp(args []string) error {
 
 	fmt.Println("Configuration:")
 	fmt.Println("  Configure PikPak authentication in .env file:")
-	fmt.Println("    PIKPAK_USERNAME=your_email@example.com")
-	fmt.Println("    PIKPAK_PASSWORD=your_password")
 	fmt.Println("    PIKPAK_REFRESH_TOKEN=your_refresh_token")
 	fmt.Println("")
 

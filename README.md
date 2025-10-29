@@ -64,11 +64,7 @@ cp .env.example .env
 
 Edit `.env` file with your credentials:
 ```bash
-# Method 1: Account & Password
-PIKPAK_USERNAME=your_email@example.com
-PIKPAK_PASSWORD=your_password
-
-# Method 2: RefreshToken (Recommended - more stable)
+# RefreshToken authentication
 PIKPAK_REFRESH_TOKEN=your_refresh_token
 
 # Optional: Proxy settings (if needed)
@@ -222,9 +218,6 @@ pikpak-downloader/
 ### Environment Variables (.env)
 ```bash
 # Authentication
-PIKPAK_USERNAME=[your_email]
-PIKPAK_PASSWORD=[your_password]
-# OR
 PIKPAK_REFRESH_TOKEN=[your_refresh_token]
 
 # Optional

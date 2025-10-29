@@ -64,11 +64,7 @@ cp .env.example .env
 
 `.env` 파일을 자격 증명으로 편집:
 ```bash
-# 방법 1: 계정 및 비밀번호
-PIKPAK_USERNAME=your_email@example.com
-PIKPAK_PASSWORD=your_password
-
-# 방법 2: RefreshToken (권장 - 더 안정적)
+# RefreshToken 인증
 PIKPAK_REFRESH_TOKEN=your_refresh_token
 
 # 선택사항: 프록시 설정 (필요한 경우)
@@ -222,9 +218,6 @@ pikpak-downloader/
 ### 환경 변수 (.env)
 ```bash
 # 인증
-PIKPAK_USERNAME=[your_email]
-PIKPAK_PASSWORD=[your_password]
-# 또는
 PIKPAK_REFRESH_TOKEN=[your_refresh_token]
 
 # 선택사항
