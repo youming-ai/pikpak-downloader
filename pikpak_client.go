@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -124,88 +123,11 @@ func (lw *LimitedWriter) String() string {
 	return lw.buf.String()
 }
 
-// SmartDownloader 智能下载器，支持动态并发控制
-type SmartDownloader struct {
-	maxConcurrency     int32
-	currentConcurrency int32
-	semaphore          chan struct{}
-	activeCount        int64
-	completedCount     int64
-	totalBytes         int64
-	startTime          time.Time
-	mutex              sync.RWMutex
-}
-
-// NewSmartDownloader 创建智能下载器
-func NewSmartDownloader(initialConcurrency int) *SmartDownloader {
-	return &SmartDownloader{
-		maxConcurrency:     int32(initialConcurrency),
-		currentConcurrency: int32(initialConcurrency),
-		semaphore:          make(chan struct{}, initialConcurrency),
-		startTime:          time.Now(),
-	}
-}
-
-// adjustConcurrency 根据性能指标动态调整并发数
-func (sd *SmartDownloader) adjustConcurrency(fileSize int64, downloadDuration time.Duration) {
-	sd.mutex.Lock()
-	defer sd.mutex.Unlock()
-
-	// 基于文件大小调整
-	if fileSize > 100*1024*1024 { // 大于100MB
-		sd.currentConcurrency = int32(math.Max(float64(sd.currentConcurrency), 5))
-	} else if fileSize < 10*1024*1024 { // 小于10MB
-		sd.currentConcurrency = int32(math.Min(float64(sd.currentConcurrency), 10))
-	}
-
-	// 基于下载速度调整
-	if downloadDuration > 0 {
-		speedMbps := float64(fileSize) / float64(downloadDuration) / (1024 * 1024)
-		if speedMbps > 50 { // 高速网络
-			sd.currentConcurrency = int32(math.Min(float64(sd.currentConcurrency*2), float64(runtime.NumCPU()*4)))
-		} else if speedMbps < 5 { // 低速网络
-			sd.currentConcurrency = int32(math.Max(float64(sd.currentConcurrency/2), 2))
-		}
-	}
-
-	// 确保不超过硬件限制
-	maxConcurrent := int32(runtime.NumCPU() * 8)
-	sd.currentConcurrency = int32(math.Min(float64(sd.currentConcurrency), float64(maxConcurrent)))
-
-	// 限制在合理范围内
-	sd.currentConcurrency = int32(math.Max(float64(sd.currentConcurrency), 2))
-
-	// 调整信号量大小
-	if int32(cap(sd.semaphore)) != sd.currentConcurrency {
-		newSemaphore := make(chan struct{}, sd.currentConcurrency)
-		sd.mutex.Unlock()
-		sd.semaphore = newSemaphore
-		sd.mutex.Lock()
-	}
-}
-
-// GetStats 获取下载统计信息
-func (sd *SmartDownloader) GetStats() (active int64, completed int64, avgSpeed float64) {
-	sd.mutex.RLock()
-	defer sd.mutex.RUnlock()
-
-	active = atomic.LoadInt64(&sd.activeCount)
-	completed = atomic.LoadInt64(&sd.completedCount)
-
-	elapsed := time.Since(sd.startTime).Seconds()
-	if elapsed > 0 && sd.totalBytes > 0 {
-		avgSpeed = float64(sd.totalBytes) / elapsed / (1024 * 1024) // MB/s
-	}
-
-	return
-}
-
 // PikPakClient PikPak client
 type PikPakClient struct {
 	cliPath    string
 	configPath string
 	debugMode  bool
-	downloader *SmartDownloader
 	metrics    *PerformanceMetrics
 }
 
@@ -247,20 +169,23 @@ type QuotaInfo struct {
 
 // NewPikPakClient create PikPak client
 func NewPikPakClient() *PikPakClient {
+	home, _ := os.UserHomeDir()
 	return &PikPakClient{
-		cliPath:    filepath.Join(os.Getenv("HOME"), "go", "bin", "pikpakcli"),
+		cliPath:    filepath.Join(home, "go", "bin", "pikpakcli"),
 		configPath: "config.yml",
 		debugMode:  false,
-		downloader: NewSmartDownloader(3), // 默认3个并发
 		metrics:    NewPerformanceMetrics(),
 	}
 }
 
-// executeCommand 执行命令，包含超时控制和输出限制
-func (p *PikPakClient) executeCommand(ctx context.Context, args []string, outputLimit int) (string, error) {
-	// 设置默认超时时间
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
+// executeCommand 执行命令，包含可选超时控制和输出限制。
+// 当 timeout <= 0 时不施加额外的截止时间（只受传入 ctx 约束）。
+func (p *PikPakClient) executeCommand(ctx context.Context, args []string, outputLimit int, timeout time.Duration) (string, error) {
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
 
 	cmd := exec.CommandContext(ctx, p.cliPath, args...)
 
@@ -275,7 +200,7 @@ func (p *PikPakClient) executeCommand(ctx context.Context, args []string, output
 
 	// 检查是否超时
 	if ctx.Err() == context.DeadlineExceeded {
-		return "", fmt.Errorf("command timed out after 30 seconds")
+		return "", fmt.Errorf("command timed out after %s", timeout)
 	}
 
 	if err != nil {
@@ -439,7 +364,7 @@ func (p *PikPakClient) CheckConfig() error {
 	}
 
 	// Validate configuration with timeout control
-	_, err = p.executeCommand(ctx, []string{"quota"}, 1024*1024) // 1MB limit for quota command
+	_, err = p.executeCommand(ctx, []string{"quota"}, 1024*1024, 30*time.Second) // 1MB limit for quota command
 	if err != nil {
 		return fmt.Errorf("Configuration validation failed: %v", err)
 	}
@@ -469,7 +394,7 @@ func (p *PikPakClient) ListFiles(path string, longFormat bool, humanReadable boo
 
 	// For small to medium file lists, use the optimized method
 	// For very large lists, we could switch to streaming in the future
-	output, err := p.executeCommand(ctx, args, 10*1024*1024)
+	output, err := p.executeCommand(ctx, args, 10*1024*1024, 60*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("Failed to list files: %v", err)
 	}
@@ -604,7 +529,7 @@ func (p *PikPakClient) GetQuota() (*QuotaInfo, error) {
 	}
 
 	// Execute with timeout and output limit (1MB for quota)
-	output, err := p.executeCommand(ctx, args, 1024*1024)
+	output, err := p.executeCommand(ctx, args, 1024*1024, 30*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("Failed to get quota: %v", err)
 	}
@@ -687,28 +612,18 @@ func (p *PikPakClient) parseSize(sizeStr string) (int64, error) {
 	return 0, fmt.Errorf("Unable to parse size: %s", sizeStr)
 }
 
-// DownloadFile download file or folder with smart concurrency control
+// DownloadFile download file or folder via upstream pikpakcli.
+// 并发数直接透传给 pikpakcli 的 --count，让上游自行调度。
 func (p *PikPakClient) DownloadFile(path string, outputDir string, concurrency int, showProgress bool) error {
-	// Create output directory
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		return fmt.Errorf("Failed to create output directory: %v", err)
 	}
 
-	// Initialize smart downloader with specified concurrency
-	if p.downloader == nil {
-		p.downloader = NewSmartDownloader(concurrency)
-	} else {
-		p.downloader.currentConcurrency = int32(concurrency)
-		p.downloader.semaphore = make(chan struct{}, concurrency)
+	if concurrency < 1 {
+		concurrency = 1
 	}
 
-	// Start download monitoring goroutine
-	if showProgress {
-		go p.monitorDownloadProgress()
-	}
-
-	// Build command arguments with optimized concurrency
-	args := []string{"download", "--path", path, "--output", outputDir, "--count", strconv.Itoa(int(p.downloader.currentConcurrency))}
+	args := []string{"download", "--path", path, "--output", outputDir, "--count", strconv.Itoa(concurrency)}
 	if showProgress {
 		args = append(args, "--progress")
 	}
@@ -716,51 +631,10 @@ func (p *PikPakClient) DownloadFile(path string, outputDir string, concurrency i
 		args = append(args, "--debug")
 	}
 
-	startTime := time.Now()
 	cmd := exec.Command(p.cliPath, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-
-	err := cmd.Run()
-	downloadDuration := time.Since(startTime)
-
-	// Update downloader statistics
-	if err == nil {
-		atomic.AddInt64(&p.downloader.completedCount, 1)
-		// Estimate file size (this is a simplified approach)
-		estimatedSize := int64(50 * 1024 * 1024) // 50MB default estimate
-		atomic.AddInt64(&p.downloader.totalBytes, estimatedSize)
-
-		// Adjust concurrency for next download based on performance
-		p.downloader.adjustConcurrency(estimatedSize, downloadDuration)
-	}
-
-	return err
-}
-
-// monitorDownloadProgress 监控下载进度并打印统计信息
-func (p *PikPakClient) monitorDownloadProgress() {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		active, completed, avgSpeed := p.downloader.GetStats()
-		if active > 0 || completed > 0 {
-			fmt.Printf("\r📊 下载统计: 活跃: %d, 完成: %d, 平均速度: %.1f MB/s, 当前并发: %d",
-				active, completed, avgSpeed, p.downloader.currentConcurrency)
-		}
-	}
-}
-
-// GetDownloadStats 获取下载统计信息
-func (p *PikPakClient) GetDownloadStats() (active int64, completed int64, avgSpeed float64, currentConcurrency int32) {
-	if p.downloader == nil {
-		return 0, 0, 0, 3
-	}
-	var activeStats, completedStats int64
-	var avgSpeedStats float64
-	activeStats, completedStats, avgSpeedStats = p.downloader.GetStats()
-	return activeStats, completedStats, avgSpeedStats, p.downloader.currentConcurrency
+	return cmd.Run()
 }
 
 // GetPerformanceStats 获取性能统计信息
@@ -778,7 +652,9 @@ func (p *PikPakClient) PrintPerformanceStats() {
 	}
 }
 
-// PrintFiles print file list with optimized formatting
+// PrintFiles print file list with optimized formatting.
+// 注：长格式不展示修改时间，因为 pikpakcli 文本输出未可靠解析到 mtime；
+// 如需修改时间请走 pikpakcli 的原生 JSON/API，再把 UpdatedAt 填进 FileInfo。
 func (p *PikPakClient) PrintFiles(files []FileInfo, longFormat bool, humanReadable bool) {
 	if len(files) == 0 {
 		fmt.Println("Directory is empty")
@@ -786,13 +662,12 @@ func (p *PikPakClient) PrintFiles(files []FileInfo, longFormat bool, humanReadab
 	}
 
 	if longFormat {
-		fmt.Printf("%-10s %-12s %-20s %s\n", "Type", "Size", "Modified", "Name")
-		fmt.Println(strings.Repeat("-", 70))
+		fmt.Printf("%-10s %-12s %s\n", "Type", "Size", "Name")
+		fmt.Println(strings.Repeat("-", 50))
 
 		for _, file := range files {
 			sizeStr := p.formatSize(file.Size, humanReadable)
-			modTime := time.Now().Format("2006-01-02 15:04")
-			fmt.Printf("%-10s %-12s %-20s %s\n", string(file.Type), sizeStr, modTime, file.Name)
+			fmt.Printf("%-10s %-12s %s\n", string(file.Type), sizeStr, file.Name)
 		}
 	} else {
 		for _, file := range files {
