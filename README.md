@@ -1,6 +1,8 @@
-# PikPak Personal Cloud Management Tool v4.0 🚀
+# PikPak Personal Cloud Management Tool
 
-**High-performance, intelligent CLI tool for managing PikPak personal cloud storage with advanced optimization features.**
+**CLI wrapper around [`pikpakcli`](https://github.com/52funny/pikpakcli) that reads credentials from `.env`, generates the upstream config, and exposes a small, consistent command surface.**
+
+> Note: this is a thin wrapper. The actual download/list/quota work is performed by the upstream `pikpakcli` binary. See "How it works" below.
 
 ## 🌍 Languages
 
@@ -8,12 +10,12 @@
 
 ## ✨ Features
 
-### 🚀 Performance & Optimization
-- **🧠 Smart Concurrency Control** - Automatically adjusts download concurrency based on file size and network conditions
-- **💾 Memory Optimization** - 30-50% reduced memory usage with efficient resource management
-- **⚡ Streaming File Processing** - Handle large directories without loading everything into memory
-- **📊 Performance Monitoring** - Real-time performance metrics and optimization statistics
-- **🔧 Intelligent Resource Management** - Advanced caching and atomic operations
+### 🔧 What this wrapper provides
+- **`.env` based configuration** — keeps your refresh token out of the upstream YAML config
+- **Atomic config generation** — writes `config.yml` via tempfile + rename to prevent partial-write corruption
+- **Concurrency pass-through** — `--count` flag is forwarded to `pikpakcli` for folder downloads
+- **Per-command timeouts** — `ls` and `quota` have deadlines so a hung network doesn't block forever
+- **Output size caps** — captured output is bounded to avoid runaway memory on pathological directories
 
 ### 📁 File Management
 - **📋 Advanced File Listing** - Paginated lists with detailed file information
@@ -22,16 +24,13 @@
 - **🔍 Efficient Search** - Fast directory traversal and file discovery
 
 ### 💾 Download Features
-- **🚀 Intelligent Downloads** - Smart concurrency adjustment for optimal performance
-- **📈 Progress Tracking** - Real-time download progress with statistics
-- **🔄 Resume Support** - Robust download management with error recovery
-- **📁 Batch Operations** - Download entire folders with optimized concurrency
+- **📁 Folder & single-file downloads** - `pikpakcli download` is wrapped with a configurable output directory
+- **📈 Progress output** - Upstream's `--progress` is exposed behind `-progress`
+- **🔄 Resume / retry** - Delegated to upstream `pikpakcli` behavior
 
 ### 📊 Monitoring & Control
-- **📈 Real-time Statistics** - Live performance metrics and download statistics
-- **🛡️ Error Handling** - Comprehensive error management with graceful degradation
-- **⏱️ Timeout Protection** - 30-second timeout for all network operations
-- **🔒 Secure Configuration** - Environment-based authentication with atomic config generation
+- **⏱️ Timeout Protection** - `ls` / `quota` run with per-command deadlines
+- **🔒 Environment-based Configuration** - refresh token and optional proxy read from `.env`
 
 ### 🌐 Enhanced CLI
 - **🎯 Intuitive Commands** - Clean, consistent command structure
@@ -160,57 +159,28 @@ go install github.com/your-username/pikpak-downloader@latest
 ./pikpak-cli download -path "/My Pack" -progress                  # Show progress
 ```
 
-### Performance Monitoring
-```bash
-# Monitor download statistics during operation
-./pikpak-cli download -path "/large-folder" -count 3 -progress
+## 🏗️ How it works
 
-# View performance metrics (built-in monitoring)
-# Performance data is automatically collected and can be accessed programmatically
-```
+This tool does **not** implement the PikPak API itself. It:
 
-## ⚡ Performance Optimizations
+1. Loads `PIKPAK_REFRESH_TOKEN` (and optional `PIKPAK_PROXY`, `PIKPAK_CLIENT_ID`, `PIKPAK_CLIENT_SECRET`) from `.env`.
+2. Writes a `config.yml` for upstream [`pikpakcli`](https://github.com/52funny/pikpakcli) via an atomic tempfile rename.
+3. Shells out to the `pikpakcli` binary for every operation (`ls`, `quota`, `download`).
+4. For metadata commands, wraps the call with a deadline and an output size cap; for `download`, streams stdout/stderr through unchanged so upstream progress indicators work.
 
-### 🧠 Smart Concurrency System
-- **Dynamic Adjustment**: Automatically optimizes concurrency based on:
-  - File size (small files get higher concurrency, large files get optimal concurrency)
-  - Network speed (adjusts based on detected bandwidth)
-  - System resources (CPU cores and available memory)
-- **Hardware Awareness**: Utilizes up to 8x CPU cores for optimal performance
-- **Intelligent Throttling**: Prevents system overload while maximizing throughput
-
-### 💾 Memory Optimization
-- **30-50% Memory Reduction**: Through optimized data structures and algorithms
-- **Streaming Processing**: Large file lists processed without full memory loading
-- **Efficient String Operations**: Pre-allocated buffers and string builders
-- **Object Pooling**: Reuses objects to minimize garbage collection
-
-### 🚀 Network Optimization
-- **15-25% Faster Downloads**: Through intelligent concurrency control
-- **Timeout Protection**: 30-second timeouts prevent hanging operations
-- **Connection Reuse**: Optimized network resource management
-- **Error Recovery**: Automatic retry and resume capabilities
-
-### 📊 Real-world Performance
-```
-📈 Test Results (v4.0.0):
-├── Memory Usage: 18-22MB (vs 28-32MB in v3.x)
-├── Download Speed: +15-25% improvement
-├── File Listing: +20-40% faster for large directories
-├── Error Rate: Dramatically reduced
-└── Stability: Zero crashes in stress testing
-```
+There is no separate concurrency scheduler in this wrapper — `-count` is forwarded to `pikpakcli --count` verbatim.
 
 ## 📁 Project Structure
 
 ```
 pikpak-downloader/
-├── pikpak_cli.go           # CLI interface
-├── pikpak_client.go        # Core client functionality
-├── config_manager.go       # Configuration management
-├── .env.example            # Configuration template
-├── Makefile                # Build automation
-└── README*.md              # Documentation
+├── pikpak_cli.go             # CLI entry point (flag parsing + dispatch)
+├── pikpak_client.go          # Wrapper around upstream pikpakcli (exec + output parsing)
+├── pikpak_client_test.go     # Parser unit tests
+├── config_manager.go         # .env loading and config.yml generation
+├── .env.example              # Configuration template
+├── Makefile                  # Build automation
+└── README*.md                # Documentation
 ```
 
 ## ⚙️ Configuration
@@ -223,6 +193,10 @@ PIKPAK_REFRESH_TOKEN=[your_refresh_token]
 # Optional
 PIKPAK_PROXY=http://127.0.0.1:7890
 PIKPAK_DEVICE_NAME=pikpak-downloader
+
+# OAuth overrides (optional). Leave unset to use upstream pikpakcli defaults.
+# PIKPAK_CLIENT_ID=
+# PIKPAK_CLIENT_SECRET=
 ```
 
 ### How to Get RefreshToken
@@ -234,65 +208,27 @@ PIKPAK_DEVICE_NAME=pikpak-downloader
 
 ## 🔄 Version History
 
-### 🎯 v4.0.0 (2025-10-23) - Performance & Optimization Release
-**Major performance overhaul with intelligent optimization features**
+See `git log` for the authoritative change history. Recent notable changes:
 
-#### 🚀 Performance Improvements
-- **30-50% Memory Reduction** - Optimized data structures and algorithms
-- **15-25% Faster Downloads** - Smart concurrency control and network optimization
-- **20-40% Faster File Listing** - Streaming processing and caching
-- **Zero Crash Rate** - Comprehensive error handling and resource management
-
-#### 🧠 Intelligent Features
-- **Smart Concurrency System** - Automatic adjustment based on file size and network conditions
-- **Performance Monitoring** - Real-time metrics and statistics collection
-- **Hardware-Aware Optimization** - Utilizes up to 8x CPU cores
-- **Memory-Efficient Processing** - Streaming for large directories
-
-#### 🛡️ Stability & Security
-- **Timeout Protection** - 30-second timeouts for all operations
-- **Atomic Configuration** - Prevents configuration file corruption
-- **Enhanced Error Handling** - Comprehensive error management
-- **Resource Cleanup** - Guaranteed resource release
-
-#### 📊 Tested & Verified
-- **11MB+ Files Downloaded** - Real-world testing with large file sets
-- **80+ Files Concurrently** - Stress-tested with multiple file types
-- **Memory Under 22MB** - Validated memory optimization claims
-- **Zero Memory Leaks** - Long-running stability confirmed
-
-### 🔧 v3.1.0 (2025-10-18) - Configuration Enhancement
-- Added .env configuration support
-- Automatic configuration generation
-- Enhanced security and usability
-
-### 🌟 v3.0.0 (2025-10-18) - Personal Cloud Management
-- Complete rewrite focusing on file management
-- Full command-line interface with help system
-- Smart file type recognition
-- Secure .env-based configuration
+- Removed an inert "SmartDownloader" layer whose dynamic-concurrency logic ran *after* each download with a hardcoded 50 MB size estimate and was never in the actual I/O path.
+- Made per-command timeouts configurable; `download` no longer inherits the 30s metadata timeout.
+- Stopped hardcoding OAuth `client_id`/`client_secret` in the generated config; they are now optional env overrides, otherwise upstream `pikpakcli` defaults apply.
+- `ls -l` no longer prints a fabricated "modified" column (the original value was `time.Now()` for every row).
 
 ---
 
-## 📈 Migration Guide
+## 📈 Recommended concurrency
 
-### From v3.x to v4.0.0
-**Upgrade is seamless and fully backward compatible!**
+The `-count` flag is forwarded to `pikpakcli --count` unchanged. The upstream tool is authoritative on what this number does.
 
-1. **No Action Required** - All existing configurations continue to work
-2. **Automatic Benefits** - All performance improvements are automatically available
-3. **Enhanced Experience** - New features are ready to use without configuration changes
-4. **Better Performance** - Notice the speed improvements immediately
-
-### Recommended Settings for v4.0.0
 ```bash
-# For optimal performance with multiple small files
+# Many small files
 ./pikpak-cli download -path "/downloads" -count 8
 
-# For large files (100MB+), let smart optimization handle it
+# One large file
 ./pikpak-cli download -path "/large-files" -progress
 
-# For general use, default settings are optimized
+# General use
 ./pikpak-cli download -path "/my-folder" -progress
 ```
 
@@ -342,12 +278,6 @@ MIT License - see [LICENSE](LICENSE) file for details.
 ./pikpak-cli download -path "/folder" -count 8  # Increase concurrency
 ```
 
-#### Memory Issues
-```bash
-# High memory usage: Enable streaming mode
-# (v4.0.0 automatically handles large directories efficiently)
-```
-
 ### Debug Mode
 ```bash
 # Enable debug output for troubleshooting
@@ -358,7 +288,6 @@ PIKPAK_DEBUG=true
 ### Getting Help
 - 🐛 **Report bugs**: [GitHub Issues](https://github.com/your-username/pikpak-downloader/issues)
 - 💬 **Discussions**: [GitHub Discussions](https://github.com/your-username/pikpak-downloader/discussions)
-- 📖 **Documentation**: Check [CHANGELOG.md](CHANGELOG.md) for detailed changes
 
 ## ⚠️ Disclaimer
 
@@ -366,17 +295,4 @@ This tool is for personal cloud management only. Please comply with PikPak's ter
 
 ## 🙏 Acknowledgments
 
-- [pikpakcli](https://github.com/52funny/pikpakcli) - Core functionality reference
-- Go language community - Excellent development tools and libraries
-- All contributors and testers who helped improve this tool
-
----
-
-## 📊 Project Statistics
-
-- **🚀 Performance**: 30-50% memory reduction, 15-25% faster downloads
-- **🛡️ Reliability**: Zero crashes in stress testing
-- **📱 Compatibility**: Supports all major platforms
-- **🔧 Maintained**: Active development with regular updates
-
-**If this project helps you, please give it a ⭐️ and share it with others!**
+- [pikpakcli](https://github.com/52funny/pikpakcli) — all real PikPak API work is done by this upstream project; this repo is a configuration/UX wrapper on top of it.
