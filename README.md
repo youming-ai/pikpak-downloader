@@ -2,6 +2,13 @@
 
 Rust CLI for PikPak cloud storage.
 
+## Install
+
+```bash
+cargo build --release
+./target/release/pikpak --help
+```
+
 ## Setup
 
 ```bash

@@ -119,11 +119,13 @@ impl CaptchaManager {
     pub(crate) async fn refresh(&self, action: &str, previous: Option<&str>) -> Result<String> {
         let mut cache = self.inner.cache.write().await;
 
-        // Always double-check inside the write lock: another task may have
-        // already refreshed while we were waiting, even when a previous
-        // token was supplied (e.g. concurrent error_code 9 retries).
+        // Double-check inside the write lock: another task may have already
+        // refreshed while we were waiting. If `previous` is supplied and the
+        // cached token is still the same token that just failed, force a real
+        // refresh instead of returning the known-bad token.
         if let Some(c) = cache.get(action) {
-            if Instant::now() < c.refresh_after {
+            let already_replaced = previous.is_none_or(|prev| prev != c.token);
+            if already_replaced && Instant::now() < c.refresh_after {
                 return Ok(c.token.clone());
             }
         }

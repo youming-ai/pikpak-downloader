@@ -2,6 +2,13 @@
 
 Rust CLI for PikPak.
 
+## 설치
+
+```bash
+cargo build --release
+./target/release/pikpak --help
+```
+
 ## 설정
 
 ```bash

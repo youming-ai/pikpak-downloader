@@ -2,6 +2,13 @@
 
 Rust CLI for PikPak 云盘。
 
+## 安装
+
+```bash
+cargo build --release
+./target/release/pikpak --help
+```
+
 ## 配置
 
 ```bash

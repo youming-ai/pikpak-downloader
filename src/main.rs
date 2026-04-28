@@ -46,9 +46,6 @@ struct DownloadArgs {
     /// Local output directory.
     #[arg(long, default_value = "./downloads")]
     output: String,
-    /// Number of concurrent downloads.
-    #[arg(long, default_value = "3")]
-    count: usize,
 }
 
 #[derive(Debug, Parser)]
