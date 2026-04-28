@@ -184,6 +184,12 @@ impl Client {
         &self.tokens
     }
 
+    /// Return a handle to the underlying HTTP client for direct requests
+    /// (e.g. downloading file content).
+    pub fn http_client(&self) -> &reqwest::Client {
+        &self.http
+    }
+
     /// Return the user's storage quota.
     pub async fn quota(&self) -> Result<Quota> {
         let action = "GET:/drive/v1/about";
@@ -290,6 +296,112 @@ impl Client {
 
         unreachable!("drive_get loop exits via return")
     }
+
+    /// Resolve a Unix-style path (e.g. `"/My Pack/videos"`) to the
+    /// corresponding folder id by walking each path segment.
+    ///
+    /// Returns `Ok(id)` on success. An empty path or `"/"` resolves to the
+    /// root (empty string, matching PikPak convention).
+    pub async fn resolve_path(&self, path: &str) -> Result<String> {
+        let normalized = path.trim_matches('/');
+        if normalized.is_empty() {
+            return Ok(String::new());
+        }
+
+        let segments: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
+        let mut parent_id = String::new();
+
+        for seg in &segments {
+            let children = self.list_folder(&parent_id).await?;
+            let found = children.iter().find(|f| {
+                f.kind.is_folder() && f.name == *seg
+            });
+
+            match found {
+                Some(f) => parent_id = f.id.clone(),
+                None => {
+                    return Err(Error::NotFound {
+                        path: path.to_string(),
+                        segment: (*seg).to_string(),
+                    });
+                }
+            }
+        }
+
+        Ok(parent_id)
+    }
+
+    /// Resolve a path to a [`FileInfo`]. If the path points to a file
+    /// (i.e. the last segment is a file, not a folder), returns that file's
+    /// info; otherwise returns the folder's info.
+    pub async fn resolve_path_info(&self, path: &str) -> Result<FileInfo> {
+        let normalized = path.trim_matches('/');
+        if normalized.is_empty() {
+            return Err(Error::NotConfigured("path must not be empty"));
+        }
+
+        let segments: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
+        let mut parent_id = String::new();
+
+        for (i, seg) in segments.iter().enumerate() {
+            let is_last = i == segments.len() - 1;
+            let children = self.list_folder(&parent_id).await?;
+            let found = children.iter().find(|f| f.name == **seg);
+
+            match found {
+                Some(f) => {
+                    if is_last {
+                        return Ok(f.clone());
+                    }
+                    if !f.kind.is_folder() {
+                        return Err(Error::NotFound {
+                            path: path.to_string(),
+                            segment: (*seg).to_string(),
+                        });
+                    }
+                    parent_id = f.id.clone();
+                }
+                None => {
+                    return Err(Error::NotFound {
+                        path: path.to_string(),
+                        segment: (*seg).to_string(),
+                    });
+                }
+            }
+        }
+
+        unreachable!("resolve_path_info loop must return inside")
+    }
+
+    /// Get a download URL for a file by its id.
+    pub async fn get_download_url(&self, file_id: &str) -> Result<DownloadInfo> {
+        let action = "GET:/drive/v1/files/:id";
+        let url = format!(
+            "{}/drive/v1/files/{}",
+            self.api_base.trim_end_matches('/'),
+            file_id,
+        );
+
+        let resp = self.drive_get(&url, action, &[]).await?;
+        let body: FileDetailResponse = serde_json::from_str(&resp)?;
+
+        Ok(DownloadInfo {
+            web_content_link: body.web_content_link,
+            name: body.name,
+            size: body.size,
+        })
+    }
+}
+
+/// Download info returned by the API for a single file.
+#[derive(Debug, Clone)]
+pub struct DownloadInfo {
+    /// Direct download URL (time-limited).
+    pub web_content_link: String,
+    /// File name.
+    pub name: String,
+    /// File size in bytes.
+    pub size: u64,
 }
 
 /// Derive a stable device id from the refresh token (md5 hex of the token).
@@ -326,4 +438,14 @@ struct ListResponse {
     files: Vec<FileInfo>,
     #[serde(default)]
     next_page_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileDetailResponse {
+    #[serde(default)]
+    name: String,
+    #[serde(default, deserialize_with = "deserialize_string_to_u64")]
+    size: u64,
+    #[serde(default)]
+    web_content_link: String,
 }

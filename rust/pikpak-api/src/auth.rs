@@ -206,8 +206,8 @@ impl TokenManager {
         }
 
         let body: RefreshResponse = resp.json().await?;
-        let refresh_at =
-            Instant::now() + Duration::from_secs(body.expires_in.saturating_sub(60));
+        let effective_ttl = body.expires_in.saturating_sub(60).max(5);
+        let refresh_at = Instant::now() + Duration::from_secs(effective_ttl);
         let access = body.access_token.clone();
         **guard = Some(CachedToken {
             access_token: body.access_token,

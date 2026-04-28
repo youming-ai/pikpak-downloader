@@ -123,12 +123,12 @@ impl CaptchaManager {
     ) -> Result<String> {
         let mut cache = self.inner.cache.write().await;
 
-        // Double-check inside the write lock.
-        if previous.is_none() {
-            if let Some(c) = cache.get(action) {
-                if Instant::now() < c.refresh_after {
-                    return Ok(c.token.clone());
-                }
+        // Always double-check inside the write lock: another task may have
+        // already refreshed while we were waiting, even when a previous
+        // token was supplied (e.g. concurrent error_code 9 retries).
+        if let Some(c) = cache.get(action) {
+            if Instant::now() < c.refresh_after {
+                return Ok(c.token.clone());
             }
         }
 

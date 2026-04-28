@@ -30,6 +30,15 @@ pub enum Error {
     #[error("not configured: missing {0}")]
     NotConfigured(&'static str),
 
+    /// A path segment could not be resolved.
+    #[error("path not found: {path} (failed at segment `{segment}`)")]
+    NotFound {
+        /// The full path that was being resolved.
+        path: String,
+        /// The segment that could not be found.
+        segment: String,
+    },
+
     /// The user access token has expired and automatic refresh is not
     /// possible (no refresh token, or refresh also rejected).
     #[error("access token expired and could not be refreshed")]

@@ -1,46 +1,39 @@
-.PHONY: build run clean deps help build-cli run-cli
+.PHONY: build run clean test help
 
-# Default target
 help:
-	@echo "PikPak Personal Cloud Storage Management Tool"
+	@echo "PikPak Personal Cloud Storage Management Tool (Rust)"
 	@echo ""
 	@echo "Available commands:"
-	@echo "  deps      - Install dependencies"
-	@echo "  build-cli - Build CLI program"
-	@echo "  run-cli   - Run CLI program"
-	@echo "  clean     - Clean build files"
-	@echo "  help      - Show this help information"
+	@echo "  build  - Build the CLI binary"
+	@echo "  run    - Run the CLI binary"
+	@echo "  test   - Run all tests"
+	@echo "  clean  - Clean build artifacts"
+	@echo "  help   - Show this help information"
 	@echo ""
 	@echo "CLI mode examples:"
-	@echo "  make run-cli ls                   # List root directory files"
-	@echo "  make run-cli quota                # View quota"
-	@echo "  make run-cli download -path '/My Pack'"
+	@echo "  make run                          # Show help"
+	@echo "  make run ARGS='ls'                # List root directory"
+	@echo "  make run ARGS='ls --path \"/My Pack\" -l -h'"
+	@echo "  make run ARGS='quota'             # View quota"
+	@echo "  make run ARGS='download --path \"/My Pack/video.mp4\"'"
+	@echo ""
+	@echo "Install binary to PATH:"
+	@echo "  cd rust && cargo install --path pikpak-cli"
 
-# Install dependencies
-deps:
-	@echo "📦 Installing dependencies..."
-	go mod tidy
-	@echo "📦 Installing pikpakcli..."
-	go install github.com/52funny/pikpakcli@latest
+build:
+	cd rust && cargo build --release
+	@echo "Binary: rust/target/release/pikpak-cli"
 
-# Build CLI program
-build-cli: deps
-	@echo "🔨 Building CLI program..."
-	go build -o pikpak-cli pikpak_cli.go pikpak_client.go config_manager.go
-	@echo "✅ Build completed: ./pikpak-cli"
-
-# Run CLI program
-run-cli:
-	@echo "🚀 Starting CLI program..."
+run:
 	@if [ -z "$(ARGS)" ]; then \
-		./pikpak-cli help; \
+		cd rust && cargo run --bin pikpak-cli -- help; \
 	else \
-		./pikpak-cli $(ARGS); \
+		cd rust && cargo run --bin pikpak-cli -- $(ARGS); \
 	fi
 
-# Clean build files
+test:
+	cd rust && cargo test
+
 clean:
-	@echo "🧹 Cleaning files..."
-	rm -f pikpak-cli
-	rm -rf downloads temp_cli_downloads
-	go clean -cache
+	cd rust && cargo clean
+	rm -rf downloads
