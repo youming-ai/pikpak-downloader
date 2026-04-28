@@ -7,17 +7,7 @@
 *.dll
 *.so
 *.dylib
-# Anchored: only the legacy Go-built binary at repo root, not the rust/pikpak-cli/ crate.
 /pikpak-cli
-
-# Test binary, built with `go test -c`
-*.test
-
-# Output of the go coverage tool
-*.out
-
-# Go workspace file
-go.work
 
 # Temporary files
 *.tmp
