@@ -1,22 +1,17 @@
-//! `pikpak-cli` — CLI front-end for the `pikpak-api` crate.
-
 use std::path::Path as StdPath;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use humansize::{format_size, BINARY};
-use pikpak_api::{Client, FileKind};
 use tokio::io::AsyncWriteExt;
 use tracing_subscriber::EnvFilter;
 
+use pikpak::{Client, FileKind};
+use pikpak::auth::OAuthCredentials;
+
 #[derive(Debug, Parser)]
-#[command(
-    name = "pikpak-cli",
-    version,
-    about = "PikPak Personal Cloud Storage Management Tool",
-    long_about = None
-)]
+#[command(name = "pikpak", version, about = "PikPak cloud storage CLI")]
 struct Cli {
     #[arg(long, global = true)]
     verbose: bool,
@@ -27,41 +22,30 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// List files and folders under a given path.
     Ls(LsArgs),
-    /// Download a file or folder from PikPak.
     Download(DownloadArgs),
-    /// Show storage quota for the account.
     Quota(QuotaArgs),
-    /// Show help information.
     Help,
 }
 
 #[derive(Debug, Parser)]
 struct LsArgs {
-    /// Directory path to list (e.g. "/My Pack"). Defaults to root.
     #[arg(long, default_value = "/")]
     path: String,
-
-    /// Show a long-format listing with size and kind.
     #[arg(short = 'l', long)]
     long: bool,
-
-    /// Render sizes in human-readable units (KB/MB/GB).
     #[arg(short = 'h', long)]
     human: bool,
 }
 
 #[derive(Debug, Parser)]
 struct DownloadArgs {
-    /// Remote path to download (file or folder), e.g. "/My Pack/video.mp4".
+    /// Remote path to download, e.g. /My Pack/video.mp4.
     #[arg(long)]
     path: String,
-
     /// Local output directory.
     #[arg(long, default_value = "./downloads")]
     output: String,
-
     /// Number of concurrent downloads.
     #[arg(long, default_value = "3")]
     count: usize,
@@ -69,7 +53,7 @@ struct DownloadArgs {
 
 #[derive(Debug, Parser)]
 struct QuotaArgs {
-    /// Print raw byte counts instead of human-readable units.
+    /// Print raw byte counts.
     #[arg(long)]
     raw: bool,
 }
@@ -81,7 +65,7 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
 
     let filter = if cli.verbose {
-        EnvFilter::new("pikpak_cli=debug,pikpak_api=debug")
+        EnvFilter::new("pikpak=debug")
     } else {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"))
     };
@@ -126,13 +110,9 @@ fn build_client() -> Result<Client> {
         }
     }
 
-    if let (Ok(id), Ok(secret)) = (
-        std::env::var("PIKPAK_CLIENT_ID"),
-        std::env::var("PIKPAK_CLIENT_SECRET"),
-    ) {
+    if let (Ok(id), Ok(secret)) = (std::env::var("PIKPAK_CLIENT_ID"), std::env::var("PIKPAK_CLIENT_SECRET")) {
         if !id.is_empty() && !secret.is_empty() {
-            builder =
-                builder.credentials(pikpak_api::auth::OAuthCredentials::new(id, secret));
+            builder = builder.credentials(OAuthCredentials::new(id, secret));
         }
     }
 
@@ -142,32 +122,32 @@ fn build_client() -> Result<Client> {
 async fn cmd_ls(client: &Client, args: LsArgs) -> Result<()> {
     let parent_id = client.resolve_path(&args.path).await?;
 
-    let files = client
+    let files: Vec<pikpak::FileInfo> = client
         .list_folder(&parent_id)
         .await
         .context("list_folder failed")?;
 
     if files.is_empty() {
-        println!("Directory is empty");
+        println!("(empty)");
         return Ok(());
     }
 
     if args.long {
-        println!("{:<10} {:>12} {}", "Type", "Size", "Name");
+        println!("{:<10} {:>12} {}", "kind", "size", "name");
         println!("{}", "-".repeat(50));
         for f in &files {
-            let kind = if f.kind.is_folder() { "Folder" } else { "File" };
+            let kind = if f.kind.is_folder() { "folder" } else { "file" };
             let size = if args.human {
                 format_size(f.size, BINARY)
             } else {
                 f.size.to_string()
             };
-            println!("{kind:<10} {size:>12} {name}", name = f.name);
+            println!("{kind:<10} {size:>12} {}", f.name);
         }
     } else {
         for f in &files {
             let marker = if f.kind == FileKind::Folder { "/" } else { "" };
-            println!("{}{marker}", f.name);
+            println!("{}{}", f.name, marker);
         }
     }
 
@@ -188,8 +168,8 @@ async fn cmd_download(client: &Client, args: DownloadArgs) -> Result<()> {
     }
 }
 
-async fn download_file(client: &Client, file: &pikpak_api::FileInfo, output_dir: &str) -> Result<()> {
-    let dl = client
+async fn download_file(client: &Client, file: &pikpak::FileInfo, output_dir: &str) -> Result<()> {
+    let dl: pikpak::DownloadInfo = client
         .get_download_url(&file.id)
         .await
         .context("failed to get download URL")?;
@@ -218,18 +198,12 @@ async fn download_file(client: &Client, file: &pikpak_api::FileInfo, output_dir:
         .context("failed to create output file")?;
 
     let mut downloaded: u64 = 0;
-    loop {
-        let n = resp.chunk().await?;
-        match n {
-            Some(chunk) => {
-                out.write_all(&chunk).await?;
-                downloaded += chunk.len() as u64;
-                if dl.size > 0 {
-                    let pct = (downloaded as f64 / dl.size as f64) * 100.0;
-                    eprint!("\r  {} / {} ({:.1}%)", format_size(downloaded, BINARY), format_size(dl.size, BINARY), pct);
-                }
-            }
-            None => break,
+    while let Some(chunk) = resp.chunk().await? {
+        out.write_all(&chunk).await?;
+        downloaded += chunk.len() as u64;
+        if dl.size > 0 {
+            let pct = (downloaded as f64 / dl.size as f64) * 100.0;
+            eprint!("\r  {} / {} ({:.1}%)", format_size(downloaded, BINARY), format_size(dl.size, BINARY), pct);
         }
     }
     eprintln!();
@@ -240,7 +214,7 @@ async fn download_file(client: &Client, file: &pikpak_api::FileInfo, output_dir:
 
 fn download_folder<'a>(
     client: &'a Client,
-    folder: &'a pikpak_api::FileInfo,
+    folder: &'a pikpak::FileInfo,
     output_dir: &'a str,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
     Box::pin(async move {
@@ -251,7 +225,7 @@ fn download_folder<'a>(
 
         println!("Downloading folder: {}", folder.name);
 
-        let files = client.list_folder(&folder.id).await?;
+        let files: Vec<pikpak::FileInfo> = client.list_folder(&folder.id).await?;
         for f in &files {
             if f.kind.is_folder() {
                 download_folder(client, f, dir_path.to_str().unwrap()).await?;
@@ -265,7 +239,7 @@ fn download_folder<'a>(
 }
 
 async fn cmd_quota(client: &Client, args: QuotaArgs) -> Result<()> {
-    let q = client.quota().await.context("quota failed")?;
+    let q: pikpak::Quota = client.quota().await.context("quota failed")?;
 
     let fmt = |n: u64| {
         if args.raw {
@@ -275,56 +249,26 @@ async fn cmd_quota(client: &Client, args: QuotaArgs) -> Result<()> {
         }
     };
 
-    println!("Cloud storage quota:");
-    println!("  Total capacity: {}", fmt(q.total));
-    println!("  Used:           {}", fmt(q.used));
-    println!("  Free:           {}", fmt(q.free()));
+    println!("total: {}", fmt(q.total));
+    println!("used:  {}", fmt(q.used));
+    println!("free:  {}", fmt(q.free()));
     if let Some(r) = q.ratio() {
-        println!("  Usage rate:     {:.1}%", r * 100.0);
+        println!("usage: {:.1}%", r * 100.0);
     }
 
     Ok(())
 }
 
 fn print_help() {
-    println!("PikPak Personal Cloud Storage Management Tool");
+    println!("PikPak cloud storage CLI");
     println!();
-    println!("Usage: pikpak-cli <command> [options]");
+    println!("Usage: pikpak <command> [options]");
     println!();
-    println!("Available commands:");
-    println!("  ls        List files and directories");
-    println!("  download  Download files or folders");
-    println!("  quota     View cloud storage quota");
-    println!("  help      Show this help information");
+    println!("Commands:");
+    println!("  ls         List files and directories");
+    println!("  download   Download files or folders");
+    println!("  quota      View storage quota");
     println!();
-    println!("Command details:");
-    println!();
-    println!("ls - List files and directories");
-    println!("  Options:");
-    println!("    --path string   Directory path (default: \"/\")");
-    println!("    -l              Long format display");
-    println!("    -h              Human readable format");
-    println!("  Examples:");
-    println!("    pikpak-cli ls");
-    println!(r#"    pikpak-cli ls --path "/My Pack" -l -h"#);
-    println!();
-    println!("download - Download files or folders");
-    println!("  Options:");
-    println!(r#"    --path string   Download path (e.g. "/My Pack/video.mp4")"#);
-    println!("    --output string Output directory (default: \"./downloads\")");
-    println!("    --count int     Concurrency count (default: 3)");
-    println!("  Examples:");
-    println!(r#"    pikpak-cli download --path "/My Pack/video.mp4""#);
-    println!(r#"    pikpak-cli download --path "/My Pack" --output "./my_downloads""#);
-    println!();
-    println!("quota - View cloud storage quota");
-    println!("  Options:");
-    println!("    --raw           Print raw byte counts");
-    println!("  Examples:");
-    println!("    pikpak-cli quota");
-    println!();
-    println!("Configuration:");
-    println!("  Configure PikPak authentication in .env file:");
-    println!("    PIKPAK_REFRESH_TOKEN=your_refresh_token");
-    println!();
+    println!("Config via .env:");
+    println!("  PIKPAK_REFRESH_TOKEN=your_refresh_token");
 }

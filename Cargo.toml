@@ -1,14 +1,11 @@
-[workspace]
-resolver = "2"
-members = ["pikpak-api", "pikpak-cli"]
-
-[workspace.package]
+[package]
+name = "pikpak"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/your-username/pikpak-downloader"
+repository = "https://github.com/youming-ai/pikpak-downloader"
 
-[workspace.dependencies]
+[dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "fs", "io-util"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 serde = { version = "1", features = ["derive"] }
@@ -17,6 +14,12 @@ thiserror = "1"
 anyhow = "1"
 tracing = "0.1"
 url = "2"
+md-5 = "0.10"
+hex = "0.4"
+clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+humansize = "2"
 
 [profile.release]
 lto = "thin"
