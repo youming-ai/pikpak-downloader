@@ -1,14 +1,14 @@
 use std::path::Path as StdPath;
 use std::process::ExitCode;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use humansize::{format_size, BINARY};
 use tokio::io::AsyncWriteExt;
 use tracing_subscriber::EnvFilter;
 
-use pikpak::{Client, FileKind};
 use pikpak::auth::OAuthCredentials;
+use pikpak::{Client, FileKind};
 
 #[derive(Debug, Parser)]
 #[command(name = "pikpak", version, about = "PikPak cloud storage CLI")]
@@ -110,7 +110,10 @@ fn build_client() -> Result<Client> {
         }
     }
 
-    if let (Ok(id), Ok(secret)) = (std::env::var("PIKPAK_CLIENT_ID"), std::env::var("PIKPAK_CLIENT_SECRET")) {
+    if let (Ok(id), Ok(secret)) = (
+        std::env::var("PIKPAK_CLIENT_ID"),
+        std::env::var("PIKPAK_CLIENT_SECRET"),
+    ) {
         if !id.is_empty() && !secret.is_empty() {
             builder = builder.credentials(OAuthCredentials::new(id, secret));
         }
@@ -133,7 +136,7 @@ async fn cmd_ls(client: &Client, args: LsArgs) -> Result<()> {
     }
 
     if args.long {
-        println!("{:<10} {:>12} {}", "kind", "size", "name");
+        println!("{:<10} {:>12} name", "kind", "size");
         println!("{}", "-".repeat(50));
         for f in &files {
             let kind = if f.kind.is_folder() { "folder" } else { "file" };
@@ -203,7 +206,12 @@ async fn download_file(client: &Client, file: &pikpak::FileInfo, output_dir: &st
         downloaded += chunk.len() as u64;
         if dl.size > 0 {
             let pct = (downloaded as f64 / dl.size as f64) * 100.0;
-            eprint!("\r  {} / {} ({:.1}%)", format_size(downloaded, BINARY), format_size(dl.size, BINARY), pct);
+            eprint!(
+                "\r  {} / {} ({:.1}%)",
+                format_size(downloaded, BINARY),
+                format_size(dl.size, BINARY),
+                pct
+            );
         }
     }
     eprintln!();

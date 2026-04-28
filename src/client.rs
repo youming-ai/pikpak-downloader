@@ -9,7 +9,7 @@ use serde::Deserialize;
 use crate::auth::{OAuthCredentials, TokenManager};
 use crate::captcha::CaptchaManager;
 use crate::error::{Error, Result};
-use crate::types::{FileInfo, Quota, deserialize_string_to_u64};
+use crate::types::{deserialize_string_to_u64, FileInfo, Quota};
 
 /// PikPak user/auth service base URL. Overridable via
 /// [`ClientBuilder::auth_base_url`].
@@ -193,10 +193,7 @@ impl Client {
     /// Return the user's storage quota.
     pub async fn quota(&self) -> Result<Quota> {
         let action = "GET:/drive/v1/about";
-        let url = format!(
-            "{}/drive/v1/about",
-            self.api_base.trim_end_matches('/')
-        );
+        let url = format!("{}/drive/v1/about", self.api_base.trim_end_matches('/'));
 
         let resp = self.drive_get(&url, action, &[]).await?;
         let body: AboutResponse = serde_json::from_str(&resp)?;
@@ -209,10 +206,7 @@ impl Client {
     /// List the direct children of a folder. Pass `""` for the root.
     pub async fn list_folder(&self, parent_id: &str) -> Result<Vec<FileInfo>> {
         let action = "GET:/drive/v1/files";
-        let url = format!(
-            "{}/drive/v1/files",
-            self.api_base.trim_end_matches('/')
-        );
+        let url = format!("{}/drive/v1/files", self.api_base.trim_end_matches('/'));
 
         let mut all = Vec::new();
         let mut page_token: Option<String> = None;
@@ -246,12 +240,7 @@ impl Client {
     ///
     /// If the server returns error_code 9 (captcha expired), refreshes the
     /// captcha and retries exactly once.
-    async fn drive_get(
-        &self,
-        url: &str,
-        action: &str,
-        query: &[(&str, String)],
-    ) -> Result<String> {
+    async fn drive_get(&self, url: &str, action: &str, query: &[(&str, String)]) -> Result<String> {
         for attempt in 0..2 {
             let access = self.tokens.access_token().await?;
             let captcha = self.captcha.token_for(action).await?;
@@ -313,9 +302,9 @@ impl Client {
 
         for seg in &segments {
             let children = self.list_folder(&parent_id).await?;
-            let found = children.iter().find(|f| {
-                f.kind.is_folder() && f.name == *seg
-            });
+            let found = children
+                .iter()
+                .find(|f| f.kind.is_folder() && f.name == *seg);
 
             match found {
                 Some(f) => parent_id = f.id.clone(),

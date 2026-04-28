@@ -116,11 +116,7 @@ impl CaptchaManager {
 
     /// Force a fresh captcha token for the given action. Optionally pass the
     /// previous token so the server can invalidate it. Returns the new token.
-    pub(crate) async fn refresh(
-        &self,
-        action: &str,
-        previous: Option<&str>,
-    ) -> Result<String> {
+    pub(crate) async fn refresh(&self, action: &str, previous: Option<&str>) -> Result<String> {
         let mut cache = self.inner.cache.write().await;
 
         // Always double-check inside the write lock: another task may have
@@ -138,11 +134,7 @@ impl CaptchaManager {
             .map(|d| d.as_millis().to_string())
             .unwrap_or_else(|_| "0".to_string());
 
-        let sign = captcha_sign(
-            &self.inner.client_id,
-            &self.inner.device_id,
-            &timestamp,
-        );
+        let sign = captcha_sign(&self.inner.client_id, &self.inner.device_id, &timestamp);
 
         let body = serde_json::json!({
             "action": action,
@@ -164,8 +156,7 @@ impl CaptchaManager {
         let access = self.inner.tokens.access_token().await?;
         let url = format!(
             "{}?client_id={}",
-            self.inner.init_endpoint,
-            self.inner.client_id,
+            self.inner.init_endpoint, self.inner.client_id,
         );
 
         tracing::debug!(action = %action, "initializing captcha token");
@@ -182,7 +173,10 @@ impl CaptchaManager {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let text = resp.text().await.unwrap_or_default();
-            return Err(Error::Api { status, message: text });
+            return Err(Error::Api {
+                status,
+                message: text,
+            });
         }
 
         let parsed: CaptchaInitResponse = resp.json().await?;

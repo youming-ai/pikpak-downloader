@@ -121,8 +121,14 @@ mod tests {
         let folder: FileKind = serde_json::from_str(r#""drive#folder""#).unwrap();
         assert_eq!(file, FileKind::File);
         assert_eq!(folder, FileKind::Folder);
-        assert_eq!(serde_json::to_string(&FileKind::File).unwrap(), r#""drive#file""#);
-        assert_eq!(serde_json::to_string(&FileKind::Folder).unwrap(), r#""drive#folder""#);
+        assert_eq!(
+            serde_json::to_string(&FileKind::File).unwrap(),
+            r#""drive#file""#
+        );
+        assert_eq!(
+            serde_json::to_string(&FileKind::Folder).unwrap(),
+            r#""drive#folder""#
+        );
     }
 
     #[test]
@@ -133,7 +139,10 @@ mod tests {
 
     #[test]
     fn quota_free_and_ratio() {
-        let q = Quota { total: 100, used: 25 };
+        let q = Quota {
+            total: 100,
+            used: 25,
+        };
         assert_eq!(q.free(), 75);
         assert_eq!(q.ratio(), Some(0.25));
 
@@ -142,7 +151,10 @@ mod tests {
         assert_eq!(empty.ratio(), None);
 
         // Over-report (edge case): used > total, free saturates at 0.
-        let over = Quota { total: 10, used: 20 };
+        let over = Quota {
+            total: 10,
+            used: 20,
+        };
         assert_eq!(over.free(), 0);
     }
 
