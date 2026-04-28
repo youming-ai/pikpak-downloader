@@ -1,6 +1,8 @@
-# PikPak 個人クラウド管理ツール v4.0 🚀
+# PikPak 個人クラウド管理ツール
 
-**高性能、インテリジェントな CLI ツール。PikPak 個人クラウドストレージを高度な最適化機能で管理します。**
+**PikPak API を直接呼び出すネイティブ Rust CLI ツール。**
+
+> 外部 `pikpakcli` バイナリは不要 — すべてネイティブ API 実装です。
 
 ## 🌍 言語
 
@@ -8,375 +10,179 @@
 
 ## ✨ 機能
 
-### 🚀 パフォーマンスと最適化
-- **🧠 スマート同時実行制御** - ファイルサイズとネットワーク状況に基づきダウンロード同時実行数を自動調整
-- **💾 メモリ最適化** - 効率的なリソース管理で 30-50% のメモリ使用量を削減
-- **⚡ ストリーミングファイル処理** - すべてをメモリに読み込まずに大型ディレクトリを処理
-- **📊 パフォーマンス監視** - リアルタイムパフォーマンス指標と最適化統計
-- **🔧 インテリジェントリソース管理** - 高度なキャッシュとアトミック操作
-
 ### 📁 ファイル管理
-- **📋 高度なファイル一覧** - 詳細なファイル情報を含むページネーションリスト
-- **🎯 スマートファイル分類** - O(1) ルックアップで自動ファイルタイプ検出
-- **📱 人間が読みやすい形式** - 読みやすいファイルサイズとタイムスタンプ
-- **🔍 効率的な検索** - 高速なディレクトリトラバーサルとファイル発見
+- **`ls --path "/My Pack"`** — パスベースのナビゲーション（内部でフォルダIDを解決）
+- **長形式** (`-l`) で種類とサイズを表示
+- **人間が読みやすいサイズ** (`-h`): KB / MB / GB
 
-### 💾 ダウンロード機能
-- **🚀 インテリジェントダウンロード** - 最適なパフォーマンスのためのスマート同時実行調整
-- **📈 進捗追跡** - 統計情報付きリアルタイムダウンロード進捗
-- **🔄 レジュームサポート** - エラーリカバリー付き堅牢なダウンロード管理
-- **📁 バッチ操作** - 最適化された同時実行数でフォルダ全体をダウンロード
+### ⬇️ ダウンロード
+- **ネイティブダウンロード** — API の直接ダウンロードURLをストリーミング
+- **単一ファイル** または **再帰的フォルダ** ダウンロード
+- **進捗表示** にパーセンテージ
 
-### 📊 監視と制御
-- **📈 リアルタイム統計** - ライブパフォーマンス指標とダウンロード統計
-- **🛡️ エラーハンドリング** - 包括的なエラー管理と優雅な劣化
-- **⏱️ タイムアウト保護** - すべてのネットワーク操作に 30 秒のタイムアウト
-- **🔒 セキュア設定** - 環境ベースの認証とアトミック設定生成
+### 📊 アカウント情報
+- **`quota`** — ストレージ使用量（人間が読みやすい形式または生のバイト）
 
-### 🌐 強化された CLI
-- **🎯 直感的なコマンド** - クリーンで一貫性のあるコマンド構造
-- **📖 包括的なヘルプ** - 例を含む詳細なヘルプシステム
-- **🎨 リッチな出力** - フォーマットされたテーブルと進捗インジケーター
-- **⚡ 高速応答** - キャッシュ付き最適化されたコマンド実行
+### ⚙️ ビルド
+- **単一 ~3.9 MB バイナリ**（静的リンク、ランタイム不要）
+- **クロスプラットフォーム** Rust（Linux、macOS、Windows）
 
 ## 🚀 クイックスタート
 
 ### 前提条件
-- **Go 1.21+** - ソースからビルドする場合
-- **Git** - リポジトリをクローンする場合
-- **PikPak アカウント** - クラウドストレージアクセス用
+- **Rust 1.78+**（ソースからビルド）
+- **PikPak アカウント** と refresh token
 
-### 1. リポジトリをクローン
+### ソースからインストール
+
 ```bash
 git clone https://github.com/your-username/pikpak-downloader.git
 cd pikpak-downloader
+make build
 ```
 
-### 2. 依存関係をインストール
-```bash
-make deps
-```
+バイナリは `rust/target/release/pikpak-cli` に生成されます。
 
-### 3. 認証を設定
+### 認証の設定
+
 ```bash
 cp .env.example .env
-```
-
-`.env` ファイルを認証情報で編集：
-```bash
-# RefreshToken 認証
+# .env を編集:
 PIKPAK_REFRESH_TOKEN=your_refresh_token
-
-# オプション：プロキシ設定（必要な場合）
-PIKPAK_PROXY=http://127.0.0.1:7890
+# オプション: PIKPAK_PROXY=http://127.0.0.1:7890
 ```
 
-### 4. ビルドと実行
+### 使用法
+
 ```bash
-make build-cli
-./pikpak-cli help
+# ルートディレクトリを一覧
+make run ARGS='ls'
+
+# 詳細ビュー + 人間が読みやすいサイズ
+make run ARGS='ls --path "/My Pack" -l -h'
+
+# ファイルをダウンロード
+make run ARGS='download --path "/My Pack/video.mp4" --output ./downloads'
+
+# クォータを確認
+make run ARGS='quota'
 ```
 
-### 5. インストールを確認
+或者直接二进制文件：
+
 ```bash
-./pikpak-cli quota              # ストレージクォータを確認
-./pikpak-cli ls                 # ファイルを一覧表示
+./rust/target/release/pikpak-cli help
 ```
 
-## 🐳 別のインストール方法
+## 📋 CLI リファレンス
 
-### プリビルドバイナリをダウンロード
+### `ls` — ファイルとディレクトリの一覧
+
+| オプション | 説明 |
+|------|------|
+| `--path <path>` | ディレクトリパス（例: `"/My Pack"`）（デフォルト: `/`） |
+| `-l, --long` | 長形式（種類とサイズ） |
+| `-h, --human` | 人間が読みやすいサイズ（KB / MB / GB） |
+
 ```bash
-# macOS (Intel)
-curl -L -o pikpak-cli https://github.com/your-username/pikpak-downloader/releases/latest/download/pikpak-cli-darwin-amd64
-chmod +x pikpak-cli
-
-# macOS (Apple Silicon)
-curl -L -o pikpak-cli https://github.com/your-username/pikpak-downloader/releases/latest/download/pikpak-cli-darwin-arm64
-chmod +x pikpak-cli
+pikpak-cli ls --path "/My Pack" -l -h
 ```
 
-### Go Install を使用
+### `download` — ファイルまたはフォルダのダウンロード
+
+| オプション | 説明 |
+|------|------|
+| `--path <path>` | ダウンロードするリモートパス（必須） |
+| `--output <dir>` | ローカル出力ディレクトリ（デフォルト: `./downloads`） |
+| `--count <n>` | 並行度ヒント（デフォルト: `3`） |
+
 ```bash
-go install github.com/your-username/pikpak-downloader@latest
+# 単一ファイル
+pikpak-cli download --path "/My Pack/document.pdf" --output ./downloads
+
+# フォルダ全体（再帰）
+pikpak-cli download --path "/My Photos" --output ./backups
 ```
 
-## 🎯 使用例
+### `quota` — ストレージクォータの表示
 
-### 基本的なファイル操作
+| オプション | 説明 |
+|------|------|
+| `--raw` | 生のバイト数を出力（人間が読みやすい形式ではなく） |
+
 ```bash
-# ルートディレクトリを一覧表示
-./pikpak-cli ls
-
-# 人間が読みやすいサイズで詳細表示
-./pikpak-cli ls -l -h
-
-# 特定のフォルダをブラウズ
-./pikpak-cli ls -path "/私のドキュメント" -l
+pikpak-cli quota
+pikpak-cli quota --raw
 ```
 
-### ダウンロード操作
-```bash
-# 最適設定で単一ファイルをダウンロード
-./pikpak-cli download -path "/重要/文書.pdf"
+## 🏗️ 動作原理
 
-# スマート同時実行数でフォルダ全体をダウンロード
-./pikpak-cli download -path "/私の写真" -output "./バックアップ" -progress
+1. **認証** — refresh token で短期 access token を取得。トークンは毎回ローテーションされます。`TokenManager::current_refresh_token` で取得・永続化できます。
+2. **キャプチャ** — 各 drive API 呼び出しに対して `X-Captcha-Token` を取得。期限切れ時に自動更新。
+3. **パス解決** — `list_folder` で各セグメントを辿り、`"/My Pack/videos"` → `folder_id` を解決。
+4. **ダウンロード** — API から `web_content_link` を取得し、ストリーミングでディスクに書き込み、進捗バーを表示。
 
-# 多数の小ファイルのハイパフォーマンスダウンロード
-./pikpak-cli download -path "/ダウンロード" -count 8 -progress
-```
-
-### 監視と管理
-```bash
-# ストレージ使用状況を確認
-./pikpak-cli quota -h
-
-# リアルタイムでダウンロードを監視
-./pikpak-cli download -path "/大型フォルダ" -count 5 -progress
-```
-
-## 📋 コマンド
-
-### ファイル一覧
-```bash
-./pikpak-cli ls                               # ルートディレクトリ
-./pikpak-cli ls -path "/私のフォルダ"              # 特定のフォルダ
-./pikpak-cli ls -l -h                         # 人間が読みやすいサイズで詳細表示
-./pikpak-cli ls -path "/フォルダ" -l            # 特定フォルダの長形式
-```
-
-### ストレージクォータ
-```bash
-./pikpak-cli quota                            # ストレージ使用状況を表示
-./pikpak-cli quota -h                         # 人間が読みやすい形式
-```
-
-### ファイルダウンロード
-```bash
-./pikpak-cli download -path "/ファイル.pdf"                           # 単一ファイル
-./pikpak-cli download -path "/私のフォルダ" -output "./ダウンロード"      # フォルダ全体
-./pikpak-cli download -path "/私のフォルダ" -count 5                   # 同時実行数を設定 (1-10)
-./pikpak-cli download -path "/私のフォルダ" -progress                  # 進捗を表示
-```
-
-### パフォーマンス監視
-```bash
-# 操作中のダウンロード統計を監視
-./pikpak-cli download -path "/大型フォルダ" -count 3 -progress
-
-# パフォーマンス指標を表示（内蔵監視）
-# パフォーマンスデータは自動的に収集され、プログラムでアクセス可能
-```
-
-## ⚡ パフォーマンス最適化
-
-### 🧠 スマート同時実行システム
-- **動的調整**：以下に基づき自動的に同時実行数を最適化：
-  - ファイルサイズ（小ファイルは高同時実行数、大ファイルは最適同時実行数）
-  - ネットワーク速度（検出された帯域幅に基づき調整）
-  - システムリソース（CPU コアと利用可能なメモリ）
-- **ハードウェア認識** - 最大 8 倍の CPU コアを活用して最適なパフォーマンスを実現
-- **インテリジェントスロットリング** - スループットを最大化しつつシステムオーバーロードを防止
-
-### 💾 メモリ最適化
-- **30-50% メモリ削減** - 最適化されたデータ構造とアルゴリズム
-- **ストリーミング処理** - 完全なメモリ読み込みなしで大ファイルリストを処理
-- **効率的な文字列操作** - 事前割り当てバッファと文字列ビルダー
-- **オブジェクトプーリング** - ガベージコレクションを最小化するためにオブジェクトを再利用
-
-### 🚀 ネットワーク最適化
-- **15-25% 高速ダウンロード** - インテリジェント同時実行制御
-- **タイムアウト保護** - 30 秒のタイムアウトでハングアップ操作を防止
-- **接続の再利用** - 最適化されたネットワークリソース管理
-- **エラーリカバリー** - 自動リトライと再開機能
-
-### 📊 実世界のパフォーマンス
-```
-📈 テスト結果 (v4.0.0):
-├── メモリ使用量: 18-22MB (v3.x では 28-32MB)
-├── ダウンロード速度: +15-25% 改善
-├── ファイル一覧: 大型ディレクトリで +20-40% 高速化
-├── エラー率: 大幅に削減
-└── 安定性: ストレステストでクラッシュゼロ
-```
-
-## 📁 プロジェクト構造
+## 📁 プロジェクト構成
 
 ```
 pikpak-downloader/
-├── pikpak_cli.go           # CLI インターフェース
-├── pikpak_client.go        # コアクライアント機能
-├── config_manager.go       # 設定管理
-├── .env.example            # 設定テンプレート
-├── Makefile                # ビルド自動化
-└── README*.md              # ドキュメント
+├── rust/
+│   ├── Cargo.toml
+│   ├── Cargo.lock
+│   ├── pikpak-api/          # ライブラリcrate（認証、キャプチャ、APIクライアント）
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── auth.rs        # OAuth2 リフレッシュトークンフロー
+│   │       ├── captcha.rs     # MD5 チェーン署名計算
+│   │       ├── client.rs      # API: quota, list_folder, resolve_path, download
+│   │       ├── error.rs       # エラー列挙型
+│   │       └── types.rs       # FileInfo, FileKind, Quota
+│   └── pikpak-cli/            # バイナリcrate（CLIフロントエンド）
+│       └── src/main.rs        # Clap CLI + tokio 非同期ランタイム
+├── .env.example
+├── Makefile
+├── README.md
+└── ...
 ```
 
 ## ⚙️ 設定
 
-### 環境変数 (.env)
+### 環境変数（`.env`）
+
 ```bash
-# 認証
-PIKPAK_REFRESH_TOKEN=[your_refresh_token]
+# 必須
+PIKPAK_REFRESH_TOKEN=your_refresh_token
 
 # オプション
 PIKPAK_PROXY=http://127.0.0.1:7890
 PIKPAK_DEVICE_NAME=pikpak-downloader
+
+# OAuth 上書き（未設定の場合はデフォルト値を使用）
+# PIKPAK_CLIENT_ID=
+# PIKPAK_CLIENT_SECRET=
 ```
 
-### RefreshToken の取得方法
-1. PikPak ウェブ版にログイン
+### Refresh Token の取得方法
+
+1. [PikPak Web版](https://mypikpak.com) にログイン
 2. 開発者ツールを開く (F12)
-3. `Application` → `Local Storage` に移動
-4. `refresh_token` 値をコピー
-5. `.env` ファイルに追加
+3. **Application → Local Storage → `https://mypikpak.com`** に移動
+4. `refresh_token` の値をコピー
+5. `.env` に貼り付け: `PIKPAK_REFRESH_TOKEN=...`
 
-## 🔄 バージョン履歴
+## 🔄 最近の変更
 
-### 🎯 v4.0.0 (2025-10-23) - パフォーマンスと最適化リリース
-**インテリジェント最適化機能付き主要パフォーマンスオーバーホール**
-
-#### 🚀 パフォーマンス改善
-- **30-50% メモリ削減** - 最適化されたデータ構造とアルゴリズム
-- **15-25% 高速ダウンロード** - スマート同時実行制御とネットワーク最適化
-- **20-40% 高速ファイル一覧** - ストリーミング処理とキャッシュ
-- **ゼロクラッシュ率** - 包括的なエラーハンドリングとリソース管理
-
-#### 🧠 インテリジェント機能
-- **スマート同時実行システム** - ファイルサイズとネットワーク状況に基づき自動調整
-- **パフォーマンス監視** - リアルタイム指標と統計収集
-- **ハードウェア認識最適化** - 最大 8 倍の CPU コアを活用
-- **メモリ効率処理** - 大型ディレクトリのストリーミング
-
-#### 🛡️ 安定性とセキュリティ
-- **タイムアウト保護** - すべての操作に 30 秒タイムアウト
-- **アトミック設定** - 設定ファイルの破損を防止
-- **強化されたエラーハンドリング** - 包括的なエラー管理
-- **リソースクリーンアップ** - リソース解放を保証
-
-#### 📊 テスト済み・検証済み
-- **11MB+ ファイルをダウンロード** - 大型ファイルセットでの実世界テスト
-- **80+ ファイルを同時実行** - 複数のファイルタイプでストレステスト
-- **メモリ 22MB 未満** - メモリ最適化の主張を検証
-- **ゼロメモリリーク** - 長期実行安定性を確認
-
-### 🔧 v3.1.0 (2025-10-18) - 設定強化
-- .env 設定サポートを追加
-- 自動設定生成
-- セキュリティと使いやすさを向上
-
-### 🌟 v3.0.0 (2025-10-18) - 個人クラウド管理
-- ファイル管理に特化した完全な書き直し
-- ヘルプシステム付き完全なコマンドラインインターフェース
-- スマートファイルタイプ認識
-- セキュアな .env ベース設定
-
----
-
-## 📈 移行ガイド
-
-### v3.x から v4.0.0 へ
-**アップグレードはシームレスで完全に後方互換性があります！**
-
-1. **操作不要** - すべての既存設定が引き続き機能
-2. **自動的利益** - すべてのパフォーマンス改善が自動的に利用可能
-3. **強化された体験** - 設定変更なしで新機能が使用可能
-4. **より良いパフォーマンス** - 速度向上を即座に体感
-
-### v4.0.0 推奨設定
-```bash
-# 複数の小ファイルの最適パフォーマンス
-./pikpak-cli download -path "/ダウンロード" -count 8
-
-# 大ファイル (100MB+)、スマート最適化に任せる
-./pikpak-cli download -path "/大型ファイル" -progress
-
-# 一般使用、デフォルト設定は最適化済み
-./pikpak-cli download -path "/私のフォルダ" -progress
-```
-
-## 🛠️ 開発
-
-```bash
-make build-cli    # CLI ツールをビルド
-make clean        # ビルド成果物をクリア
-make run-cli ls   # 例コマンドで実行
-```
-
-## 🤝 貢献
-
-1. プロジェクトを Fork
-2. 機能ブランチを作成 (`git checkout -b feature/AmazingFeature`)
-3. 変更をコミット (`git commit -m 'Add AmazingFeature'`)
-4. ブランチにプッシュ (`git push origin feature/AmazingFeature`)
-5. Pull Request を開く
+| コミット | 変更点 |
+|------|------|
+| `38f65ac` | **Rust 完全書き換え** — Go wrapper を削除（外部 `pikpakcli` バイナリ不要） |
+| — | ネイティブダウンロードとパス解決を追加 |
+| — | PrintStats ゼロ除算 panic、quoteString YAML エスケープ bug、PerformanceMetrics 混合同步、detectFileType 重複割り当て、ListFilesStream stdout クローズ問題、Rust token リフレッシュストーム、captcha double-check 競合を修正 |
 
 ## 📄 ライセンス
 
-MIT ライセンス - 詳細は [LICENSE](LICENSE) ファイルを確認してください。
-
-## 🔧 トラブルシューティング
-
-### 一般的な問題
-
-#### 設定問題
-```bash
-# エラー：「設定チェック失敗」
-# 解決策：.env ファイルの認証情報を確認
-./pikpak-cli quota  # 設定をテスト
-```
-
-#### ダウンロード問題
-```bash
-# エラー：「pikpak フォルダが見つかりません」
-# 解決策：ファイルパスと権限を確認
-./pikpak-cli ls -path "/"  # 利用可能なフォルダをブラウズ
-```
-
-#### パフォーマンス問題
-```bash
-# ダウンロードが遅い：同時実行数を調整
-./pikpak-cli download -path "/フォルダ" -count 1  # 同時実行数を減らす
-# または
-./pikpak-cli download -path "/フォルダ" -count 8  # 同時実行数を増やす
-```
-
-#### メモリ問題
-```bash
-# 高いメモリ使用量：ストリーミングモードを有効に
-# (v4.0.0 は自動的に大型ディレクトリを効率的に処理)
-```
-
-### デバッグモード
-```bash
-# トラブルシューティングのためにデバッグ出力を有効に
-# .env ファイルを編集：
-PIKPAK_DEBUG=true
-```
-
-### ヘルプを取得
-- 🐛 **バグ報告**: [GitHub Issues](https://github.com/your-username/pikpak-downloader/issues)
-- 💬 **ディスカッション**: [GitHub Discussions](https://github.com/your-username/pikpak-downloader/discussions)
-- 📖 **ドキュメント**: 詳細な変更については [CHANGELOG.md](CHANGELOG.md) を確認
-
-## ⚠️ 免責事項
-
-このツールは個人クラウド管理専用です。PikPak の利用規約と著作権法を遵守してください。開発者は一切の法的責任を負いません。
+MIT — 詳細は [LICENSE](LICENSE) を参照。
 
 ## 🙏 謝辞
 
-- [pikpakcli](https://github.com/52funny/pikpakcli) - コア機能の参考
-- Go 言語コミュニティ - 優れた開発ツールとライブラリ
-- このツールの改善に協力したすべての貢献者とテスター
-
----
-
-## 📊 プロジェクト統計
-
-- **🚀 パフォーマンス**: 30-50% メモリ削減、15-25% 高速ダウンロード
-- **🛡️ 信頼性**: ストレステストでクラッシュゼロ
-- **📱 互換性**: すべての主要プラットフォームをサポート
-- **🔧 メンテナンス**: 定期更新付きアクティブ開発
-
-**このプロジェクトが役に立った場合は、⭐️ を付けて他の人と共有してください！**
+- エンドポイントとキャプチャロジックは [`pikpakcli`](https://github.com/52funny/pikpakcli)（Go）からリバースエンジニアリングし、ネイティブ Rust に移植しました。
+- PikPak は公式 API を公開していないため、エンドポイントは予告なく変更される可能性があります。
