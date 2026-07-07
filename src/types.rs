@@ -27,6 +27,11 @@ impl FileKind {
     pub fn is_folder(self) -> bool {
         matches!(self, FileKind::Folder)
     }
+
+    /// Return `true` if this entry is a regular file.
+    pub fn is_file(self) -> bool {
+        matches!(self, FileKind::File)
+    }
 }
 
 /// A single entry returned by a file listing call.
