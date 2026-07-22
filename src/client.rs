@@ -227,8 +227,10 @@ impl Client {
             let body: ListResponse = serde_json::from_str(&resp)?;
             all.extend(body.files);
 
+            // Break if the server stops paginating or repeats a token we
+            // already used (defends against a malformed infinite response).
             match body.next_page_token {
-                Some(t) if !t.is_empty() => page_token = Some(t),
+                Some(t) if !t.is_empty() && Some(&t) != page_token.as_ref() => page_token = Some(t),
                 _ => break,
             }
         }
@@ -262,8 +264,17 @@ impl Client {
                 return Ok(text);
             }
 
-            // On the first attempt, try to rescue a captcha expiry (code 9).
+            // On the first attempt, try to rescue a stale access token
+            // (401) or a captcha expiry (error_code 9) and retry once.
             if attempt == 0 {
+                if status == reqwest::StatusCode::UNAUTHORIZED {
+                    tracing::debug!(
+                        action = %action,
+                        "access token rejected, invalidating and retrying"
+                    );
+                    self.tokens.invalidate().await;
+                    continue;
+                }
                 if let Ok(err) = serde_json::from_str::<ApiError>(&text) {
                     if err.error_code == 9 {
                         tracing::debug!(
@@ -326,7 +337,7 @@ impl Client {
     pub async fn resolve_path_info(&self, path: &str) -> Result<FileInfo> {
         let normalized = path.trim_matches('/');
         if normalized.is_empty() {
-            return Err(Error::NotConfigured("path must not be empty"));
+            return Err(Error::InvalidPath("path must not be empty"));
         }
 
         let segments: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
@@ -335,18 +346,21 @@ impl Client {
         for (i, seg) in segments.iter().enumerate() {
             let is_last = i == segments.len() - 1;
             let children = self.list_folder(&parent_id).await?;
-            let found = children.iter().find(|f| f.name == **seg);
+            // Middle segments must be folders; only the final segment may be
+            // a file. Restricting the search avoids matching a same-named
+            // file that happens to precede the intended folder.
+            let found = if is_last {
+                children.iter().find(|f| f.name == **seg)
+            } else {
+                children
+                    .iter()
+                    .find(|f| f.kind.is_folder() && f.name == **seg)
+            };
 
             match found {
                 Some(f) => {
                     if is_last {
                         return Ok(f.clone());
-                    }
-                    if !f.kind.is_folder() {
-                        return Err(Error::NotFound {
-                            path: path.to_string(),
-                            segment: (*seg).to_string(),
-                        });
                     }
                     parent_id = f.id.clone();
                 }

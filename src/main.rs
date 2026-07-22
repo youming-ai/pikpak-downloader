@@ -1,4 +1,6 @@
+use std::future::Future;
 use std::path::Path as StdPath;
+use std::pin::Pin;
 use std::process::ExitCode;
 
 use anyhow::{bail, Context, Result};
@@ -11,7 +13,12 @@ use pikpak::auth::OAuthCredentials;
 use pikpak::{Client, FileKind};
 
 #[derive(Debug, Parser)]
-#[command(name = "pikpak", version, about = "PikPak cloud storage CLI")]
+#[command(
+    name = "pikpak",
+    version,
+    about = "PikPak cloud storage CLI",
+    after_help = "Config via .env or environment:\n  PIKPAK_REFRESH_TOKEN  (required) refresh token from the web UI\n  PIKPAK_PROXY          (optional) HTTP(S) proxy URL\n  PIKPAK_CLIENT_ID      (optional) override OAuth client id\n  PIKPAK_CLIENT_SECRET  (optional) override OAuth client secret"
+)]
 struct Cli {
     #[arg(long, global = true)]
     verbose: bool,
@@ -22,10 +29,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// List files and directories.
     Ls(LsArgs),
+    /// Download files or folders.
     Download(DownloadArgs),
+    /// View storage quota.
     Quota(QuotaArgs),
-    Help,
 }
 
 #[derive(Debug, Parser)]
@@ -78,20 +87,11 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    let client = build_client()?;
     match cli.command {
-        Command::Help => {
-            print_help();
-            Ok(())
-        }
-        _ => {
-            let client = build_client()?;
-            match cli.command {
-                Command::Ls(args) => cmd_ls(&client, args).await,
-                Command::Download(args) => cmd_download(&client, args).await,
-                Command::Quota(args) => cmd_quota(&client, args).await,
-                Command::Help => unreachable!(),
-            }
-        }
+        Command::Ls(args) => cmd_ls(&client, args).await,
+        Command::Download(args) => cmd_download(&client, args).await,
+        Command::Quota(args) => cmd_quota(&client, args).await,
     }
 }
 
@@ -155,20 +155,35 @@ async fn cmd_ls(client: &Client, args: LsArgs) -> Result<()> {
 }
 
 async fn cmd_download(client: &Client, args: DownloadArgs) -> Result<()> {
-    tokio::fs::create_dir_all(&args.output)
+    let output = StdPath::new(&args.output);
+    tokio::fs::create_dir_all(output)
         .await
         .context("failed to create output directory")?;
 
     let info = client.resolve_path_info(&args.path).await?;
 
     if info.kind.is_folder() {
-        download_folder(client, &info, &args.output).await
+        download_folder(client, &info, output).await
     } else {
-        download_file(client, &info, &args.output).await
+        download_file(client, &info, output).await
     }
 }
 
-async fn download_file(client: &Client, file: &pikpak::FileInfo, output_dir: &str) -> Result<()> {
+/// Reduce a server-provided name to a single safe path component,
+/// preventing path traversal via absolute paths, `..`, or embedded
+/// separators. Returns the basename, or an error if none remains.
+fn safe_component(name: &str) -> Result<String> {
+    match StdPath::new(name).file_name().and_then(|s| s.to_str()) {
+        Some(base) => Ok(base.to_string()),
+        None => bail!("refusing unsafe remote name: {name:?}"),
+    }
+}
+
+async fn download_file(
+    client: &Client,
+    file: &pikpak::FileInfo,
+    output_dir: &StdPath,
+) -> Result<()> {
     let dl: pikpak::DownloadInfo = client
         .get_download_url(&file.id)
         .await
@@ -177,7 +192,7 @@ async fn download_file(client: &Client, file: &pikpak::FileInfo, output_dir: &st
     println!("Downloading: {}", dl.name);
     println!("Size: {}", format_size(dl.size, BINARY));
 
-    let file_path = StdPath::new(output_dir).join(&dl.name);
+    let file_path = output_dir.join(safe_component(&dl.name)?);
     let mut resp = client
         .http_client()
         .get(&dl.web_content_link)
@@ -193,7 +208,13 @@ async fn download_file(client: &Client, file: &pikpak::FileInfo, output_dir: &st
         );
     }
 
-    let mut out = tokio::fs::File::create(&file_path)
+    // Stream to a `.part` sibling and rename on success so an interrupted
+    // download never leaves a truncated file under its final name.
+    let mut part_path = file_path.clone().into_os_string();
+    part_path.push(".part");
+    let part_path = std::path::PathBuf::from(part_path);
+
+    let mut out = tokio::fs::File::create(&part_path)
         .await
         .context("failed to create output file")?;
 
@@ -213,6 +234,11 @@ async fn download_file(client: &Client, file: &pikpak::FileInfo, output_dir: &st
     }
     eprintln!();
 
+    out.flush().await.context("failed to flush output file")?;
+    tokio::fs::rename(&part_path, &file_path)
+        .await
+        .context("failed to finalize output file")?;
+
     println!("Saved: {}", file_path.display());
     Ok(())
 }
@@ -220,10 +246,10 @@ async fn download_file(client: &Client, file: &pikpak::FileInfo, output_dir: &st
 fn download_folder<'a>(
     client: &'a Client,
     folder: &'a pikpak::FileInfo,
-    output_dir: &'a str,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
+    output_dir: &'a StdPath,
+) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
     Box::pin(async move {
-        let dir_path = StdPath::new(output_dir).join(&folder.name);
+        let dir_path = output_dir.join(safe_component(&folder.name)?);
         tokio::fs::create_dir_all(&dir_path)
             .await
             .context("failed to create folder")?;
@@ -233,9 +259,9 @@ fn download_folder<'a>(
         let files: Vec<pikpak::FileInfo> = client.list_folder(&folder.id).await?;
         for f in &files {
             if f.kind.is_folder() {
-                download_folder(client, f, dir_path.to_str().unwrap()).await?;
+                download_folder(client, f, &dir_path).await?;
             } else {
-                download_file(client, f, dir_path.to_str().unwrap()).await?;
+                download_file(client, f, &dir_path).await?;
             }
         }
 
@@ -264,16 +290,32 @@ async fn cmd_quota(client: &Client, args: QuotaArgs) -> Result<()> {
     Ok(())
 }
 
-fn print_help() {
-    println!("PikPak cloud storage CLI");
-    println!();
-    println!("Usage: pikpak <command> [options]");
-    println!();
-    println!("Commands:");
-    println!("  ls         List files and directories");
-    println!("  download   Download files or folders");
-    println!("  quota      View storage quota");
-    println!();
-    println!("Config via .env:");
-    println!("  PIKPAK_REFRESH_TOKEN=your_refresh_token");
+#[cfg(test)]
+mod tests {
+    use super::safe_component;
+
+    #[test]
+    fn keeps_plain_names() {
+        assert_eq!(safe_component("video.mp4").unwrap(), "video.mp4");
+        assert_eq!(safe_component("My Pack").unwrap(), "My Pack");
+    }
+
+    #[test]
+    fn strips_directory_traversal() {
+        assert_eq!(safe_component("../../etc/passwd").unwrap(), "passwd");
+        assert_eq!(safe_component("a/b/c.txt").unwrap(), "c.txt");
+    }
+
+    #[test]
+    fn rejects_absolute_paths() {
+        assert_eq!(safe_component("/etc/cron.d/x").unwrap(), "x");
+    }
+
+    #[test]
+    fn rejects_names_without_a_basename() {
+        assert!(safe_component("").is_err());
+        assert!(safe_component("..").is_err());
+        assert!(safe_component(".").is_err());
+        assert!(safe_component("/").is_err());
+    }
 }

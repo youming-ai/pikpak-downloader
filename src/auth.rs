@@ -153,6 +153,16 @@ impl TokenManager {
         Ok(fresh)
     }
 
+    /// Drop the cached access token so the next [`access_token`] call
+    /// forces a fresh refresh. Used when the server rejects a token we
+    /// still believed valid (HTTP 401).
+    ///
+    /// [`access_token`]: Self::access_token
+    pub async fn invalidate(&self) {
+        let mut guard = self.inner.cached.write().await;
+        *guard = None;
+    }
+
     /// Return the `sub` (user id) claim from the current token, refreshing
     /// if necessary. Used by the captcha flow to bind requests to a user.
     pub async fn user_id(&self) -> Result<String> {

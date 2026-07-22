@@ -44,6 +44,10 @@ pub enum Error {
     #[error("access token expired and could not be refreshed")]
     TokenExpired,
 
+    /// A supplied path was empty or otherwise malformed.
+    #[error("invalid path: {0}")]
+    InvalidPath(&'static str),
+
     /// Url construction error.
     #[error("url error: {0}")]
     Url(#[from] url::ParseError),
