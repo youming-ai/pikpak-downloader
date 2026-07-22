@@ -1,5 +1,3 @@
-#[PikPak Downloader](https://github.com/youming-ai/pikpak-downloader)
-
 [![License](https://img.shields.io/github/license/youming-ai/pikpak-downloader)](LICENSE)
 
 [English](README.md) | **繁體中文** | [日本語](README.ja-JP.md) | [한국어](README.ko-KR.md)
