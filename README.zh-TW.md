@@ -2,6 +2,8 @@
 
 [![License](https://img.shields.io/github/license/youming-ai/pikpak-downloader)](LICENSE)
 
+[English](README.md) | **繁體中文** | [日本語](README.ja-JP.md) | [한국어](README.ko-KR.md)
+
 基於 Rust 編寫的高性能 **PikPak** 雲端硬碟命令列工具（CLI）和用戶端開發函式庫。
 
 它提供了對檔案清單展示、帳戶配額查詢以及檔案或資料夾遞迴下載的完善支援。同時，它還實作了移植自 `pikpakcli` 的 MD5 簽章生成演算法，能夠自動處理人機驗證（Captcha Token）。
@@ -15,6 +17,7 @@
 - **自動人機驗證與 Token 刷新**：在底層自動實作 PikPak 行動端的驗證簽章演算法（`X-Captcha-Token`）和 Token 輪轉，無需手動進行人機驗證。
 - **代理支援**：支援 HTTP/HTTPS 代理設定，方便在受限的網路環境中使用。
 - **詳細的檔案資訊**：豐富的檔案清單展示，支援詳細模式（`-l`）和易讀的檔案大小單位（`-h`）。
+- **安全的原子化下載**：對伺服器回傳的檔名做路徑穿越（path traversal）淨化，並將每個檔案先串流寫入暫存的 `.part` 檔案，待傳輸完成後才重新命名——即使中途中斷，也不會在最終路徑留下被截斷的殘檔。
 
 ---
 

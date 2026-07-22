@@ -2,6 +2,8 @@
 
 [![License](https://img.shields.io/github/license/youming-ai/pikpak-downloader)](LICENSE)
 
+**English** | [繁體中文](README.zh-TW.md) | [日本語](README.ja-JP.md) | [한국어](README.ko-KR.md)
+
 A high-performance Rust command-line tool (CLI) and client library for **PikPak** cloud storage.
 
 It provides robust support for listing files, checking account quota, and downloading files or directories recursively. It also features automatic captcha solving using MD5 signature generation algorithms ported from `pikpakcli`.
@@ -15,6 +17,7 @@ It provides robust support for listing files, checking account quota, and downlo
 - **Auto-Captcha & Token Flow**: Implements the PikPak mobile client's captcha signature algorithms (`X-Captcha-Token`) and token rotation automatically under the hood. No manual captcha solving is required.
 - **Proxy Support**: Connect via HTTP/HTTPS proxies.
 - **Detailed File Info**: Rich file listing with options for detailed view (`-l`) and human-readable file sizes (`-h`).
+- **Safe & Atomic Downloads**: Server-provided names are sanitized against path traversal, and each file is streamed to a temporary `.part` sibling that is renamed only once the transfer completes — an interrupted download never leaves a truncated file under its final name.
 
 ---
 
