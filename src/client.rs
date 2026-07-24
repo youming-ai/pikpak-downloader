@@ -243,11 +243,17 @@ impl Client {
     /// If the server returns error_code 9 (captcha expired), refreshes the
     /// captcha and retries exactly once.
     async fn drive_get(&self, url: &str, action: &str, query: &[(&str, String)]) -> Result<String> {
-        for attempt in 0..2 {
+        // 401 and captcha-expiry each get one targeted retry; transient
+        // network failures and 5xx/429 get bounded exponential-backoff retries.
+        let mut auth_retried = false;
+        let mut captcha_retried = false;
+        let mut net_retries: u32 = 0;
+
+        loop {
             let access = self.tokens.access_token().await?;
             let captcha = self.captcha.token_for(action).await?;
 
-            let resp = self
+            let send = self
                 .http
                 .get(url)
                 .bearer_auth(&access)
@@ -255,32 +261,54 @@ impl Client {
                 .header("X-Captcha-Token", &captcha)
                 .query(query)
                 .send()
-                .await?;
+                .await;
+
+            let resp = match send {
+                Ok(r) => r,
+                Err(e) if is_transient(&e) && net_retries < MAX_NET_RETRIES => {
+                    let delay = backoff_delay(net_retries);
+                    tracing::debug!(action = %action, error = %e, ?delay, "transient network error, retrying");
+                    net_retries += 1;
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
 
             let status = resp.status();
-            let text = resp.text().await?;
+            let text = match resp.text().await {
+                Ok(t) => t,
+                Err(e) if is_transient(&e) && net_retries < MAX_NET_RETRIES => {
+                    let delay = backoff_delay(net_retries);
+                    net_retries += 1;
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
 
             if status.is_success() {
                 return Ok(text);
             }
 
-            // On the first attempt, try to rescue a stale access token
-            // (401) or a captcha expiry (error_code 9) and retry once.
-            if attempt == 0 {
-                if status == reqwest::StatusCode::UNAUTHORIZED {
-                    tracing::debug!(
-                        action = %action,
-                        "access token rejected, invalidating and retrying"
-                    );
-                    self.tokens.invalidate().await;
-                    continue;
-                }
+            if status == reqwest::StatusCode::UNAUTHORIZED && !auth_retried {
+                tracing::debug!(
+                    action = %action,
+                    "access token rejected, invalidating and retrying"
+                );
+                auth_retried = true;
+                self.tokens.invalidate().await;
+                continue;
+            }
+
+            if !captcha_retried {
                 if let Ok(err) = serde_json::from_str::<ApiError>(&text) {
                     if err.error_code == 9 {
                         tracing::debug!(
                             action = %action,
                             "captcha expired, refreshing and retrying"
                         );
+                        captcha_retried = true;
                         let prev = captcha.clone();
                         let _ = self.captcha.refresh(action, Some(&prev)).await?;
                         continue;
@@ -288,13 +316,22 @@ impl Client {
                 }
             }
 
+            // Server-side transient failures (5xx, 429) are worth a backoff retry.
+            if (status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS)
+                && net_retries < MAX_NET_RETRIES
+            {
+                let delay = backoff_delay(net_retries);
+                tracing::debug!(action = %action, status = %status.as_u16(), ?delay, "server error, retrying");
+                net_retries += 1;
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
             return Err(Error::Api {
                 status: status.as_u16(),
                 message: text,
             });
         }
-
-        unreachable!("drive_get loop exits via return")
     }
 
     /// Resolve a Unix-style path (e.g. `"/My Pack/videos"`) to the
@@ -412,6 +449,21 @@ fn device_id_from(refresh_token: &str) -> String {
     let mut hasher = Md5::new();
     hasher.update(refresh_token.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+/// Maximum retries for transient network / server errors (per request).
+const MAX_NET_RETRIES: u32 = 4;
+
+/// Exponential backoff for retry attempt `n` (0-based): 300ms, 600ms, 1.2s,
+/// 2.4s, ... capped at 10s.
+fn backoff_delay(attempt: u32) -> Duration {
+    let ms = 300u64.saturating_mul(1u64 << attempt.min(5));
+    Duration::from_millis(ms.min(10_000))
+}
+
+/// Whether a reqwest error is a transient network condition worth retrying.
+fn is_transient(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect() || err.is_request() || err.is_body()
 }
 
 #[derive(Debug, Deserialize)]
