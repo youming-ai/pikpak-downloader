@@ -12,7 +12,7 @@ It provides robust support for listing files, checking account quota, and downlo
 - **Recursive Downloads**: Effortlessly download files or entire directory trees, preserving original folder structures.
 - **Auto-Captcha & Token Flow**: Implements the PikPak mobile client's captcha signature algorithms (`X-Captcha-Token`) and token rotation automatically under the hood. No manual captcha solving is required.
 - **Proxy Support**: Connect via HTTP/HTTPS proxies.
-- **Detailed File Info**: Rich file listing with options for detailed view (`-l`) and human-readable file sizes (`-h`).
+- **Detailed File Info**: Rich file listing with options for detailed view (`-l`) and human-readable file sizes (`--human`).
 - **Safe & Atomic Downloads**: Server-provided names are sanitized against path traversal, and each file is streamed to a temporary `.part` sibling that is renamed only once the transfer completes — an interrupted download never leaves a truncated file under its final name.
 - **Resumable Downloads**: Interrupted transfers resume from the existing `.part` file via HTTP `Range` requests, and transient network / server errors are retried with exponential backoff — no re-downloading from scratch after a blip.
 - **Concurrent Downloads**: Fetch many files in parallel with `-j/--jobs` when downloading a folder.
@@ -48,7 +48,7 @@ cargo install --path .
 
 ## Configuration
 
-The application reads configuration from environment variables or a `.env` file in the current working directory.
+The application reads configuration from environment variables or a `.env` file. The file is looked up in the current working directory and then in its parents, so running the tool from a subdirectory still finds your project's `.env`. When PikPak rotates the refresh token, the new value is written back to the same file that was loaded.
 
 To set it up:
 
@@ -85,6 +85,12 @@ PIKPAK_CLIENT_SECRET=
 
 Run `pikpak --help` to see all available commands and flags.
 
+Every command accepts a global `--verbose` flag, which enables debug logging (useful for diagnosing auth, captcha and retry behaviour). It can go before or after the subcommand:
+
+```bash
+pikpak --verbose download --path "/My Pack/video.mp4"
+```
+
 ### 1. View Quota
 
 Display total, used, and free storage spaces.
@@ -114,8 +120,8 @@ pikpak ls
 # List files in a specific path
 pikpak ls --path "/My Pack"
 
-# Detailed list (-l) with human-readable file sizes (-h)
-pikpak ls --path "/My Pack" -l -h
+# Detailed list (-l) with human-readable file sizes (--human)
+pikpak ls --path "/My Pack" -l --human
 ```
 
 ### 3. Download Files & Folders
@@ -176,6 +182,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+### Library notes
+
+- **Which HTTP client to use.** `client.http_client()` carries the configured *total* request timeout, which is right for the small JSON API calls. To stream file content, use `client.download_client()` instead: it has no total deadline, only a per-read stall timeout, so a large file is never cut off mid-transfer.
+- **Persisting a rotated refresh token.** PikPak invalidates the previous refresh token on every exchange. Register `ClientBuilder::on_refresh_token` to persist each new value the moment the server issues it, rather than when your program happens to exit:
+
+  ```rust
+  let client = Client::builder()
+      .refresh_token(token)
+      .on_refresh_token(|rotated| { /* write it back to your config */ })
+      .build()?;
+  ```
+
+### Manual smoke test
+
+The automated tests run entirely against local mock servers and never touch the
+real service, so a few things can only be checked by hand with a real account:
+
+1. `pikpak quota` prints plausible totals.
+2. `pikpak ls --path "/"` and a nested path return the expected entries.
+3. `pikpak download --path <single file>` writes the file into `./downloads`.
+4. `pikpak download --path <folder> -j 4` mirrors the tree and every file
+   completes.
+5. Interrupt a large download (Ctrl-C) and run it again: it resumes instead of
+   restarting, and the finished file matches the remote size.
+6. Confirm a large download is **not** aborted at ~30s.
+7. `pikpak --verbose ls` shows auth, captcha and retry activity.
+8. After the first command, `PIKPAK_REFRESH_TOKEN` in `.env` has changed, and
+   the next command still authenticates.
 
 ---
 
