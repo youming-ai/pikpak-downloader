@@ -222,6 +222,9 @@ real service, so a few things can only be checked by hand with a real account:
 7. `pikpak --verbose ls` shows auth, captcha and retry activity.
 8. After the first command, `PIKPAK_REFRESH_TOKEN` in `.env` has changed, and
    the next command still authenticates.
+9. Run two commands against the same `.env` at once (a `download` in one
+   terminal, `ls` in another): whichever read the token second recovers by
+   re-reading the rotated value, instead of failing with `invalid_grant`.
 
 ## Troubleshooting
 
