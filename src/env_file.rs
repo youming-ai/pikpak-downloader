@@ -18,6 +18,22 @@ pub(crate) fn env_file_for_persistence(
     }
 }
 
+/// Read the refresh token currently stored in `env_path`, if it has one.
+///
+/// Used to recover when another process rotated the token first: the value it
+/// saved is the one that still works. `None` also covers "the token came from
+/// the environment", where there is no file to re-read.
+///
+/// The file is parsed by dotenvy rather than by hand so that a value our own
+/// writer quoted (see [`env_quote`]) reads back exactly as written.
+pub(crate) fn read_env_token(env_path: Option<&StdPath>) -> Option<String> {
+    let content = std::fs::read_to_string(env_path?).ok()?;
+    dotenvy::from_read_iter(std::io::Cursor::new(content))
+        .filter_map(std::result::Result::ok)
+        .find(|(key, _)| key == "PIKPAK_REFRESH_TOKEN")
+        .map(|(_, value)| value)
+}
+
 /// Persist a rotated refresh token and report the outcome.
 ///
 /// Runs from the client's rotation hook, so it executes as soon as the server
@@ -380,6 +396,68 @@ mod tests {
         let content = std::fs::read_to_string(&env_path).unwrap();
         assert!(content.contains("PIKPAK_REFRESH_TOKEN=rotated"));
         assert!(content.contains("PIKPAK_PROXY=http://x"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_env_token_returns_the_stored_value() {
+        let dir = std::env::temp_dir().join(format!("pikpak-read-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let env_path = dir.join(".env");
+        std::fs::write(
+            &env_path,
+            "PIKPAK_REFRESH_TOKEN=stored-token\nPIKPAK_PROXY=http://x\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            super::read_env_token(Some(&env_path)).as_deref(),
+            Some("stored-token")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_env_token_is_none_without_a_file_or_a_key() {
+        let dir = std::env::temp_dir().join(format!("pikpak-read2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // No path at all (the token came from the environment), and no file.
+        assert_eq!(super::read_env_token(None), None);
+        assert_eq!(super::read_env_token(Some(&dir.join("absent.env"))), None);
+
+        // A file without the key.
+        let other = dir.join("other.env");
+        std::fs::write(&other, "PIKPAK_PROXY=http://x\n").unwrap();
+        assert_eq!(super::read_env_token(Some(&other)), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_env_token_round_trips_what_the_writer_stored() {
+        // A reload hands the client whatever this returns, so the writer and the
+        // reader must agree byte-for-byte — including values `env_quote` had to
+        // quote or escape.
+        let dir = std::env::temp_dir().join(format!("pikpak-read3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let env_path = dir.join(".env");
+        std::fs::write(&env_path, "PIKPAK_REFRESH_TOKEN=old\n").unwrap();
+
+        for token in [
+            "plain-token_123",
+            "two words",
+            "with$dollar",
+            "back\\slash",
+            "a\nb",
+            "hash#inside",
+        ] {
+            assert!(super::update_env_token(&env_path, token).unwrap());
+            assert_eq!(
+                super::read_env_token(Some(&env_path)).as_deref(),
+                Some(token),
+                "reload must return {token:?} unchanged"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

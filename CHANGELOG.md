@@ -16,6 +16,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A superseded refresh token is recovered instead of failing the run.** Every
+  exchange invalidates the previous token, so two concurrent runs (or a run
+  racing the web client) can leave one of them holding a dead token while the
+  working replacement sits in the `.env`. On an `invalid_grant` rejection the
+  CLI now re-reads that file and retries once with the token it finds, so
+  colliding runs heal themselves rather than one dying with "refreshed by other
+  process". Library users get the same behaviour through
+  `ClientBuilder::refresh_token_source`.
 - **Downloads are no longer cut off by a total request deadline.** File content
   is fetched with a client whose timeout is a per-read stall timeout, so a
   transfer running longer than the configured timeout is not aborted mid-body
@@ -70,6 +78,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ClientBuilder::on_refresh_token` for persisting rotated tokens.
 - Small public helpers shared by the CLI and the library: `jittered_backoff`,
   `exponential_backoff`, `is_retryable_status` and `is_drive_root`.
+- `ClientBuilder::refresh_token_source`, so an embedder can hand the client the
+  token it has persisted and let a rejected exchange retry once with it.
 - CI (`fmt --check`, `clippy -D warnings`, `test`) plus an MSRV job pinned to
   1.86.
 

@@ -35,6 +35,9 @@ const DEFAULT_USER_AGENT: &str = "ANDROID-com.pikcloud.pikpak/1.21.0";
 /// Shared callback invoked with each newly rotated refresh token.
 type RefreshTokenHook = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Shared callback returning the refresh token the caller has persisted.
+type RefreshTokenSource = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
 /// Public API surface: every PikPak operation goes through this struct.
 ///
 /// Construct via [`ClientBuilder`]. Cheap to clone.
@@ -59,6 +62,7 @@ pub struct ClientBuilder {
     user_agent: String,
     proxy: Option<String>,
     on_refresh_token: Option<RefreshTokenHook>,
+    refresh_token_source: Option<RefreshTokenSource>,
 }
 
 impl Default for ClientBuilder {
@@ -73,6 +77,7 @@ impl Default for ClientBuilder {
             user_agent: DEFAULT_USER_AGENT.into(),
             proxy: None,
             on_refresh_token: None,
+            refresh_token_source: None,
         }
     }
 }
@@ -149,6 +154,23 @@ impl ClientBuilder {
         self
     }
 
+    /// Register a callback returning the refresh token you have persisted, if
+    /// any (for the CLI: the `PIKPAK_REFRESH_TOKEN` line of its `.env`).
+    ///
+    /// PikPak invalidates the previous refresh token on every exchange, so a
+    /// token read a moment ago can already be superseded — typically when a
+    /// second copy of the CLI, or the web client, refreshed in the meantime.
+    /// When an exchange is rejected, the token this callback returns is tried
+    /// once if it differs from the rejected one, which lets concurrent runs
+    /// recover instead of failing while the working replacement sits on disk.
+    pub fn refresh_token_source<F>(mut self, source: F) -> Self
+    where
+        F: Fn() -> Option<String> + Send + Sync + 'static,
+    {
+        self.refresh_token_source = Some(Arc::new(source));
+        self
+    }
+
     /// Finalize and build the [`Client`].
     pub fn build(self) -> Result<Client> {
         let refresh_token = self
@@ -198,6 +220,9 @@ impl ClientBuilder {
         );
         if let Some(hook) = self.on_refresh_token {
             tokens.set_rotation_hook(move |token| hook(token));
+        }
+        if let Some(source) = self.refresh_token_source {
+            tokens.set_token_source(move || source());
         }
 
         let captcha = CaptchaManager::new(

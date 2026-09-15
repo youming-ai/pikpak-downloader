@@ -16,7 +16,7 @@ It provides robust support for listing files, checking account quota, and downlo
 - **Safe & Atomic Downloads**: Server-provided names are sanitized against path traversal, and each file is streamed to a temporary `.part` sibling that is renamed only once the transfer completes — an interrupted download never leaves a truncated file under its final name.
 - **Resumable Downloads**: Interrupted transfers resume from the existing `.part` file via HTTP `Range` requests, and transient network / server errors are retried with exponential backoff — no re-downloading from scratch after a blip.
 - **Concurrent Downloads**: Fetch many files in parallel with `-j/--jobs` when downloading a folder.
-- **Token Rotation Persistence**: PikPak rotates the refresh token on each auth; the rotated value is written back to your `.env` automatically so stored credentials stay valid.
+- **Token Rotation Persistence**: PikPak rotates the refresh token on each auth. The **CLI** writes the rotated value back to your `.env` automatically so stored credentials stay valid; library users persist it themselves through `ClientBuilder::on_refresh_token` (see [Library notes](#library-notes)).
 
 ---
 
@@ -48,7 +48,7 @@ cargo install --path .
 
 ## Configuration
 
-The application reads configuration from environment variables or a `.env` file. The file is looked up in the current working directory and then in its parents, so running the tool from a subdirectory still finds your project's `.env`. When PikPak rotates the refresh token, the new value is written back to the same file that was loaded.
+The application reads configuration from environment variables or a `.env` file. The file is looked up in the current working directory and then in its parents, so running the tool from a subdirectory still finds your project's `.env`. When PikPak rotates the refresh token, the CLI writes the new value back to the same file that was loaded (the library never touches your files; see [Library notes](#library-notes)). If another process rotated the token first, the CLI re-reads that file and retries once with the token it finds, so two concurrent runs recover instead of one failing.
 
 To set it up:
 
@@ -194,6 +194,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   let client = Client::builder()
       .refresh_token(token)
       .on_refresh_token(|rotated| { /* write it back to your config */ })
+      .build()?;
+  ```
+
+- **Recovering when another process rotated first.** Every exchange invalidates the previous token, so a token read a moment ago can already be dead — typically when a second process refreshed in the meantime. `ClientBuilder::refresh_token_source` supplies the token you have persisted; when an exchange is rejected, a *different* token from that source is retried once, so concurrent runs recover instead of failing:
+
+  ```rust
+  let client = Client::builder()
+      .refresh_token(token)
+      .refresh_token_source(|| read_token_from_my_config())
       .build()?;
   ```
 

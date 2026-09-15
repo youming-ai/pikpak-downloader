@@ -153,6 +153,7 @@ fn build_client(
     let refresh_token = validate_refresh_token(std::env::var("PIKPAK_REFRESH_TOKEN").ok())?;
 
     let env_path = env_path.map(StdPath::to_path_buf);
+    let source_path = env_path.clone();
     let mut builder = Client::builder()
         .refresh_token(refresh_token)
         // Persist the moment the server rotates, not when the command ends: a
@@ -163,7 +164,10 @@ fn build_client(
                 rotated_unpersisted.store(true, Ordering::SeqCst);
             }
             env_file::persist_rotated_token(env_path.as_deref(), token);
-        });
+        })
+        // If another process rotated the token first, the replacement it saved is
+        // the one that still works — pick it up rather than failing the run.
+        .refresh_token_source(move || env_file::read_env_token(source_path.as_deref()));
 
     if let Ok(proxy) = std::env::var("PIKPAK_PROXY") {
         if !proxy.is_empty() {
