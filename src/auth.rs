@@ -245,7 +245,7 @@ impl TokenManager {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            return Err(Error::Auth(format!("status {status}: {body}")));
+            return Err(explain_auth_failure(status, &body));
         }
 
         let RefreshResponse {
@@ -276,6 +276,39 @@ impl TokenManager {
         });
         Ok(access_token)
     }
+}
+
+/// Turn a failed token exchange into the most useful error we can produce.
+///
+/// PikPak reports a rejected refresh token as `invalid_grant` (error_code 4126)
+/// for two everyday situations, both of which lock the user out until they act:
+/// the token has already been superseded — every exchange rotates it, so any
+/// other copy (the web client refreshing in the background, or an earlier run of
+/// this tool whose replacement was not kept) is dead — or it was issued for a
+/// different client platform than the Android one this crate authenticates as.
+/// Naming both, and the remedy, turns the server's opaque JSON into something
+/// the user can act on.
+fn explain_auth_failure(status: u16, body: &str) -> Error {
+    let rejected = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .filter(|v| {
+            v.get("error").and_then(|e| e.as_str()) == Some("invalid_grant")
+                || v.get("error_code").and_then(|c| c.as_u64()) == Some(4126)
+        })
+        .is_some();
+    if !rejected {
+        return Error::Auth(format!("status {status}: {body}"));
+    }
+    Error::Auth(format!(
+        "status {status}: PikPak rejected the refresh token (invalid_grant). \
+         The token is single-use — every login rotates it, so the copy you supplied may \
+         already have been superseded by the web client refreshing in the background, or \
+         by an earlier run of this tool. It may also have been issued for a different \
+         client platform: web-app tokens are not always refreshable by this tool's \
+         Android-style client. Put a fresh token in a .env file (rotations are persisted \
+         there automatically), keep other PikPak sessions logged out while this runs, and \
+         see the README's Troubleshooting section. Server response: {body}"
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -429,5 +462,83 @@ mod tests {
 
         client.tokens().access_token().await.unwrap();
         assert_eq!(hook_calls.lock().unwrap().clone(), vec!["rotated-1"]);
+    }
+
+    /// Serve one canned HTTP response, then close.
+    async fn single_shot_server(
+        status: u16,
+        reason: &'static str,
+        body: &'static str,
+    ) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let _ = crate::test_http::read_request(&mut sock).await;
+            crate::test_http::respond_json(&mut sock, status, reason, body).await;
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn a_rejected_grant_explains_its_causes() {
+        // The verbatim rejection from issue #2: a refresh token PikPak refuses
+        // as already superseded. The server's JSON alone says nothing about
+        // what to do, so the error must.
+        let body = r#"{"error":"invalid_grant","error_code":4126,"error_description":"invalid refresh token for it may be has been refreshed by other process, more info redis: nil, RefreshToken [REDACTED]"}"#;
+        let addr = single_shot_server(400, "Bad Request", body).await;
+        let tokens = TokenManager::new(
+            reqwest::Client::new(),
+            format!("http://{addr}/v1/auth/token"),
+            OAuthCredentials::default(),
+            "device-1",
+            "superseded-token",
+        );
+
+        let err = tokens
+            .access_token()
+            .await
+            .expect_err("the rejected exchange must fail");
+        let text = format!("{err:#}");
+
+        assert!(text.contains("invalid_grant"), "{text}");
+        assert!(
+            text.contains("single-use"),
+            "must explain the rotation cause: {text}"
+        );
+        assert!(
+            text.contains("different client platform"),
+            "must explain the client-binding cause: {text}"
+        );
+        assert!(
+            text.contains(".env"),
+            "must point at the .env remedy: {text}"
+        );
+        assert!(text.contains("Server response:"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_auth_failure_stays_plain() {
+        // Only the token rejection gets the long explanation; anything else
+        // keeps the terse status line.
+        let addr = single_shot_server(503, "Service Unavailable", "backend gone").await;
+        let tokens = TokenManager::new(
+            reqwest::Client::new(),
+            format!("http://{addr}/v1/auth/token"),
+            OAuthCredentials::default(),
+            "device-1",
+            "some-token",
+        );
+
+        let err = tokens
+            .access_token()
+            .await
+            .expect_err("the failed exchange must fail");
+        let text = format!("{err:#}");
+
+        assert!(text.contains("status 503"), "{text}");
+        assert!(!text.contains("single-use"), "{text}");
     }
 }

@@ -25,6 +25,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the cached access token is cleared but the rotated refresh token is kept, so
   the next refresh uses the newest value instead of a server-invalidated older
   one.
+- **A rejected refresh token now explains itself.** PikPak's `invalid_grant`
+  (error_code 4126) is reported for two everyday situations — the token was
+  already superseded by a rotation, or it was issued for a different client
+  platform — so the error names both and the remedy instead of relaying only the
+  server's JSON. When the token came from the environment (so a rotation cannot
+  be written anywhere), the run now also ends with a reminder, since missing the
+  printed replacement locks the account out until a new token is supplied (issue
+  #2).
 - **Rotated refresh tokens are persisted the moment the server issues them**,
   not when the command finishes, and are written back to the `.env` that was
   actually loaded (dotenvy also searches parent directories). A token supplied
@@ -67,6 +75,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Known limitations
 
+- PikPak issues refresh tokens per client platform, and this tool authenticates
+  as the Android client. A token minted by the web app is not always refreshable
+  here; a web token rejected as `invalid_grant` on arrival is that mismatch, not
+  a bug in the tool (issue #2).
 - Resuming cannot detect a remote file that changed while keeping both its id
   and its length *and* reporting no modification time.
 - A folder download still enumerates the whole tree before the first transfer

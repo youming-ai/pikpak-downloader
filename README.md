@@ -79,6 +79,8 @@ PIKPAK_CLIENT_SECRET=
 4. Select **Local Storage** -> `https://mypikpak.com`.
 5. Find the key named `credentials` or search for `refresh_token` in the values. It is a long alphanumeric string.
 
+> **Caveat:** PikPak refresh tokens are single-use (every login rotates them, and each rotation invalidates your copy) and they are issued per client platform — this tool authenticates as the Android client, while the web app issues its own tokens. If a freshly copied token is rejected with `invalid_grant`, see [Troubleshooting](#troubleshooting).
+
 ---
 
 ## CLI Usage
@@ -211,6 +213,38 @@ real service, so a few things can only be checked by hand with a real account:
 7. `pikpak --verbose ls` shows auth, captcha and retry activity.
 8. After the first command, `PIKPAK_REFRESH_TOKEN` in `.env` has changed, and
    the next command still authenticates.
+
+## Troubleshooting
+
+### `invalid_grant` — "invalid refresh token ... refreshed by other process"
+
+PikPak answers with this (error_code 4126) when it refuses the refresh token at
+login. Two everyday causes look identical from the outside:
+
+1. **The token was already used.** PikPak rotates the refresh token on *every*
+   login — each exchange invalidates the previous value, so the copy you kept
+   anywhere else is dead the moment something else refreshed it: the web client
+   refreshing in the background, another copy of this tool running at the same
+   time, or an earlier run of this tool whose replacement you did not save.
+
+   - Keep the token in a `.env` file: every rotation is written back there as it
+     happens, so the newest value is always the one on disk.
+   - If you keep it in your shell environment instead, the tool can only *print*
+     the replacement — watch for
+     `note: refresh token rotated; set PIKPAK_REFRESH_TOKEN to: …`, and the
+     end-of-run reminder that follows.
+   - Don't use the web client (or a second copy of this tool) with the same
+     account while the CLI works.
+
+2. **The token was issued for a different client platform.** PikPak mints
+   refresh tokens per login platform, and this tool authenticates as the
+   Android client. A freshly copied web-app token can be rejected outright with
+   this same error (see
+   [#2](https://github.com/youming-ai/pikpak-downloader/issues/2)). If a
+   brand-new token fails immediately and nothing else has touched the account,
+   log out of the web app and back in, then copy a fresh token; if it keeps
+   failing, that web session's tokens may not be refreshable by this client at
+   all.
 
 ---
 

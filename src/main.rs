@@ -1,5 +1,7 @@
 use std::path::{Path as StdPath, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -103,12 +105,33 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli, env_path: Option<PathBuf>) -> Result<()> {
-    let client = build_client(env_path.as_deref())?;
-    match cli.command {
+    // Set by the rotation hook when a rotation happened that could not be
+    // written anywhere, so the run can end with a nudge about it.
+    let rotated_unpersisted = Arc::new(AtomicBool::new(false));
+    let client = build_client(env_path.as_deref(), rotated_unpersisted.clone())?;
+    let result = match cli.command {
         Command::Ls(args) => cmd_ls(&client, args).await,
         Command::Download(args) => download::cmd_download(&client, args).await,
         Command::Quota(args) => cmd_quota(&client, args).await,
+    };
+    if let Some(note) = rotation_reminder(rotated_unpersisted.load(Ordering::SeqCst)) {
+        eprintln!("{note}");
     }
+    result
+}
+
+/// The end-of-run nudge for a rotation that could not be persisted anywhere.
+///
+/// The rotation hook already printed the replacement token when it happened;
+/// this is the last line for a user whose terminal has scrolled past it. Only
+/// the environment-sourced case needs it — with a `.env`, the rotation is
+/// persisted as it happens.
+fn rotation_reminder(unpersisted_rotation: bool) -> Option<&'static str> {
+    unpersisted_rotation.then_some(
+        "PIKPAK_REFRESH_TOKEN came from your environment, so the rotated replacement printed \
+         above could not be saved automatically. Update your environment with it — or put the \
+         token in a .env file, where every rotation is persisted for you.",
+    )
 }
 
 /// Validate the configured refresh token.
@@ -123,7 +146,10 @@ fn validate_refresh_token(value: Option<String>) -> Result<String> {
     }
 }
 
-fn build_client(env_path: Option<&StdPath>) -> Result<Client> {
+fn build_client(
+    env_path: Option<&StdPath>,
+    rotated_unpersisted: Arc<AtomicBool>,
+) -> Result<Client> {
     let refresh_token = validate_refresh_token(std::env::var("PIKPAK_REFRESH_TOKEN").ok())?;
 
     let env_path = env_path.map(StdPath::to_path_buf);
@@ -132,7 +158,12 @@ fn build_client(env_path: Option<&StdPath>) -> Result<Client> {
         // Persist the moment the server rotates, not when the command ends: a
         // long download can be interrupted at any point, and by then the
         // previous refresh token is already invalid server-side.
-        .on_refresh_token(move |token| env_file::persist_rotated_token(env_path.as_deref(), token));
+        .on_refresh_token(move |token| {
+            if env_path.is_none() {
+                rotated_unpersisted.store(true, Ordering::SeqCst);
+            }
+            env_file::persist_rotated_token(env_path.as_deref(), token);
+        });
 
     if let Ok(proxy) = std::env::var("PIKPAK_PROXY") {
         if !proxy.is_empty() {
@@ -221,6 +252,17 @@ mod tests {
         assert!(super::validate_refresh_token(Some(String::new())).is_err());
         assert!(super::validate_refresh_token(Some("   ".to_string())).is_err());
         assert!(super::validate_refresh_token(None).is_err());
+    }
+
+    #[test]
+    fn rotation_reminder_only_fires_when_nothing_was_persisted() {
+        let note = super::rotation_reminder(true).expect("must remind");
+        assert!(note.contains("could not be saved automatically"), "{note}");
+        assert!(note.contains(".env"), "{note}");
+        assert!(
+            super::rotation_reminder(false).is_none(),
+            "a persisted rotation (the .env case) must not nag"
+        );
     }
 
     #[test]
