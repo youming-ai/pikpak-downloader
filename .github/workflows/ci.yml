@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Keep in sync with `rust-version` in Cargo.toml. `--locked` is
+      # deliberate: the MSRV here is driven by the committed dependency
+      # versions, so an unlocked build would drift.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.86.0"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build with the minimum supported Rust version
+        run: cargo check --locked --all-targets
