@@ -2,6 +2,10 @@
 name = "pikpak"
 version = "0.1.0"
 edition = "2021"
+# Verified with `cargo +1.86.0 check --locked --all-targets`. This crate's own
+# code only needs 1.82, but the committed lockfile pulls in dependencies that
+# require 1.86 (icu/idna) and edition2024 (clap_lex, Rust 1.85).
+rust-version = "1.86"
 license = "MIT"
 repository = "https://github.com/youming-ai/pikpak-downloader"
 
