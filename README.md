@@ -1,160 +1,86 @@
 [![License](https://img.shields.io/github/license/youming-ai/pikpak-downloader)](LICENSE)
+![rustc 1.86+](https://img.shields.io/badge/rustc-1.86%2B-blue)
 
-A high-performance Rust command-line tool (CLI) and client library for **PikPak** cloud storage.
+PikPak from the terminal. Listing, quota and downloading, as a CLI or a Rust
+library. Captcha signing and refresh-token rotation are handled for you.
 
-It provides robust support for listing files, checking account quota, and downloading files or directories recursively. It also features automatic captcha solving using MD5 signature generation algorithms ported from `pikpakcli`.
+- **Resumable.** `.part` + HTTP `Range`, retried with jittered backoff. A partial
+  is only resumed while it still belongs to the same remote file (id, size and
+  mtime, kept in a `<name>.part.meta` sidecar), and a transfer is never finalized
+  short of the size the API reported.
+- **Concurrent.** `-j N` for folders; remote trees are mirrored as they are.
+- **Careful with names.** Server-provided names are sanitized (path traversal,
+  `..`, Windows reserved names like `CON`/`NUL`) before touching your disk.
+- **No manual captcha.** `X-Captcha-Token` is derived and refreshed
+  transparently; tokens rotate without you noticing.
 
----
-
-## Features
-
-- **CLI & Library**: Use it as a stand-alone command-line tool or integrate it into your own Rust projects as a client library.
-- **Recursive Downloads**: Effortlessly download files or entire directory trees, preserving original folder structures.
-- **Auto-Captcha & Token Flow**: Implements the PikPak mobile client's captcha signature algorithms (`X-Captcha-Token`) and token rotation automatically under the hood. No manual captcha solving is required.
-- **Proxy Support**: Connect via HTTP/HTTPS proxies.
-- **Detailed File Info**: Rich file listing with options for detailed view (`-l`) and human-readable file sizes (`--human`).
-- **Safe & Atomic Downloads**: Server-provided names are sanitized against path traversal, and each file is streamed to a temporary `.part` sibling that is renamed only once the transfer completes — an interrupted download never leaves a truncated file under its final name.
-- **Resumable Downloads**: Interrupted transfers resume from the existing `.part` file via HTTP `Range` requests, and transient network / server errors are retried with exponential backoff — no re-downloading from scratch after a blip. A partial is only resumed while it still belongs to the same remote file (id, size and modification time, recorded in a `<name>.part.meta` sidecar beside it), so a replaced or re-uploaded file is fetched afresh instead of being spliced together; a transfer is never finalized while it is shorter than the size the API reported.
-- **Concurrent Downloads**: Fetch many files in parallel with `-j/--jobs` when downloading a folder.
-- **Token Rotation Persistence**: PikPak rotates the refresh token on each auth. The **CLI** writes the rotated value back to your `.env` automatically so stored credentials stay valid; library users persist it themselves through `ClientBuilder::on_refresh_token` (see [Library notes](#library-notes)).
-
----
-
-## Installation
-
-### Build from Source
-
-Requires **Rust 1.86 or newer** (declared as `rust-version` in `Cargo.toml` and enforced by the CI MSRV job). Then run:
+## Install
 
 ```bash
-# Clone the repository
-git clone https://github.com/youming-ai/pikpak-downloader.git
-cd pikpak-downloader
-
-# Build the release binary
-cargo build --release
-
-# The compiled binary will be available at:
-./target/release/pikpak --help
+cargo install --path .        # or: cargo build --release
+pikpak --help
 ```
 
-### Install to System Path
+Rust 1.86 or newer (`rust-version` in `Cargo.toml`, pinned by the CI MSRV job).
+
+## Configure
 
 ```bash
-cargo install --path .
-```
-
----
-
-## Configuration
-
-The application reads configuration from environment variables or a `.env` file. The file is looked up in the current working directory and then in its parents, so running the tool from a subdirectory still finds your project's `.env`. When PikPak rotates the refresh token, the CLI writes the new value back to the same file that was loaded (the library never touches your files; see [Library notes](#library-notes)). If another process rotated the token first, the CLI re-reads that file and retries once with the token it finds, so two concurrent runs recover instead of one failing.
-
-To set it up:
-
-```bash
-# Copy the example environment file
 cp .env.example .env
 ```
 
-Open `.env` and fill in your details. The `cp` above copies the example file's
-own comments with it; they explain the token's single-use rotation and what
-happens when two clients refresh the same account at once.
+Read from the environment, or from the first `.env` found in the working
+directory and then its parents. `PIKPAK_REFRESH_TOKEN` is required;
+`PIKPAK_PROXY`, `PIKPAK_CLIENT_ID` and `PIKPAK_CLIENT_SECRET` are optional.
 
-```env
-# Single-use, and written back here automatically — see the notes above.
-PIKPAK_REFRESH_TOKEN=your_refresh_token
+PikPak refresh tokens are **single-use**: every login rotates them, and the CLI
+writes each replacement back into the file it loaded — so keep the token in
+`.env` rather than your shell environment, where the tool can only *print* the
+replacement. Two clients refreshing one account at once is handled as well: the
+CLI re-reads that file and retries once.
 
-# Optional: HTTP/HTTPS proxy URL (e.g., http://127.0.0.1:7890)
-PIKPAK_PROXY=
+<details>
+<summary>Where to get the token</summary>
 
-# Optional: Custom OAuth Client ID and Secret if you wish to override defaults
-PIKPAK_CLIENT_ID=
-PIKPAK_CLIENT_SECRET=
-```
+1. Log in at [mypikpak.com](https://mypikpak.com) and open DevTools.
+2. **Application** → **Local Storage** → `https://mypikpak.com`.
+3. Find `credentials`, or search the values for `refresh_token`.
 
-### How to Get `PIKPAK_REFRESH_TOKEN`
+The web app issues platform-bound tokens, so a freshly copied one can be refused
+outright — see [Troubleshooting](#troubleshooting).
+</details>
 
-1. Go to the [PikPak Web Client](https://mypikpak.com) and log in to your account.
-2. Open your browser's Developer Tools (usually `F12` or right-click -> `Inspect`).
-3. Navigate to the **Application** tab (Chrome/Edge) or **Storage** tab (Firefox).
-4. Select **Local Storage** -> `https://mypikpak.com`.
-5. Find the key named `credentials` or search for `refresh_token` in the values. It is a long alphanumeric string.
-
-> **Caveat:** PikPak refresh tokens are single-use (every login rotates them, and each rotation invalidates your copy) and they are issued per client platform — this tool authenticates as the Android client, while the web app issues its own tokens. If a freshly copied token is rejected with `invalid_grant`, see [Troubleshooting](#troubleshooting).
-
----
-
-## CLI Usage
-
-Run `pikpak --help` to see all available commands and flags.
-
-Every command accepts a global `--verbose` flag, which enables debug logging (useful for diagnosing auth, captcha and retry behaviour). It can go before or after the subcommand:
+## CLI
 
 ```bash
+pikpak quota                                  # totals; --raw for byte counts
+pikpak ls                                     # root
+pikpak ls --path "/My Pack" -l                # long listing; --human for sizes
+pikpak download --path "/My Pack/Movies" -j 4
+pikpak download --path "/My Pack/video.mp4" --output /data
+pikpak download --path /                      # drive root, expanded into its children
 pikpak --verbose download --path "/My Pack/video.mp4"
 ```
 
-### 1. View Quota
-
-Display total, used, and free storage spaces.
-
-```bash
-# Human-readable format (default)
-pikpak quota
-
-# Output example:
-# total: 10.00 TiB
-# used:  4.23 TiB
-# free:  5.77 TiB
-# usage: 42.3%
-
-# Raw byte counts
-pikpak quota --raw
+```console
+$ pikpak quota
+total: 10.00 TiB
+used:  4.23 TiB
+free:  5.77 TiB
+usage: 42.3%
 ```
 
-### 2. List Files & Folders
+| flag | meaning |
+| --- | --- |
+| `--path <p>` | remote path, `/` = drive root |
+| `--output <d>` | local directory (default `./downloads`) |
+| `-j, --jobs <n>` | files fetched in parallel (folders only) |
+| `-l, --long` | long listing (`ls`) |
+| `--human` | human-readable sizes (`ls`; long flag only — `-h` is `--help`) |
+| `--raw` | byte counts instead of sizes (`quota`) |
+| `--verbose` | debug logs, before or after the subcommand |
 
-List files in a given directory path.
-
-```bash
-# List files in the root folder (/)
-pikpak ls
-
-# List files in a specific path
-pikpak ls --path "/My Pack"
-
-# Detailed list (-l) with human-readable file sizes (--human)
-pikpak ls --path "/My Pack" -l --human
-```
-
-### 3. Download Files & Folders
-
-Download a single file or an entire directory recursively.
-
-```bash
-# Download a file to the default folder (./downloads)
-pikpak download --path "/My Pack/video.mp4"
-
-# Download a directory recursively
-pikpak download --path "/My Pack/Movies"
-
-# Download a directory recursively with 4 concurrent transfers
-pikpak download --path "/My Pack/Movies" --jobs 4
-
-# Download to a custom output directory
-pikpak download --path "/My Pack/video.mp4" --output "/path/to/local/dir"
-
-# Download the whole drive root (expanded into its children; files land
-# directly in the output directory, folders keep their own subdirectory)
-pikpak download --path /
-```
-
----
-
-## Library Usage (Rust API)
-
-You can also use `pikpak` as a library crate. Add it to your `Cargo.toml` dependencies, or use a local path dependency.
+## Library
 
 ```rust
 use pikpak::Client;
@@ -191,82 +117,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Library notes
-
-- **Which HTTP client to use.** `client.http_client()` carries the configured *total* request timeout, which is right for the small JSON API calls. To stream file content, use `client.download_client()` instead: it has no total deadline, only a per-read stall timeout, so a large file is never cut off mid-transfer.
-- **Persisting a rotated refresh token.** PikPak invalidates the previous refresh token on every exchange. Register `ClientBuilder::on_refresh_token` to persist each new value the moment the server issues it, rather than when your program happens to exit:
-
-  ```rust
-  let client = Client::builder()
-      .refresh_token(token)
-      .on_refresh_token(|rotated| { /* write it back to your config */ })
-      .build()?;
-  ```
-
-- **Recovering when another process rotated first.** Every exchange invalidates the previous token, so a token read a moment ago can already be dead — typically when a second process refreshed in the meantime. `ClientBuilder::refresh_token_source` supplies the token you have persisted; when an exchange is rejected, a *different* token from that source is retried once, so concurrent runs recover instead of failing:
-
-  ```rust
-  let client = Client::builder()
-      .refresh_token(token)
-      .refresh_token_source(|| read_token_from_my_config())
-      .build()?;
-  ```
-
-### Manual smoke test
-
-The automated tests run entirely against local mock servers and never touch the
-real service, so a few things can only be checked by hand with a real account:
-
-1. `pikpak quota` prints plausible totals.
-2. `pikpak ls --path "/"` and a nested path return the expected entries.
-3. `pikpak download --path <single file>` writes the file into `./downloads`.
-4. `pikpak download --path <folder> -j 4` mirrors the tree and every file
-   completes.
-5. Interrupt a large download (Ctrl-C) and run it again: it resumes instead of
-   restarting, and the finished file matches the remote size.
-6. Confirm a large download is **not** aborted at ~30s.
-7. `pikpak --verbose ls` shows auth, captcha and retry activity.
-8. After the first command, `PIKPAK_REFRESH_TOKEN` in `.env` has changed, and
-   the next command still authenticates.
-9. Run two commands against the same `.env` at once (a `download` in one
-   terminal, `ls` in another): whichever read the token second recovers by
-   re-reading the rotated value, instead of failing with `invalid_grant`.
+- `client.http_client()` for API calls (total request timeout);
+  `client.download_client()` for file content — no total deadline, only a
+  per-read stall timeout, so large transfers are not cut off.
+- Persist each rotation as it happens with `ClientBuilder::on_refresh_token`;
+  recover from another process's rotation with
+  `ClientBuilder::refresh_token_source`.
+- The library never writes your files.
 
 ## Troubleshooting
 
 ### `invalid_grant` — "invalid refresh token ... refreshed by other process"
 
-PikPak answers with this (error_code 4126) when it refuses the refresh token at
-login. Two everyday causes look identical from the outside:
+Two causes look identical from the outside:
 
-1. **The token was already used.** PikPak rotates the refresh token on *every*
-   login — each exchange invalidates the previous value, so the copy you kept
-   anywhere else is dead the moment something else refreshed it: the web client
-   refreshing in the background, another copy of this tool running at the same
-   time, or an earlier run of this tool whose replacement you did not save.
+1. **Already used.** Tokens are single-use, so anything else refreshing the
+   account — the web client, a second copy of this tool, an earlier run — kills
+   your copy. Keep it in `.env`, where rotations persist themselves.
+2. **Issued for another platform.** This tool authenticates as the Android
+   client, and a web-issued token may not be refreshable by it
+   ([#2](https://github.com/youming-ai/pikpak-downloader/issues/2)). If a
+   brand-new token fails while nothing else touches the account, this is it.
 
-   - Keep the token in a `.env` file: every rotation is written back there as it
-     happens, so the newest value is always the one on disk.
-   - If you keep it in your shell environment instead, the tool can only *print*
-     the replacement — watch for
-     `note: refresh token rotated; set PIKPAK_REFRESH_TOKEN to: …`, and the
-     end-of-run reminder that follows.
-   - Don't use the web client (or a second copy of this tool) with the same
-     account while the CLI works.
+<details>
+<summary>Manual smoke test (needs a real account)</summary>
 
-2. **The token was issued for a different client platform.** PikPak mints
-   refresh tokens per login platform, and this tool authenticates as the
-   Android client. A freshly copied web-app token can be rejected outright with
-   this same error (see
-   [#2](https://github.com/youming-ai/pikpak-downloader/issues/2)). If a
-   brand-new token fails immediately and nothing else has touched the account,
-   log out of the web app and back in, then copy a fresh token; if it keeps
-   failing, that web session's tokens may not be refreshable by this client at
-   all.
+The test suite runs against local mocks only, so a few things are hand-checked:
 
----
+1. `pikpak quota`, `pikpak ls --path /` and a nested path look right;
+   `--verbose ls` shows auth, captcha and retry activity.
+2. `pikpak download --path <file>` and `<folder> -j 4` produce complete files.
+3. Interrupt a large download and re-run: it resumes, and the result matches the
+   remote size.
+4. A large download is not aborted at ~30s.
+5. Two commands against one `.env` at once: the second one recovers.
+6. After a command, the token in `.env` has rotated and the next run still
+   authenticates.
+</details>
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
-
+MIT — see [LICENSE](LICENSE).
