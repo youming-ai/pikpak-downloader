@@ -14,7 +14,7 @@ It provides robust support for listing files, checking account quota, and downlo
 - **Proxy Support**: Connect via HTTP/HTTPS proxies.
 - **Detailed File Info**: Rich file listing with options for detailed view (`-l`) and human-readable file sizes (`--human`).
 - **Safe & Atomic Downloads**: Server-provided names are sanitized against path traversal, and each file is streamed to a temporary `.part` sibling that is renamed only once the transfer completes — an interrupted download never leaves a truncated file under its final name.
-- **Resumable Downloads**: Interrupted transfers resume from the existing `.part` file via HTTP `Range` requests, and transient network / server errors are retried with exponential backoff — no re-downloading from scratch after a blip.
+- **Resumable Downloads**: Interrupted transfers resume from the existing `.part` file via HTTP `Range` requests, and transient network / server errors are retried with exponential backoff — no re-downloading from scratch after a blip. A partial is only resumed while it still belongs to the same remote file (id, size and modification time, recorded in a `<name>.part.meta` sidecar beside it), so a replaced or re-uploaded file is fetched afresh instead of being spliced together; a transfer is never finalized while it is shorter than the size the API reported.
 - **Concurrent Downloads**: Fetch many files in parallel with `-j/--jobs` when downloading a folder.
 - **Token Rotation Persistence**: PikPak rotates the refresh token on each auth. The **CLI** writes the rotated value back to your `.env` automatically so stored credentials stay valid; library users persist it themselves through `ClientBuilder::on_refresh_token` (see [Library notes](#library-notes)).
 
@@ -24,7 +24,7 @@ It provides robust support for listing files, checking account quota, and downlo
 
 ### Build from Source
 
-Ensure you have Rust and Cargo installed, then run:
+Requires **Rust 1.86 or newer** (declared as `rust-version` in `Cargo.toml` and enforced by the CI MSRV job). Then run:
 
 ```bash
 # Clone the repository
@@ -142,6 +142,10 @@ pikpak download --path "/My Pack/Movies" --jobs 4
 
 # Download to a custom output directory
 pikpak download --path "/My Pack/video.mp4" --output "/path/to/local/dir"
+
+# Download the whole drive root (expanded into its children; files land
+# directly in the output directory, folders keep their own subdirectory)
+pikpak download --path /
 ```
 
 ---
