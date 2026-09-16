@@ -57,11 +57,13 @@ To set it up:
 cp .env.example .env
 ```
 
-Open `.env` and fill in your details:
+Open `.env` and fill in your details. The `cp` above copies the example file's
+own comments with it; they explain the token's single-use rotation and what
+happens when two clients refresh the same account at once.
 
 ```env
-# Required: Your PikPak refresh token
-PIKPAK_REFRESH_TOKEN=your_refresh_token_here
+# Single-use, and written back here automatically — see the notes above.
+PIKPAK_REFRESH_TOKEN=your_refresh_token
 
 # Optional: HTTP/HTTPS proxy URL (e.g., http://127.0.0.1:7890)
 PIKPAK_PROXY=
@@ -155,7 +157,7 @@ pikpak download --path /
 You can also use `pikpak` as a library crate. Add it to your `Cargo.toml` dependencies, or use a local path dependency.
 
 ```rust
-use pikpak::{Client, FileKind};
+use pikpak::Client;
 use std::time::Duration;
 
 #[tokio::main]
