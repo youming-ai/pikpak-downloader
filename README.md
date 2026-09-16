@@ -4,15 +4,13 @@
 PikPak from the terminal. Listing, quota and downloading, as a CLI or a Rust
 library. Captcha signing and refresh-token rotation are handled for you.
 
-- **Resumable.** `.part` + HTTP `Range`, retried with jittered backoff. A partial
-  is only resumed while it still belongs to the same remote file (id, size and
-  mtime, kept in a `<name>.part.meta` sidecar), and a transfer is never finalized
-  short of the size the API reported.
-- **Concurrent.** `-j N` for folders; remote trees are mirrored as they are.
-- **Careful with names.** Server-provided names are sanitized (path traversal,
-  `..`, Windows reserved names like `CON`/`NUL`) before touching your disk.
-- **No manual captcha.** `X-Captcha-Token` is derived and refreshed
-  transparently; tokens rotate without you noticing.
+- **Resumable + concurrent.** `.part` + `Range` — resumed only while the partial
+  still matches the remote file (id/size/mtime) — jittered backoff, `-j N` trees,
+  and a transfer is never finalized short of the reported size.
+- **Defensive.** Server names are sanitized (traversal, `..`, Windows `CON`/`NUL`)
+  and each file is renamed into place only once it is complete.
+- **Automatic.** Captcha and token rotation; rotated tokens are written back to
+  your `.env`, and one another process already rotated is recovered.
 
 ## Install
 
@@ -82,7 +80,7 @@ usage: 42.3%
 
 ## Library
 
-```rust
+```rust,no_run
 use pikpak::Client;
 use std::time::Duration;
 
@@ -157,4 +155,4 @@ The test suite runs against local mocks only, so a few things are hand-checked:
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](https://github.com/youming-ai/pikpak-downloader/blob/main/LICENSE).

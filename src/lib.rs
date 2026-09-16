@@ -1,5 +1,8 @@
 //! Rust crate for PikPak cloud storage.
-
+//!
+//! The README is the crate documentation, so its examples are compiled by
+//! `cargo test --doc` and cannot drift from the API.
+#![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]
 
 pub mod auth;
