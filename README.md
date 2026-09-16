@@ -45,7 +45,7 @@ CLI re-reads that file and retries once.
 3. Find `credentials`, or search the values for `refresh_token`.
 
 The web app issues platform-bound tokens, so a freshly copied one can be refused
-outright — see [Troubleshooting](#troubleshooting).
+outright by this Android-client tool.
 </details>
 
 ## CLI
@@ -122,36 +122,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   recover from another process's rotation with
   `ClientBuilder::refresh_token_source`.
 - The library never writes your files.
-
-## Troubleshooting
-
-### `invalid_grant` — "invalid refresh token ... refreshed by other process"
-
-Two causes look identical from the outside:
-
-1. **Already used.** Tokens are single-use, so anything else refreshing the
-   account — the web client, a second copy of this tool, an earlier run — kills
-   your copy. Keep it in `.env`, where rotations persist themselves.
-2. **Issued for another platform.** This tool authenticates as the Android
-   client, and a web-issued token may not be refreshable by it
-   ([#2](https://github.com/youming-ai/pikpak-downloader/issues/2)). If a
-   brand-new token fails while nothing else touches the account, this is it.
-
-<details>
-<summary>Manual smoke test (needs a real account)</summary>
-
-The test suite runs against local mocks only, so a few things are hand-checked:
-
-1. `pikpak quota`, `pikpak ls --path /` and a nested path look right;
-   `--verbose ls` shows auth, captcha and retry activity.
-2. `pikpak download --path <file>` and `<folder> -j 4` produce complete files.
-3. Interrupt a large download and re-run: it resumes, and the result matches the
-   remote size.
-4. A large download is not aborted at ~30s.
-5. Two commands against one `.env` at once: the second one recovers.
-6. After a command, the token in `.env` has rotated and the next run still
-   authenticates.
-</details>
 
 ## License
 

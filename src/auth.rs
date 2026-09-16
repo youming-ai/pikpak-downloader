@@ -404,8 +404,8 @@ fn explain_auth_failure(status: u16, body: &str) -> Error {
          by an earlier run of this tool. It may also have been issued for a different \
          client platform: web-app tokens are not always refreshable by this tool's \
          Android-style client. Put a fresh token in a .env file (rotations are persisted \
-         there automatically), keep other PikPak sessions logged out while this runs, and \
-         see the README's Troubleshooting section. Server response: {body}"
+         there automatically) and keep other PikPak sessions logged out while this runs. \
+         Server response: {body}"
     ))
 }
 
