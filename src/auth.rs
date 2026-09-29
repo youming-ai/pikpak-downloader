@@ -235,9 +235,26 @@ impl TokenManager {
     /// Return the `sub` (user id) claim from the current token, refreshing
     /// if necessary. Used by the captcha flow to bind requests to a user.
     pub async fn user_id(&self) -> Result<String> {
-        // Trigger a refresh if needed, then read the cache.
-        let _ = self.access_token().await?;
-        let guard = self.inner.cached.read().await;
+        // Fast path: still valid.
+        {
+            let guard = self.inner.cached.read().await;
+            if let Some(t) = guard.as_ref() {
+                if Instant::now() < t.refresh_at {
+                    return Ok(t.user_id.clone());
+                }
+            }
+        }
+
+        // Slow path: acquire write lock and refresh. Double-check inside the
+        // write lock in case another task refreshed while we were waiting.
+        let mut guard = self.inner.cached.write().await;
+        if let Some(t) = guard.as_ref() {
+            if Instant::now() < t.refresh_at {
+                return Ok(t.user_id.clone());
+            }
+        }
+
+        self.refresh_now(&mut guard).await?;
         guard
             .as_ref()
             .map(|t| t.user_id.clone())

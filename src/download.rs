@@ -162,7 +162,15 @@ fn safe_component(name: &str) -> Result<String> {
 /// Kept separate from [`safe_component`] so the rules can be tested on any
 /// platform, while only being *applied* when actually running on Windows.
 fn sanitize_for_windows(name: &str) -> String {
-    let trimmed = name.trim_end_matches(['.', ' ']);
+    let filtered: String = name
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            c if (c as u32) < 32 => '_',
+            c => c,
+        })
+        .collect();
+    let trimmed = filtered.trim_end_matches(['.', ' ']);
     let trimmed = if trimmed.is_empty() { "_" } else { trimmed };
     let stem = trimmed
         .split('.')
@@ -334,18 +342,25 @@ async fn download_file(
         .await
         .context("failed to get download URL")?;
 
-    let file_path = output_dir.join(safe_component(&dl.name)?);
+    let file_name = if dl.name.trim().is_empty() {
+        &file.name
+    } else {
+        &dl.name
+    };
+    let expected_size = if dl.size == 0 { file.size } else { dl.size };
+
+    let file_path = output_dir.join(safe_component(file_name)?);
     let mut part = file_path.clone().into_os_string();
     part.push(".part");
     let part_path = PathBuf::from(part);
 
     // Never resume bytes that might belong to a different version of the file.
-    prepare_part(&part_path, &PartIdentity::of(file, dl.size)).await?;
+    prepare_part(&part_path, &PartIdentity::of(file, expected_size)).await?;
 
     println!(
         "Downloading: {} ({})",
-        dl.name,
-        format_size(dl.size, BINARY)
+        file_name,
+        format_size(expected_size, BINARY)
     );
 
     // The download link is time-limited; refresh it on each retry.
@@ -354,24 +369,24 @@ async fn download_file(
     let mut last_size = part_size(&part_path).await;
     loop {
         let size_before = last_size;
-        match download_attempt(client, &link, dl.size, &part_path, show_progress).await {
+        match download_attempt(client, &link, expected_size, &part_path, show_progress).await {
             Ok(()) => break,
             Err(err) => {
                 if !matches!(err, DlError::Retryable(_)) {
                     return Err(err.into_inner())
-                        .with_context(|| format!("failed to download {}", dl.name));
+                        .with_context(|| format!("failed to download {}", file_name));
                 }
                 let e = err.into_inner();
                 last_size = part_size(&part_path).await;
                 let Some(base_delay) = budget.record_failure(last_size > size_before) else {
-                    return Err(e).with_context(|| format!("failed to download {}", dl.name));
+                    return Err(e).with_context(|| format!("failed to download {}", file_name));
                 };
                 // Spread the wait so workers that failed together do not retry
                 // together; the budget's own arithmetic stays deterministic.
                 let delay = jittered_backoff(base_delay);
                 eprintln!(
                     "  {}: attempt {} failed ({e:#}); retrying in {:.1}s",
-                    dl.name,
+                    file_name,
                     budget.attempts,
                     delay.as_secs_f64()
                 );
@@ -459,7 +474,10 @@ async fn download_attempt(
             // 200 OK (range ignored) or a fresh download: start from zero.
             (create_part(part_path).await?, 0)
         } else {
-            let retry = is_retryable_status(status);
+            let is_url_expired = status == reqwest::StatusCode::FORBIDDEN
+                || status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::GONE;
+            let retry = is_retryable_status(status) || is_url_expired;
             let body = resp.text().await.unwrap_or_default();
             let err = anyhow::anyhow!("download failed with status {}: {body}", status.as_u16());
             return Err(if retry {
@@ -523,7 +541,11 @@ async fn download_attempt(
 /// used by 416 responses.
 fn parse_range_start(value: &reqwest::header::HeaderValue) -> Option<u64> {
     let text = value.to_str().ok()?.trim();
-    let rest = text.strip_prefix("bytes")?;
+    let rest = if text.len() >= 5 && text[..5].eq_ignore_ascii_case("bytes") {
+        &text[5..]
+    } else {
+        return None;
+    };
     let rest = rest.trim_start_matches([' ', '=']);
     rest.split('-').next()?.trim().parse::<u64>().ok()
 }
@@ -639,6 +661,11 @@ mod tests {
     fn windows_sanitisation_handles_reserved_names_and_trailing_dots() {
         // Ordinary names are untouched.
         assert_eq!(super::sanitize_for_windows("report.txt"), "report.txt");
+        // Illegal filesystem characters are replaced with underscores.
+        assert_eq!(
+            super::sanitize_for_windows("Season 1: Ep? <HD>*|\"2024\".mp4"),
+            "Season 1_ Ep_ _HD____2024_.mp4"
+        );
         // Reserved device names, with or without an extension.
         assert_eq!(super::sanitize_for_windows("CON"), "_CON");
         assert_eq!(super::sanitize_for_windows("nul.txt"), "_nul.txt");
@@ -869,8 +896,10 @@ mod tests {
         use super::parse_range_start;
         let hv = |s: &str| reqwest::header::HeaderValue::from_str(s).unwrap();
         assert_eq!(parse_range_start(&hv("bytes 10-19/100")), Some(10));
+        assert_eq!(parse_range_start(&hv("Bytes 10-19/100")), Some(10));
+        assert_eq!(parse_range_start(&hv("BYTES 10-19/100")), Some(10));
         assert_eq!(parse_range_start(&hv("bytes=0-19/100")), Some(0));
-        assert_eq!(parse_range_start(&hv("  bytes 7-7/8  ")), Some(7));
+        assert_eq!(parse_range_start(&hv("  Bytes 7-7/8  ")), Some(7));
         // 416-style and malformed values yield no usable offset.
         assert_eq!(parse_range_start(&hv("bytes */100")), None);
         assert_eq!(parse_range_start(&hv("nonsense")), None);
@@ -1495,6 +1524,100 @@ mod tests {
 
         let text = format!("{err:#}");
         assert!(text.contains("No Such Folder"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn download_retries_and_refreshes_when_download_url_expires() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let content: Vec<u8> = (0..64u32).map(|i| i as u8).collect();
+        let detail_calls = Arc::new(AtomicUsize::new(0));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let detail_calls_clone = detail_calls.clone();
+        let content_clone = content.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let content = content_clone.clone();
+                let detail_calls = detail_calls_clone.clone();
+                tokio::spawn(async move {
+                    let request = read_request(&mut sock).await;
+                    let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+
+                    if path.starts_with("/v1/auth/token") {
+                        let body = r#"{"access_token":"access","refresh_token":"rotated","expires_in":7200,"sub":"user"}"#;
+                        send_response(
+                            &mut sock,
+                            "200 OK",
+                            &[("Content-Length", body.len().to_string())],
+                            body.as_bytes(),
+                        )
+                        .await;
+                    } else if path.starts_with("/v1/shield/captcha/init") {
+                        let body = r#"{"captcha_token":"captcha"}"#;
+                        send_response(
+                            &mut sock,
+                            "200 OK",
+                            &[("Content-Length", body.len().to_string())],
+                            body.as_bytes(),
+                        )
+                        .await;
+                    } else if path.starts_with("/drive/v1/files/f1") {
+                        let n = detail_calls.fetch_add(1, Ordering::SeqCst);
+                        let link_path = if n == 0 { "expired" } else { "fresh" };
+                        let body = format!(
+                            r#"{{"name":"big.bin","size":"{}","web_content_link":"http://{addr}/content/{link_path}"}}"#,
+                            content.len()
+                        );
+                        send_response(
+                            &mut sock,
+                            "200 OK",
+                            &[("Content-Length", body.len().to_string())],
+                            body.as_bytes(),
+                        )
+                        .await;
+                    } else if path.starts_with("/content/expired") {
+                        let body = "expired link";
+                        send_response(
+                            &mut sock,
+                            "403 Forbidden",
+                            &[("Content-Length", body.len().to_string())],
+                            body.as_bytes(),
+                        )
+                        .await;
+                    } else if path.starts_with("/content/fresh") {
+                        send_response(
+                            &mut sock,
+                            "200 OK",
+                            &[("Content-Length", content.len().to_string())],
+                            &content,
+                        )
+                        .await;
+                    } else {
+                        send_response(&mut sock, "404 Not Found", &[], b"").await;
+                    }
+                });
+            }
+        });
+
+        let client = mock_client(addr);
+        let dir = std::env::temp_dir().join(format!("pikpak-expired-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let file = file_info("f1", "big.bin", 64);
+        super::download_file(&client, &file, &dir, false)
+            .await
+            .expect("expired URL should be refreshed and download should succeed");
+
+        assert_eq!(std::fs::read(dir.join("big.bin")).unwrap(), content);
+        assert!(
+            detail_calls.load(Ordering::SeqCst) >= 2,
+            "get_download_url should be called again to refresh URL"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

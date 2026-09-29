@@ -146,9 +146,13 @@ fn env_quote(value: &str) -> String {
 /// to an in-place write — correct, though not atomic.
 fn write_atomically(path: &StdPath, bytes: &[u8]) -> std::io::Result<()> {
     let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(".tmp");
+    tmp.push(format!(".{}.tmp", std::process::id()));
     let tmp = PathBuf::from(tmp);
     std::fs::write(&tmp, bytes)?;
+    #[cfg(unix)]
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let _ = std::fs::set_permissions(&tmp, metadata.permissions());
+    }
     match std::fs::rename(&tmp, path) {
         Ok(()) => Ok(()),
         Err(_) => {
