@@ -347,7 +347,10 @@ async fn download_file(
     } else {
         &dl.name
     };
-    let expected_size = if dl.size == 0 { file.size } else { dl.size };
+    // The detail response may leave the size out; the directory listing we already
+    // have knows it. An absent field is not the same as a zero-byte file, which is
+    // why the response models it as an `Option`.
+    let expected_size = dl.size.unwrap_or(file.size);
 
     let file_path = output_dir.join(safe_component(file_name)?);
     let mut part = file_path.clone().into_os_string();
@@ -391,8 +394,22 @@ async fn download_file(
                     delay.as_secs_f64()
                 );
                 tokio::time::sleep(delay).await;
-                if let Ok(fresh) = client.get_download_url(&file.id).await {
-                    link = fresh.web_content_link;
+                // The link is time-limited, so fetch a fresh one for the next try.
+                match client.get_download_url(&file.id).await {
+                    Ok(fresh) => link = fresh.web_content_link,
+                    // A rejected account token cannot be repaired by retrying:
+                    // surface it now instead of spending the whole budget and then
+                    // blaming the CDN status that the stale link produced.
+                    Err(err @ (pikpak::Error::Auth(_) | pikpak::Error::TokenExpired)) => {
+                        return Err(err).with_context(|| {
+                            format!("failed to refresh the download link for {file_name}")
+                        })
+                    }
+                    // Anything else is a blip in the API call rather than the link
+                    // itself; keep the current link and let the next attempt decide.
+                    Err(err) => {
+                        tracing::debug!(error = %err, "could not refresh the download link")
+                    }
                 }
             }
         }
@@ -474,10 +491,7 @@ async fn download_attempt(
             // 200 OK (range ignored) or a fresh download: start from zero.
             (create_part(part_path).await?, 0)
         } else {
-            let is_url_expired = status == reqwest::StatusCode::FORBIDDEN
-                || status == reqwest::StatusCode::UNAUTHORIZED
-                || status == reqwest::StatusCode::GONE;
-            let retry = is_retryable_status(status) || is_url_expired;
+            let retry = is_retryable_status(status) || is_expired_link_status(status);
             let body = resp.text().await.unwrap_or_default();
             let err = anyhow::anyhow!("download failed with status {}: {body}", status.as_u16());
             return Err(if retry {
@@ -541,13 +555,27 @@ async fn download_attempt(
 /// used by 416 responses.
 fn parse_range_start(value: &reqwest::header::HeaderValue) -> Option<u64> {
     let text = value.to_str().ok()?.trim();
-    let rest = if text.len() >= 5 && text[..5].eq_ignore_ascii_case("bytes") {
-        &text[5..]
-    } else {
+    // `to_str` yields visible ASCII only, so byte 5 is always a character
+    // boundary; `get` states that rather than leaning on the reader knowing it.
+    let unit = text.get(..5)?;
+    if !unit.eq_ignore_ascii_case("bytes") {
         return None;
-    };
+    }
+    let rest = text.get(5..)?;
     let rest = rest.trim_start_matches([' ', '=']);
     rest.split('-').next()?.trim().parse::<u64>().ok()
+}
+
+/// Whether a content-transfer status means the time-limited download link has
+/// gone stale, so fetching a fresh link and retrying is worthwhile.
+///
+/// A CDN answering a signed URL carries no bearer token of ours, so a 401 here
+/// is the link expiring, not the account token being rejected — the two differ
+/// in what fixes them, and only the link can be refreshed.
+fn is_expired_link_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::FORBIDDEN
+        || status == reqwest::StatusCode::UNAUTHORIZED
+        || status == reqwest::StatusCode::GONE
 }
 
 async fn create_part(path: &StdPath) -> std::result::Result<tokio::fs::File, DlError> {
@@ -903,6 +931,22 @@ mod tests {
         // 416-style and malformed values yield no usable offset.
         assert_eq!(parse_range_start(&hv("bytes */100")), None);
         assert_eq!(parse_range_start(&hv("nonsense")), None);
+    }
+
+    #[test]
+    fn only_a_stale_link_is_treated_as_an_expired_link() {
+        use reqwest::StatusCode;
+        assert!(super::is_expired_link_status(StatusCode::UNAUTHORIZED));
+        assert!(super::is_expired_link_status(StatusCode::FORBIDDEN));
+        assert!(super::is_expired_link_status(StatusCode::GONE));
+        assert!(!super::is_expired_link_status(StatusCode::NOT_FOUND));
+        assert!(!super::is_expired_link_status(
+            StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(!super::is_expired_link_status(
+            StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert!(!super::is_expired_link_status(StatusCode::OK));
     }
 
     /// Server that answers every request with a fixed raw response.
@@ -1527,23 +1571,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test]
-    async fn download_retries_and_refreshes_when_download_url_expires() {
+    /// A stack whose first download link is already stale and whose detail
+    /// endpoint hands out a fresh one on the next call.
+    ///
+    /// `expired_status` is what the stale link answers with. `refresh_fails` makes
+    /// the second detail call fail as a rejected account token — the case where
+    /// refreshing the link cannot possibly help.
+    async fn spawn_expiring_link_server(
+        content: Vec<u8>,
+        expired_status: &'static str,
+        refresh_fails: bool,
+    ) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let content: Vec<u8> = (0..64u32).map(|i| i as u8).collect();
-        let detail_calls = Arc::new(AtomicUsize::new(0));
 
+        let detail_calls = Arc::new(AtomicUsize::new(0));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let detail_calls_clone = detail_calls.clone();
-        let content_clone = content.clone();
+        let calls = detail_calls.clone();
+        let body = content.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     return;
                 };
-                let content = content_clone.clone();
-                let detail_calls = detail_calls_clone.clone();
+                let content = body.clone();
+                let detail_calls = calls.clone();
                 tokio::spawn(async move {
                     let request = read_request(&mut sock).await;
                     let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
@@ -1568,23 +1620,34 @@ mod tests {
                         .await;
                     } else if path.starts_with("/drive/v1/files/f1") {
                         let n = detail_calls.fetch_add(1, Ordering::SeqCst);
-                        let link_path = if n == 0 { "expired" } else { "fresh" };
-                        let body = format!(
-                            r#"{{"name":"big.bin","size":"{}","web_content_link":"http://{addr}/content/{link_path}"}}"#,
-                            content.len()
-                        );
-                        send_response(
-                            &mut sock,
-                            "200 OK",
-                            &[("Content-Length", body.len().to_string())],
-                            body.as_bytes(),
-                        )
-                        .await;
+                        if refresh_fails && n > 0 {
+                            let body = r#"{"error":"invalid_grant","error_code":4126}"#;
+                            send_response(
+                                &mut sock,
+                                "400 Bad Request",
+                                &[("Content-Length", body.len().to_string())],
+                                body.as_bytes(),
+                            )
+                            .await;
+                        } else {
+                            let link = if n == 0 { "expired" } else { "fresh" };
+                            let body = format!(
+                                r#"{{"name":"big.bin","size":"{}","web_content_link":"http://{addr}/content/{link}"}}"#,
+                                content.len()
+                            );
+                            send_response(
+                                &mut sock,
+                                "200 OK",
+                                &[("Content-Length", body.len().to_string())],
+                                body.as_bytes(),
+                            )
+                            .await;
+                        }
                     } else if path.starts_with("/content/expired") {
-                        let body = "expired link";
+                        let body = "stale link";
                         send_response(
                             &mut sock,
-                            "403 Forbidden",
+                            expired_status,
                             &[("Content-Length", body.len().to_string())],
                             body.as_bytes(),
                         )
@@ -1603,20 +1666,72 @@ mod tests {
                 });
             }
         });
+        (addr, detail_calls)
+    }
 
+    #[tokio::test]
+    async fn download_refreshes_the_link_when_the_cdn_says_it_is_gone() {
+        use std::sync::atomic::Ordering;
+
+        // A stale signed link answers 401, 403 or 410 depending on the CDN; each
+        // one means the same thing: fetch a fresh link and try again.
+        for expired_status in ["401 Unauthorized", "403 Forbidden", "410 Gone"] {
+            let content: Vec<u8> = (0..64u32).map(|i| i as u8).collect();
+            let (addr, detail_calls) =
+                spawn_expiring_link_server(content.clone(), expired_status, false).await;
+            let client = mock_client(addr);
+            let dir = std::env::temp_dir().join(format!(
+                "pikpak-stale-link-{}-{}",
+                std::process::id(),
+                expired_status.split(' ').next().unwrap()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+
+            let file = file_info("f1", "big.bin", content.len() as u64);
+            super::download_file(&client, &file, &dir, false)
+                .await
+                .unwrap_or_else(|e| panic!("{expired_status} must be retried: {e:#}"));
+
+            assert_eq!(std::fs::read(dir.join("big.bin")).unwrap(), content);
+            assert!(
+                detail_calls.load(Ordering::SeqCst) >= 2,
+                "{expired_status}: the link must be refreshed before retrying"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn download_surfaces_a_rejected_token_instead_of_spending_the_budget() {
+        use std::sync::atomic::Ordering;
+
+        // The link looks stale, but refreshing it fails because the account token
+        // was rejected. No retry can fix that, so the download must report the auth
+        // failure rather than exhaust the budget and blame the CDN's status.
+        let content: Vec<u8> = (0..64u32).map(|i| i as u8).collect();
+        let (addr, detail_calls) =
+            spawn_expiring_link_server(content.clone(), "401 Unauthorized", true).await;
         let client = mock_client(addr);
-        let dir = std::env::temp_dir().join(format!("pikpak-expired-link-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pikpak-dead-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let file = file_info("f1", "big.bin", 64);
-        super::download_file(&client, &file, &dir, false)
+        let file = file_info("f1", "big.bin", content.len() as u64);
+        let err = super::download_file(&client, &file, &dir, false)
             .await
-            .expect("expired URL should be refreshed and download should succeed");
+            .expect_err("a rejected token must fail the download");
 
-        assert_eq!(std::fs::read(dir.join("big.bin")).unwrap(), content);
+        let text = format!("{err:#}");
+        assert!(text.contains("invalid_grant"), "{text}");
         assert!(
-            detail_calls.load(Ordering::SeqCst) >= 2,
-            "get_download_url should be called again to refresh URL"
+            text.contains("refresh the download link"),
+            "the auth failure must be attributed to the link refresh: {text}"
+        );
+        assert_eq!(
+            detail_calls.load(Ordering::SeqCst),
+            2,
+            "one refresh attempt, then give up — the retry budget must stay untouched"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

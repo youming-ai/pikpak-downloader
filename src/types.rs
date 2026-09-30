@@ -40,6 +40,15 @@ impl FileKind {
     pub fn is_file(self) -> bool {
         matches!(self, FileKind::File)
     }
+
+    /// A short label for listings: `"folder"`, `"file"` or `"unknown"`.
+    pub fn label(self) -> &'static str {
+        match self {
+            FileKind::File => "file",
+            FileKind::Folder => "folder",
+            FileKind::Unknown => "unknown",
+        }
+    }
 }
 
 /// A single entry returned by a file listing call.
@@ -109,14 +118,16 @@ impl Quota {
     }
 }
 
-/// Deserialize a size that PikPak may encode either as a decimal string
-/// (`"1234"`) or as a plain JSON number, into `u64`.
+/// Deserialize a size PikPak may encode either as a decimal string (`"1234"`)
+/// or as a plain JSON number, keeping "absent" distinct from zero.
 ///
-/// Accepts a missing/null field or an empty string as zero, so folders (which
-/// PikPak sometimes returns without a `size` key) don't make the whole listing
-/// fail. The wire format is documented as strings, but a server-side switch to
-/// numbers would otherwise break every operation — accepting both costs nothing.
-pub(crate) fn deserialize_lenient_u64<'de, D>(d: D) -> std::result::Result<u64, D::Error>
+/// Absent covers a missing key, `null` and an empty string — all of which mean
+/// the server did not report a size. That distinction matters: a caller with a
+/// size from another response (a directory listing, say) can substitute it, while
+/// a genuine zero-byte file must not be mistaken for a missing field.
+pub(crate) fn deserialize_optional_lenient_u64<'de, D>(
+    d: D,
+) -> std::result::Result<Option<u64>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -128,17 +139,28 @@ where
     }
 
     match Option::<StringOrNumber>::deserialize(d)? {
-        None => Ok(0),
-        Some(StringOrNumber::Number(n)) => Ok(n),
+        None => Ok(None),
+        Some(StringOrNumber::Number(n)) => Ok(Some(n)),
         Some(StringOrNumber::String(s)) => {
             let s = s.trim();
             if s.is_empty() {
-                Ok(0)
+                Ok(None)
             } else {
-                s.parse::<u64>().map_err(serde::de::Error::custom)
+                s.parse::<u64>().map(Some).map_err(serde::de::Error::custom)
             }
         }
     }
+}
+
+/// Deserialize a size that must read as a number, treating "absent" as zero.
+///
+/// Folders are sometimes returned without a `size` key, and a missing size must
+/// not fail the whole listing — hence the lenient default.
+pub(crate) fn deserialize_lenient_u64<'de, D>(d: D) -> std::result::Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(deserialize_optional_lenient_u64(d)?.unwrap_or(0))
 }
 
 #[cfg(test)]

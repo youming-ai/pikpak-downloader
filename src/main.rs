@@ -211,11 +211,7 @@ async fn cmd_ls(client: &Client, args: LsArgs) -> Result<()> {
         println!("{:<10} {:>12} name", "kind", "size");
         println!("{}", "-".repeat(50));
         for f in &files {
-            let kind = match f.kind {
-                FileKind::Folder => "folder",
-                FileKind::File => "file",
-                FileKind::Unknown => "unknown",
-            };
+            let kind = f.kind.label();
             let size = if args.human {
                 format_size(f.size, BINARY)
             } else {

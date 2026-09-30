@@ -11,7 +11,7 @@ use serde::Deserialize;
 use crate::auth::{OAuthCredentials, TokenManager};
 use crate::captcha::CaptchaManager;
 use crate::error::{Error, Result};
-use crate::types::{deserialize_lenient_u64, FileInfo, Quota};
+use crate::types::{deserialize_lenient_u64, deserialize_optional_lenient_u64, FileInfo, Quota};
 
 /// PikPak user/auth service base URL. Overridable via
 /// [`ClientBuilder::auth_base_url`].
@@ -436,6 +436,13 @@ impl Client {
                 continue;
             }
 
+            // A rejected refresh token means the same thing whichever endpoint
+            // reports it, so give it the actionable message the token exchange
+            // uses instead of relaying a raw body from a drive call.
+            if crate::auth::is_grant_rejection(&text) {
+                return Err(crate::auth::explain_auth_failure(status.as_u16(), &text));
+            }
+
             return Err(Error::Api {
                 status: status.as_u16(),
                 message: text,
@@ -475,8 +482,8 @@ impl Client {
     /// `allow_file_last` decides whether the final segment may be a file (as
     /// [`resolve_path_info`](Self::resolve_path_info) needs) or must be a folder
     /// (as [`resolve_path`](Self::resolve_path) needs). Middle segments are
-    /// always folders: restricting the search avoids matching a same-named file
-    /// that happens to precede the intended folder.
+    /// always folders, and a folder also wins over a same-named file at the final
+    /// segment — a name collision must not resolve according to listing order.
     async fn walk_path(&self, path: &str, allow_file_last: bool) -> Result<Resolved> {
         if is_drive_root(path) {
             return Ok(Resolved::Root);
@@ -488,11 +495,19 @@ impl Client {
 
         for (index, segment) in segments.iter().enumerate() {
             let is_last = index == segments.len() - 1;
-            let may_be_file = is_last && allow_file_last;
             let children = self.list_folder(&parent_id).await?;
-            let found = children
-                .into_iter()
-                .find(|f| f.name == *segment && (may_be_file || f.kind.is_folder()));
+            // A folder wins over a same-named file, at the final segment too:
+            // which of the two a listing happens to return first is not something
+            // a caller should depend on, and only folders can be walked into.
+            let folder = children
+                .iter()
+                .find(|f| f.name == *segment && f.kind.is_folder());
+            let found = match folder {
+                Some(folder) => Some(folder),
+                None if is_last && allow_file_last => children.iter().find(|f| f.name == *segment),
+                None => None,
+            }
+            .cloned();
 
             match found {
                 Some(info) if is_last => return Ok(Resolved::Entry(info)),
@@ -537,8 +552,11 @@ pub struct DownloadInfo {
     pub web_content_link: String,
     /// File name.
     pub name: String,
-    /// File size in bytes.
-    pub size: u64,
+    /// File size in bytes, when the detail response reported one.
+    ///
+    /// `None` means the field was absent (not that the file is empty), so a
+    /// caller holding a size from a directory listing can substitute it.
+    pub size: Option<u64>,
 }
 
 /// Derive a stable device id from the refresh token (md5 hex of the token).
@@ -636,8 +654,8 @@ struct ListResponse {
 struct FileDetailResponse {
     #[serde(default)]
     name: String,
-    #[serde(default, deserialize_with = "deserialize_lenient_u64")]
-    size: u64,
+    #[serde(default, deserialize_with = "deserialize_optional_lenient_u64")]
+    size: Option<u64>,
     #[serde(default)]
     web_content_link: String,
 }
@@ -993,6 +1011,82 @@ mod tests {
             mock.drive_targets()[1].contains("parent_id=folder-X"),
             "middle segment must resolve to the folder"
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_path_info_prefers_a_folder_for_the_last_segment_too() {
+        // The same collision at the final segment: the folder wins there as well,
+        // so the order a listing happens to arrive in cannot change what a path
+        // resolves to (which is what `ls` and `download` both key off).
+        let mock = Mock::start(vec![(
+            200,
+            page_json(
+                &[
+                    ("file-X", "X", "drive#file"),
+                    ("folder-X", "X", "drive#folder"),
+                ],
+                None,
+            ),
+        )])
+        .await;
+
+        let info = mock.client().resolve_path_info("X").await.unwrap();
+
+        assert_eq!(info.id, "folder-X");
+        assert!(info.kind.is_folder());
+    }
+
+    #[tokio::test]
+    async fn resolve_path_info_still_resolves_a_lone_file() {
+        let mock = Mock::start(vec![(
+            200,
+            page_json(&[("f1", "movie.mp4", "drive#file")], None),
+        )])
+        .await;
+
+        let info = mock.client().resolve_path_info("movie.mp4").await.unwrap();
+
+        assert_eq!(info.id, "f1");
+        assert!(info.kind.is_file());
+    }
+
+    #[tokio::test]
+    async fn a_rejected_token_from_a_drive_call_explains_itself() {
+        // The token exchange is not the only place a dead token surfaces: a drive
+        // call sees the same rejection, and must give the same actionable message
+        // rather than relaying the server's raw body.
+        let body = r#"{"error":"invalid_grant","error_code":4126}"#;
+        let mock = Mock::start(vec![(400, body.to_string())]).await;
+
+        let err = mock.client().list_folder("").await.unwrap_err();
+
+        assert!(matches!(err, Error::Auth(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains("single-use"), "{text}");
+        assert!(text.contains(".env"), "{text}");
+    }
+
+    #[test]
+    fn an_absent_size_stays_absent_while_an_explicit_zero_is_a_size() {
+        // The download path substitutes the directory listing's size only when the
+        // detail response left the field out. A file the API reports as zero bytes
+        // must not be mistaken for one it said nothing about, or a genuinely empty
+        // file is judged against a stale listing size and never completes.
+        let absent: super::FileDetailResponse =
+            serde_json::from_str(r#"{"web_content_link":"http://x"}"#).unwrap();
+        assert_eq!(absent.size, None);
+
+        let blank: super::FileDetailResponse =
+            serde_json::from_str(r#"{"size":"","web_content_link":"http://x"}"#).unwrap();
+        assert_eq!(blank.size, None);
+
+        let empty: super::FileDetailResponse =
+            serde_json::from_str(r#"{"size":"0","web_content_link":"http://x"}"#).unwrap();
+        assert_eq!(empty.size, Some(0));
+
+        let numbered: super::FileDetailResponse =
+            serde_json::from_str(r#"{"size":64,"web_content_link":"http://x"}"#).unwrap();
+        assert_eq!(numbered.size, Some(64));
     }
 
     #[tokio::test]

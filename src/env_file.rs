@@ -145,10 +145,25 @@ fn env_quote(value: &str) -> String {
 /// Windows cannot rename over an existing file, so there the rewrite falls back
 /// to an in-place write — correct, though not atomic.
 fn write_atomically(path: &StdPath, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
     let mut tmp = path.as_os_str().to_os_string();
     tmp.push(format!(".{}.tmp", std::process::id()));
     let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, bytes)?;
+
+    // Create the temporary file private from the start: it holds a refresh token
+    // in clear text, and a plain `fs::write` would leave it readable until — and,
+    // for a file that does not exist yet, unless — the permissions below apply.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(&tmp)?.write_all(bytes)?;
+
+    // Keep whatever the real file had, so an existing 0600 stays 0600.
     #[cfg(unix)]
     if let Ok(metadata) = std::fs::metadata(path) {
         let _ = std::fs::set_permissions(&tmp, metadata.permissions());
@@ -400,6 +415,38 @@ mod tests {
         let content = std::fs::read_to_string(&env_path).unwrap();
         assert!(content.contains("PIKPAK_REFRESH_TOKEN=rotated"));
         assert!(content.contains("PIKPAK_PROXY=http://x"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_keeps_the_env_file_as_private_as_it_was() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("pikpak-perms-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let env_path = dir.join(".env");
+
+        for mode in [0o600, 0o644] {
+            std::fs::write(&env_path, "PIKPAK_REFRESH_TOKEN=old\n").unwrap();
+            std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(mode)).unwrap();
+
+            assert!(super::update_env_token(&env_path, "rotated").unwrap());
+
+            let after = std::fs::metadata(&env_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(after, mode, "mode {mode:o} must survive the rewrite");
+
+            let leftovers: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.ends_with(".tmp"))
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "temporary files left behind: {leftovers:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
