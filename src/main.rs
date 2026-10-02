@@ -188,12 +188,19 @@ fn build_client(
 }
 
 async fn cmd_ls(client: &Client, args: LsArgs) -> Result<()> {
-    let parent_id = client.resolve_path(&args.path).await?;
-
-    let files: Vec<pikpak::FileInfo> = client
-        .list_folder(&parent_id)
-        .await
-        .context("list_folder failed")?;
+    let files: Vec<pikpak::FileInfo> = if pikpak::is_drive_root(&args.path) {
+        client.list_folder("").await.context("list_folder failed")?
+    } else {
+        let info = client.resolve_path_info(&args.path).await?;
+        if info.kind.is_folder() {
+            client
+                .list_folder(&info.id)
+                .await
+                .context("list_folder failed")?
+        } else {
+            vec![info]
+        }
+    };
 
     if files.is_empty() {
         println!("(empty)");
@@ -204,7 +211,7 @@ async fn cmd_ls(client: &Client, args: LsArgs) -> Result<()> {
         println!("{:<10} {:>12} name", "kind", "size");
         println!("{}", "-".repeat(50));
         for f in &files {
-            let kind = if f.kind.is_folder() { "folder" } else { "file" };
+            let kind = f.kind.label();
             let size = if args.human {
                 format_size(f.size, BINARY)
             } else {

@@ -194,29 +194,42 @@ impl TokenManager {
         let _ = self.inner.token_source.set(TokenSource(Arc::new(source)));
     }
 
-    /// Return a currently-valid access token, refreshing if needed.
-    pub async fn access_token(&self) -> Result<String> {
+    /// A fresh cached token, refreshing first when the current one is stale.
+    ///
+    /// `pick` selects the field the caller needs, so [`access_token`] and
+    /// [`user_id`] share one locking protocol instead of two copies of it that
+    /// have to be kept in step.
+    ///
+    /// [`access_token`]: Self::access_token
+    /// [`user_id`]: Self::user_id
+    async fn cached_token_after_refresh<T>(&self, pick: impl Fn(&CachedToken) -> T) -> Result<T> {
         // Fast path: still valid.
         {
             let guard = self.inner.cached.read().await;
             if let Some(t) = guard.as_ref() {
                 if Instant::now() < t.refresh_at {
-                    return Ok(t.access_token.clone());
+                    return Ok(pick(t));
                 }
             }
         }
 
-        // Slow path: acquire write lock and refresh. Double-check inside the
+        // Slow path: acquire the write lock and refresh. Double-check inside the
         // write lock in case another task refreshed while we were waiting.
         let mut guard = self.inner.cached.write().await;
         if let Some(t) = guard.as_ref() {
             if Instant::now() < t.refresh_at {
-                return Ok(t.access_token.clone());
+                return Ok(pick(t));
             }
         }
 
-        let fresh = self.refresh_now(&mut guard).await?;
-        Ok(fresh)
+        self.refresh_now(&mut guard).await?;
+        guard.as_ref().map(pick).ok_or(Error::TokenExpired)
+    }
+
+    /// Return a currently-valid access token, refreshing if needed.
+    pub async fn access_token(&self) -> Result<String> {
+        self.cached_token_after_refresh(|t| t.access_token.clone())
+            .await
     }
 
     /// Drop the cached access token so the next [`access_token`] call
@@ -235,13 +248,7 @@ impl TokenManager {
     /// Return the `sub` (user id) claim from the current token, refreshing
     /// if necessary. Used by the captcha flow to bind requests to a user.
     pub async fn user_id(&self) -> Result<String> {
-        // Trigger a refresh if needed, then read the cache.
-        let _ = self.access_token().await?;
-        let guard = self.inner.cached.read().await;
-        guard
-            .as_ref()
-            .map(|t| t.user_id.clone())
-            .ok_or(Error::TokenExpired)
+        self.cached_token_after_refresh(|t| t.user_id.clone()).await
     }
 
     /// Return the most recently issued refresh token (rotated on each
@@ -374,7 +381,7 @@ struct ExchangeFailure {
 /// `invalid_grant` (its error_code 4126) means the token itself is the problem,
 /// so a *different* one may still work — as opposed to a transient or unrelated
 /// failure, where retrying with another token would be pointless.
-fn is_grant_rejection(body: &str) -> bool {
+pub(crate) fn is_grant_rejection(body: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .is_some_and(|v| {
@@ -393,7 +400,7 @@ fn is_grant_rejection(body: &str) -> bool {
 /// different client platform than the Android one this crate authenticates as.
 /// Naming both, and the remedy, turns the server's opaque JSON into something
 /// the user can act on.
-fn explain_auth_failure(status: u16, body: &str) -> Error {
+pub(crate) fn explain_auth_failure(status: u16, body: &str) -> Error {
     if !is_grant_rejection(body) {
         return Error::Auth(format!("status {status}: {body}"));
     }
