@@ -327,12 +327,20 @@ pub(crate) async fn cmd_download(
         failed,
         bytes,
     };
-    // A partial result is still a result: report what landed before failing, so
-    // a caller can tell a clean run from one that lost files.
-    ui.ok("download", &summary)?;
+    // A failed run emits exactly one document — the failure — so the counts go
+    // into its message rather than a second document on stdout. The summary is
+    // reported only when nothing failed.
     match first_err {
-        Some(e) => Err(e),
-        None => Ok(summary),
+        Some(e) => Err(e).with_context(|| {
+            format!(
+                "{failed} of {planned} files failed ({} downloaded, {} bytes)",
+                summary.downloaded, summary.bytes
+            )
+        }),
+        None => {
+            ui.ok("download", &summary)?;
+            Ok(summary)
+        }
     }
 }
 
@@ -1833,6 +1841,7 @@ mod tests {
                 path: "/".to_string(),
                 output: dir.to_string_lossy().into_owned(),
                 jobs: 1,
+                detach: false,
             },
             crate::output::Output::new(false, false),
         )
@@ -1863,6 +1872,7 @@ mod tests {
                 path: "/dir".to_string(),
                 output: dir.to_string_lossy().into_owned(),
                 jobs: 1,
+                detach: false,
             },
             crate::output::Output::new(false, false),
         )
@@ -1920,6 +1930,7 @@ mod tests {
                 path: "/No Such Folder".to_string(),
                 output: dir.to_string_lossy().into_owned(),
                 jobs: 1,
+                detach: false,
             },
             crate::output::Output::new(false, false),
         )
@@ -2198,6 +2209,7 @@ mod tests {
                     path: "/dir".to_string(),
                     output: out.to_string_lossy().into_owned(),
                     jobs,
+                    detach: false,
                 },
                 crate::output::Output::new(false, false),
             )

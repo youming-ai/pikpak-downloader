@@ -14,6 +14,7 @@ use serde::Serialize;
 
 mod download;
 mod env_file;
+mod jobs;
 mod output;
 
 #[derive(Debug, Parser)]
@@ -38,6 +39,17 @@ struct Cli {
     #[arg(long, global = true)]
     no_progress: bool,
 
+    /// Internal: the detached job this process is the worker for.
+    ///
+    /// Set by `download --detach` when it re-executes this binary. Not part of
+    /// the interface.
+    #[arg(long, hide = true, global = true)]
+    internal_job: Option<String>,
+
+    /// Internal: state directory the worker keeps its record in.
+    #[arg(long, hide = true, global = true)]
+    internal_state: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -49,6 +61,7 @@ impl Command {
             Command::Ls(_) => "ls",
             Command::Download(_) => "download",
             Command::Quota(_) => "quota",
+            Command::Jobs(_) => "jobs",
         }
     }
 }
@@ -61,6 +74,8 @@ enum Command {
     Download(DownloadArgs),
     /// View storage quota.
     Quota(QuotaArgs),
+    /// Inspect or control detached downloads.
+    Jobs(jobs::JobsArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -87,6 +102,12 @@ struct DownloadArgs {
     /// Number of files to download concurrently (folders only).
     #[arg(short = 'j', long, default_value_t = 1)]
     jobs: usize,
+    /// Return immediately with a job id instead of waiting for the transfer.
+    ///
+    /// The job keeps running after this process exits; follow it with
+    /// `pikpak jobs status|wait|cancel`.
+    #[arg(long)]
+    detach: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -137,13 +158,34 @@ async fn run(cli: Cli, env_path: Option<PathBuf>, output: output::Output) -> Res
     // Set by the rotation hook when a rotation happened that could not be
     // written anywhere, so the run can end with a nudge about it.
     let rotated_unpersisted = Arc::new(AtomicBool::new(false));
-    let client = build_client(env_path.as_deref(), rotated_unpersisted.clone())?;
+    // Built per command rather than up front: `jobs` needs no credentials, and
+    // asking what is already running should not fail because the token has since
+    // been rotated away.
+    let client = || build_client(env_path.as_deref(), rotated_unpersisted.clone());
     let result = match cli.command {
-        Command::Ls(args) => cmd_ls(&client, args, output).await,
-        Command::Download(args) => download::cmd_download(&client, args, output)
+        Command::Ls(args) => cmd_ls(&client()?, args, output).await,
+        Command::Download(args) => match (&cli.internal_job, args.detach) {
+            // This process *is* the worker for a detached job.
+            (Some(id), _) => jobs::run_worker_download(
+                &client()?,
+                args,
+                output,
+                id.clone(),
+                cli.internal_state.clone(),
+            )
             .await
             .map(|_| ()),
-        Command::Quota(args) => cmd_quota(&client, args, output).await,
+            // Fail here rather than start a job that cannot authenticate.
+            (None, true) => {
+                validate_refresh_token(std::env::var("PIKPAK_REFRESH_TOKEN").ok())?;
+                jobs::start_detached(&args, output).map(|_| ())
+            }
+            (None, false) => download::cmd_download(&client()?, args, output)
+                .await
+                .map(|_| ()),
+        },
+        Command::Quota(args) => cmd_quota(&client()?, args, output).await,
+        Command::Jobs(args) => jobs::cmd_jobs(args.command, output).await,
     };
     if let Some(note) = rotation_reminder(rotated_unpersisted.load(Ordering::SeqCst)) {
         eprintln!("{note}");

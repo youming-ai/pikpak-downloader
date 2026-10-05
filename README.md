@@ -79,6 +79,7 @@ usage: 42.3%
 | `--verbose` | debug logs, before or after the subcommand |
 | `--json` | one JSON document on stdout: the result, or the failure |
 | `--no-progress` | never draw byte-level progress |
+| `--detach` | `download`: return a job id instead of waiting |
 
 ### Machine-readable output
 
@@ -93,6 +94,22 @@ the cases worth branching on: `3` auth, `4` not found, `5` network, `6` refused,
 $ pikpak --json quota
 {"ok":true,"command":"quota","result":{"total":10995116277760,"used":4650000000000,"free":6345116277760,"usage_percent":42.3}}
 ```
+
+### Long downloads
+
+`download --detach` returns a job id straight away and keeps transferring in the
+background, so a transfer can outlive the command that started it:
+
+```bash
+id=$(pikpak download --detach --path "/My Pack/Movies" --output /data)
+pikpak jobs list                 # id, state, progress, path
+pikpak jobs status "$id"
+pikpak jobs wait "$id"           # blocks; exits with the job's own outcome
+pikpak jobs cancel "$id"         # stops at the worker's next chunk boundary
+```
+
+State lives under `PIKPAK_STATE_DIR` (default `.pikpak`): `jobs/<id>.json`,
+`jobs/<id>.cancel`, and the worker's output in `logs/<id>.log`.
 
 ## Library
 

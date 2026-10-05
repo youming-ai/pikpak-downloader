@@ -31,6 +31,70 @@ pub const EXIT_NETWORK: u8 = 5;
 pub const EXIT_REFUSED: u8 = 6;
 /// A local filesystem operation failed.
 pub const EXIT_IO: u8 = 7;
+/// A caller-set deadline passed before the work finished (`jobs wait`).
+pub const EXIT_TIMEOUT: u8 = 8;
+/// A job was cancelled before it finished (`jobs wait`).
+pub const EXIT_CANCELLED: u8 = 9;
+
+/// A deadline the caller set expired. Its own type so the exit code can say
+/// "timed out" rather than "something went wrong".
+#[derive(Debug)]
+pub struct Timeout(pub String);
+
+impl std::fmt::Display for Timeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
+impl std::error::Error for Timeout {}
+
+/// Something the caller named does not exist. Its own type so the message can
+/// name the right kind of thing — a job id is not a path — while the exit code
+/// stays `not_found`.
+#[derive(Debug)]
+pub struct Missing(pub String);
+
+impl std::fmt::Display for Missing {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
+impl std::error::Error for Missing {}
+
+/// A detached job that did not succeed, carrying the exit code its own failed
+/// run produced so `jobs wait` reports the same thing a synchronous run would.
+#[derive(Debug)]
+pub struct JobFailed {
+    /// The code the worker's failure maps to.
+    pub code: u8,
+    /// What went wrong.
+    pub message: String,
+}
+
+impl std::fmt::Display for JobFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.message)
+    }
+}
+
+impl std::error::Error for JobFailed {}
+
+/// The `kind` label for an exit code, for the rare case where the code is known
+/// but the original error is not (a job read back from disk).
+pub fn kind_for_code(code: u8) -> &'static str {
+    match code {
+        EXIT_AUTH => "auth",
+        EXIT_NOT_FOUND => "not_found",
+        EXIT_NETWORK => "network",
+        EXIT_REFUSED => "refused",
+        EXIT_IO => "io",
+        EXIT_TIMEOUT => "timeout",
+        EXIT_CANCELLED => "cancelled",
+        _ => "unexpected",
+    }
+}
 
 /// How much the run says, and in what shape.
 #[derive(Debug, Clone, Copy)]
@@ -116,6 +180,14 @@ pub(crate) fn error_document(command: &str, error: &AnyError) -> Value {
 ///
 /// Codes are a public interface: add new ones, never repurpose them.
 pub fn exit_code_for(error: &AnyError) -> (u8, &'static str) {
+    // A job that already failed carries its own code; do not re-derive it.
+    if let Some(failed) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<JobFailed>())
+    {
+        return (failed.code, kind_for_code(failed.code));
+    }
+
     if let Some(source) = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<pikpak::Error>())
@@ -134,6 +206,20 @@ pub fn exit_code_for(error: &AnyError) -> (u8, &'static str) {
             },
             _ => (EXIT_UNEXPECTED, "unexpected"),
         };
+    }
+
+    if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<Missing>().is_some())
+    {
+        return (EXIT_NOT_FOUND, "not_found");
+    }
+
+    if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<Timeout>().is_some())
+    {
+        return (EXIT_TIMEOUT, "timeout");
     }
 
     // The download path wraps filesystem failures in context of its own, so look
@@ -252,6 +338,53 @@ mod tests {
         assert_eq!(document["ok"], Value::Bool(true));
         assert_eq!(document["command"], "quota");
         assert_eq!(document["result"]["total"], 10);
+    }
+
+    #[test]
+    fn a_failed_job_reports_the_code_its_own_run_produced() {
+        let failed = anyhow::Error::new(JobFailed {
+            code: EXIT_NETWORK,
+            message: "job 1-000001 failed: the service is down".into(),
+        })
+        .context("jobs wait failed");
+        assert_eq!(exit_code_for(&failed), (EXIT_NETWORK, "network"));
+
+        // A cancelled job is not an auth failure or a network blip.
+        let cancelled = anyhow::Error::new(JobFailed {
+            code: EXIT_CANCELLED,
+            message: "job 1-000001 was cancelled".into(),
+        });
+        assert_eq!(exit_code_for(&cancelled), (EXIT_CANCELLED, "cancelled"));
+    }
+
+    #[test]
+    fn every_documented_code_has_a_kind() {
+        for (code, kind) in [
+            (EXIT_UNEXPECTED, "unexpected"),
+            (EXIT_AUTH, "auth"),
+            (EXIT_NOT_FOUND, "not_found"),
+            (EXIT_NETWORK, "network"),
+            (EXIT_REFUSED, "refused"),
+            (EXIT_IO, "io"),
+            (EXIT_TIMEOUT, "timeout"),
+            (EXIT_CANCELLED, "cancelled"),
+        ] {
+            assert_eq!(kind_for_code(code), kind, "code {code}");
+        }
+        assert_eq!(kind_for_code(200), "unexpected");
+    }
+
+    #[test]
+    fn a_named_thing_that_does_not_exist_is_not_found() {
+        let missing = anyhow::Error::new(Missing("no job 1-000001".into())).context("jobs status");
+        assert_eq!(exit_code_for(&missing), (EXIT_NOT_FOUND, "not_found"));
+    }
+
+    #[test]
+    fn a_caller_deadline_is_reported_as_a_timeout() {
+        let expired = anyhow::Error::new(Timeout("job 1-000001 is still running".into()))
+            .context("jobs wait failed");
+        assert_eq!(exit_code_for(&expired), (EXIT_TIMEOUT, "timeout"));
     }
 
     #[test]
