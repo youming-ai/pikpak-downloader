@@ -328,15 +328,18 @@ pub(crate) async fn cmd_download(
 
     let sem = Arc::new(Semaphore::new(jobs));
     let mut set = tokio::task::JoinSet::new();
+    // A panicked task returns no value, only its id: map that back to the file.
+    let mut index_of = HashMap::new();
     for (index, task) in tasks.into_iter().enumerate() {
         let client = client.clone();
         let sem = sem.clone();
-        set.spawn(async move {
+        let handle = set.spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore is never closed");
             let result =
                 download_file(&client, &task.file, &task.dir, &task.name, show_progress).await;
             (index, result)
         });
+        index_of.insert(handle.id(), index);
     }
 
     // The failure reported (and so the exit code) is the earliest file's in
@@ -348,10 +351,9 @@ pub(crate) async fn cmd_download(
     let mut bytes = 0u64;
     while let Some(joined) = set.join_next().await {
         // A panicking transfer is one failed file, not the end of the others.
-        // It has no index left, so it ranks after every ordinary failure.
         let (index, result) = joined.unwrap_or_else(|panic| {
             (
-                usize::MAX,
+                index_of.get(&panic.id()).copied().unwrap_or(usize::MAX),
                 Err(anyhow::anyhow!("download task panicked: {panic}")),
             )
         });

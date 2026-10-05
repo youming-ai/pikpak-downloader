@@ -393,7 +393,7 @@ impl Client {
             let text = match resp.text().await {
                 Ok(t) => t,
                 Err(e) if is_transient(&e) && net_retries < MAX_NET_RETRIES => {
-                    let delay = jittered_backoff(backoff_delay(net_retries));
+                    let delay = jittered_backoff(backoff_delay(net_retries)).max(retry_after);
                     net_retries += 1;
                     tokio::time::sleep(delay).await;
                     continue;

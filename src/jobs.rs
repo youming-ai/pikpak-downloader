@@ -160,12 +160,18 @@ impl JobStore {
             }
         }
         // `jobs` and `logs` are this tool's own, so ones an older version created
-        // world-readable are tightened too. The root may be a directory the user
-        // pointed `PIKPAK_STATE_DIR` at; that one is left as it is.
+        // world-readable are tightened too — and a store that cannot be made
+        // private is not used, since its logs can hold a token. A symlink is
+        // left alone: tightening would change whatever it points at. The root
+        // may be a directory the user pointed `PIKPAK_STATE_DIR` at; that one is
+        // left as it is.
         #[cfg(unix)]
         for dir in [root.join("jobs"), root.join("logs")] {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            if std::fs::symlink_metadata(&dir).is_ok_and(|meta| meta.is_dir()) {
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                    .with_context(|| format!("failed to make {} private", dir.display()))?;
+            }
         }
         Ok(Self {
             root: root.to_path_buf(),
@@ -894,6 +900,25 @@ mod tests {
         assert_eq!(mode(root.join("logs")), 0o700);
         assert_eq!(mode(root.join("jobs").join("1-000001.json")), 0o600);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_logs_directory_is_not_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_state("symlinked");
+        let elsewhere = temp_state("symlinked-target");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, root.join("logs")).unwrap();
+
+        JobStore::open(&root).unwrap();
+
+        let mode = std::fs::metadata(&elsewhere).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "the link's target is not ours to lock down");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&elsewhere);
     }
 
     #[test]

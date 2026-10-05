@@ -145,9 +145,10 @@ async fn main() -> ExitCode {
     // spawned task surfaces through its join handle — one failed file in a
     // download — and must not take the rest of the run down with it.
     let default_hook = std::panic::take_hook();
+    let main_thread = std::thread::current().id();
     std::panic::set_hook(Box::new(move |info| {
         default_hook(info);
-        if std::thread::current().name() != Some("main") {
+        if std::thread::current().id() != main_thread {
             return;
         }
         output.fail(command, &anyhow::anyhow!("internal error: {info}"));

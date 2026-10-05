@@ -66,3 +66,6 @@ jobs:
 
       - name: Build with the minimum supported Rust version
         run: cargo check --locked --all-targets
+
+      - name: Library without the CLI, at the minimum version
+        run: cargo check --locked --lib --no-default-features
