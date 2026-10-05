@@ -22,7 +22,7 @@ mod output;
     name = "pikpak",
     version,
     about = "PikPak cloud storage CLI",
-    after_help = "Config via .env or environment:\n  PIKPAK_REFRESH_TOKEN  (required) refresh token from the web UI\n  PIKPAK_PROXY          (optional) HTTP(S) proxy URL\n  PIKPAK_CLIENT_ID      (optional) override OAuth client id\n  PIKPAK_CLIENT_SECRET  (optional) override OAuth client secret"
+    after_help = "Config via .env or environment:\n  PIKPAK_REFRESH_TOKEN  (required) refresh token from the web UI\n  PIKPAK_PROXY          (optional) HTTP(S) proxy URL\n  PIKPAK_CLIENT_ID      (optional) override OAuth client id\n  PIKPAK_CLIENT_SECRET  (optional) override OAuth client secret\n  PIKPAK_DEVICE_ID      (optional) device id; saved to .env on first run"
 )]
 struct Cli {
     #[arg(long, global = true)]
@@ -245,6 +245,7 @@ fn build_client(
 ) -> Result<Client> {
     let refresh_token = validate_refresh_token(std::env::var("PIKPAK_REFRESH_TOKEN").ok())?;
 
+    let device_id = env_file::device_id(env_path, &refresh_token);
     let env_path = env_path.map(StdPath::to_path_buf);
     let source_path = env_path.clone();
     let mut builder = Client::builder()
@@ -261,6 +262,10 @@ fn build_client(
         // If another process rotated the token first, the replacement it saved is
         // the one that still works — pick it up rather than failing the run.
         .refresh_token_source(move || env_file::read_env_token(source_path.as_deref()));
+
+    if let Some(id) = device_id {
+        builder = builder.device_id(id);
+    }
 
     if let Ok(proxy) = std::env::var("PIKPAK_PROXY") {
         if !proxy.is_empty() {

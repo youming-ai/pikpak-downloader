@@ -83,7 +83,9 @@ $ pikpak --json quota
 
 Read from the environment, or from the first `.env` in the working directory or
 its parents: `PIKPAK_REFRESH_TOKEN` (required), and optionally `PIKPAK_PROXY`,
-`PIKPAK_CLIENT_ID`, `PIKPAK_CLIENT_SECRET`.
+`PIKPAK_CLIENT_ID`, `PIKPAK_CLIENT_SECRET`, `PIKPAK_DEVICE_ID`. Without a
+device id the CLI saves one to that `.env` on its first run, so the account
+sees one device across runs instead of a new one each time.
 
 Refresh tokens are **single-use**: every login rotates them, and this tool
 authenticates as the PikPak **Android** client. The CLI writes each replacement

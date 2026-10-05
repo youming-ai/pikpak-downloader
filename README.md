@@ -29,7 +29,9 @@ cp .env.example .env
 
 Read from the environment, or from the first `.env` found in the working
 directory and then its parents. `PIKPAK_REFRESH_TOKEN` is required;
-`PIKPAK_PROXY`, `PIKPAK_CLIENT_ID` and `PIKPAK_CLIENT_SECRET` are optional.
+`PIKPAK_PROXY`, `PIKPAK_CLIENT_ID`, `PIKPAK_CLIENT_SECRET` and
+`PIKPAK_DEVICE_ID` are optional — the CLI saves a device id to `.env` on its
+first run, so every later run reports the same device.
 
 PikPak refresh tokens are **single-use**: every login rotates them, and the CLI
 writes each replacement back into the file it loaded — so keep the token in
