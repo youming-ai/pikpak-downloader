@@ -86,6 +86,10 @@ impl NameClaims {
         }
     }
 
+    /// Read `dir`'s sidecars once, and reserve every name they bind before any
+    /// claim is made there: otherwise an entry listed earlier — a remote
+    /// `x.part`, say — could take a name a partial already owns, and its
+    /// download would overwrite that partial.
     fn ensure_dir_scanned(&mut self, dir: &StdPath) {
         if self.persisted.contains_key(dir) {
             return;
@@ -103,6 +107,11 @@ impl NameClaims {
                 }
             }
         }
+        // Two sidecars whose names overlap (`x` and `x.part`) cannot both be
+        // honoured; the one left out is claimed afresh.
+        let taken = self.taken.entry(dir.to_path_buf()).or_default();
+        let case_insensitive = self.case_insensitive;
+        id_map.retain(|_, name| take(taken, &fold(name, case_insensitive), true));
         self.persisted.insert(dir.to_path_buf(), id_map);
     }
 
@@ -110,11 +119,9 @@ impl NameClaims {
     /// `.part.meta` file in `dir` matches `file_id`.
     fn claim_file(&mut self, dir: &StdPath, file_id: &str, raw: &str) -> Result<String> {
         self.ensure_dir_scanned(dir);
-        if let Some(bound_name) = self.persisted.get(dir).and_then(|m| m.get(file_id)) {
-            let taken = self.taken.entry(dir.to_path_buf()).or_default();
-            if take(taken, &fold(bound_name, self.case_insensitive), true) {
-                return Ok(bound_name.clone());
-            }
+        // Reserved for this file by the scan; taking it out hands it over once.
+        if let Some(bound_name) = self.persisted.get_mut(dir).and_then(|m| m.remove(file_id)) {
+            return Ok(bound_name);
         }
         self.claim(dir, raw, true)
     }
@@ -126,6 +133,8 @@ impl NameClaims {
     /// [`MAX_COMPONENT_LEN`] bytes, truncating the stem without splitting UTF-8
     /// characters.
     fn claim(&mut self, dir: &StdPath, raw: &str, is_file: bool) -> Result<String> {
+        // Folders claim here too, and must not take a partial's name either.
+        self.ensure_dir_scanned(dir);
         let base = safe_component(raw)?;
         let taken = self.taken.entry(dir.to_path_buf()).or_default();
         let case_insensitive = self.case_insensitive;
@@ -1092,6 +1101,31 @@ mod tests {
             claims.claim(dir, "y.part.meta", true).unwrap(),
             "y.part (2).meta"
         );
+    }
+
+    #[test]
+    fn an_earlier_entry_never_takes_a_partials_persisted_name() {
+        let dir =
+            std::env::temp_dir().join(format!("pikpak-claims-reserve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // An interrupted download of "x" (id f2) left its partial behind.
+        let meta = super::PartIdentity {
+            id: "f2".to_string(),
+            size: 1024,
+            modified_time: None,
+        };
+        std::fs::write(dir.join("x.part.meta"), serde_json::to_vec(&meta).unwrap()).unwrap();
+
+        let mut claims = super::NameClaims::with_case_folding(false);
+        // Listed first this time, a remote `x.part` must not land on that partial,
+        // and neither may a folder of that name.
+        let fresh = claims.claim_file(&dir, "f1", "x.part").unwrap();
+        assert_ne!(fresh, "x.part");
+        assert_ne!(claims.claim(&dir, "x.part", false).unwrap(), "x.part");
+        // The partial's owner still resumes under its own name.
+        assert_eq!(claims.claim_file(&dir, "f2", "x").unwrap(), "x");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
