@@ -14,12 +14,20 @@ library. Captcha signing and refresh-token rotation are handled for you.
 
 ## Install
 
+Prebuilt for Linux (x86_64, aarch64; static) and macOS (Apple silicon, Intel):
+
 ```bash
-cargo install --path .        # or: cargo build --release
+curl -fsSL "https://github.com/youming-ai/pikpak-downloader/releases/latest/download/pikpak-$(uname -m | sed s/arm64/aarch64/)-$(case $(uname -s) in Darwin) echo apple-darwin;; *) echo unknown-linux-musl;; esac).tar.gz" | sudo tar -xzC /usr/local/bin pikpak
 pikpak --help
 ```
 
-Rust 1.86 or newer (`rust-version` in `Cargo.toml`, pinned by the CI MSRV job).
+Checksums are in each release's `SHA256SUMS`. Or build from source, with Rust
+1.86 or newer (`rust-version` in `Cargo.toml`, pinned by the CI MSRV job):
+
+```bash
+cargo install --locked --git https://github.com/youming-ai/pikpak-downloader
+# or, in a clone: cargo install --locked --path .
+```
 
 ## Configure
 

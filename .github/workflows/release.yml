@@ -1,0 +1,76 @@
+name: Release
+
+# A `v*` tag builds the binaries and publishes them as a GitHub release.
+# A pull request that touches this file only builds them, so a broken target
+# shows up before a tag does.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths: [.github/workflows/release.yml]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # musl: one static binary that runs on any distribution's glibc.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Asset names carry no version, so `releases/latest/download/<name>`
+      # always points at the newest build.
+      - name: Package
+        run: tar -C target/${{ matrix.target }}/release -czf pikpak-${{ matrix.target }}.tar.gz pikpak
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pikpak-${{ matrix.target }}
+          path: pikpak-${{ matrix.target }}.tar.gz
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha256sum pikpak-*.tar.gz > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" pikpak-*.tar.gz SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --generate-notes --verify-tag
