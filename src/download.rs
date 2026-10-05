@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
 
+use crate::output::Output;
 use crate::DownloadArgs;
 use pikpak::{
     exponential_backoff, is_drive_root, is_retryable_status, jittered_backoff, Client, FileKind,
@@ -211,7 +212,26 @@ fn push_file(
     Ok(())
 }
 
-pub(crate) async fn cmd_download(client: &Client, args: DownloadArgs) -> Result<()> {
+/// What a download run did, as reported in `--json` output.
+#[derive(Debug, Serialize)]
+pub(crate) struct DownloadSummary {
+    /// Output directory, as given on the command line.
+    pub output: String,
+    /// Files the run planned to transfer.
+    pub files: usize,
+    /// Files that finished, including ones resumed from an earlier run.
+    pub downloaded: usize,
+    /// Files that failed.
+    pub failed: usize,
+    /// Bytes across the files that finished.
+    pub bytes: u64,
+}
+
+pub(crate) async fn cmd_download(
+    client: &Client,
+    args: DownloadArgs,
+    ui: Output,
+) -> Result<DownloadSummary> {
     let output = StdPath::new(&args.output);
     tokio::fs::create_dir_all(output)
         .await
@@ -250,15 +270,24 @@ pub(crate) async fn cmd_download(client: &Client, args: DownloadArgs) -> Result<
         }
     }
 
+    let empty = DownloadSummary {
+        output: args.output.clone(),
+        files: 0,
+        downloaded: 0,
+        failed: 0,
+        bytes: 0,
+    };
     if tasks.is_empty() {
-        println!("(nothing to download)");
-        return Ok(());
+        ui.note("(nothing to download)");
+        ui.ok("download", &empty)?;
+        return Ok(empty);
     }
 
     let jobs = args.jobs.max(1);
     // Live byte-level progress only reads cleanly with a single active
     // transfer; with concurrency we fall back to per-file start/finish lines.
-    let show_progress = jobs == 1;
+    let show_progress = ui.progress(jobs);
+    let planned = tasks.len();
 
     let sem = Arc::new(Semaphore::new(jobs));
     let mut set = tokio::task::JoinSet::new();
@@ -272,11 +301,18 @@ pub(crate) async fn cmd_download(client: &Client, args: DownloadArgs) -> Result<
     }
 
     let mut first_err: Option<anyhow::Error> = None;
+    let mut downloaded = 0usize;
+    let mut failed = 0usize;
+    let mut bytes = 0u64;
     while let Some(joined) = set.join_next().await {
         match joined.context("download task panicked")? {
-            Ok(()) => {}
+            Ok(size) => {
+                downloaded += 1;
+                bytes += size;
+            }
             Err(e) => {
-                eprintln!("error: {e:#}");
+                failed += 1;
+                ui.note(format!("error: {e:#}"));
                 if first_err.is_none() {
                     first_err = Some(e);
                 }
@@ -284,9 +320,27 @@ pub(crate) async fn cmd_download(client: &Client, args: DownloadArgs) -> Result<
         }
     }
 
+    let summary = DownloadSummary {
+        output: args.output.clone(),
+        files: planned,
+        downloaded,
+        failed,
+        bytes,
+    };
+    // A failed run emits exactly one document — the failure — so the counts go
+    // into its message rather than a second document on stdout. The summary is
+    // reported only when nothing failed.
     match first_err {
-        Some(e) => Err(e),
-        None => Ok(()),
+        Some(e) => Err(e).with_context(|| {
+            format!(
+                "{failed} of {planned} files failed ({} downloaded, {} bytes)",
+                summary.downloaded, summary.bytes
+            )
+        }),
+        None => {
+            ui.ok("download", &summary)?;
+            Ok(summary)
+        }
     }
 }
 
@@ -493,11 +547,20 @@ async fn download_file(
     output_dir: &StdPath,
     dest_name: &str,
     show_progress: bool,
-) -> Result<()> {
+) -> Result<u64> {
     let dl: pikpak::DownloadInfo = client
         .get_download_url(&file.id)
         .await
         .context("failed to get download URL")?;
+    // An empty link would only fail later as an opaque request-builder error,
+    // reported as a network blip worth retrying. It is the service declining.
+    if dl.web_content_link.is_empty() {
+        return Err(crate::output::Coded {
+            code: crate::output::EXIT_REFUSED,
+            message: format!("PikPak returned no download link for {dest_name}"),
+        }
+        .into());
+    }
 
     let safe_dest_name = safe_component(dest_name)?;
     // The detail response may leave the size out; the directory listing we already
@@ -513,7 +576,7 @@ async fn download_file(
     // Never resume bytes that might belong to a different version of the file.
     prepare_part(&part_path, &PartIdentity::of(file, expected_size)).await?;
 
-    println!(
+    eprintln!(
         "Downloading: {} ({})",
         safe_dest_name,
         format_size(expected_size, BINARY)
@@ -550,7 +613,11 @@ async fn download_file(
                 tokio::time::sleep(delay).await;
                 // The link is time-limited, so fetch a fresh one for the next try.
                 match client.get_download_url(&file.id).await {
-                    Ok(fresh) => link = fresh.web_content_link,
+                    Ok(fresh) if !fresh.web_content_link.is_empty() => {
+                        link = fresh.web_content_link
+                    }
+                    // An empty link is no better than the one we have.
+                    Ok(_) => {}
                     // A rejected account token cannot be repaired by retrying:
                     // surface it now instead of spending the whole budget and then
                     // blaming the CDN status that the stale link produced.
@@ -580,8 +647,14 @@ async fn download_file(
         .await
         .context("failed to finalize output file")?;
     let _ = tokio::fs::remove_file(identity_path(&part_path)).await;
-    println!("Saved: {}", file_path.display());
-    Ok(())
+    eprintln!("Saved: {}", file_path.display());
+
+    // Report what actually landed rather than what was advertised: a resumed or
+    // already-complete file can differ from the size the API claimed.
+    Ok(tokio::fs::metadata(&file_path)
+        .await
+        .map(|meta| meta.len())
+        .unwrap_or(expected_size))
 }
 
 /// A single download attempt. Resumes from an existing `.part` file via an HTTP
@@ -647,7 +720,10 @@ async fn download_attempt(
         } else {
             let retry = is_retryable_status(status) || is_expired_link_status(status);
             let body = resp.text().await.unwrap_or_default();
-            let err = anyhow::anyhow!("download failed with status {}: {body}", status.as_u16());
+            let err = anyhow::Error::new(crate::output::Coded {
+                code: transfer_status_code(status),
+                message: format!("download failed with status {}: {body}", status.as_u16()),
+            });
             return Err(if retry {
                 DlError::Retryable(err)
             } else {
@@ -697,8 +773,11 @@ async fn download_attempt(
     // size) would be renamed to the final name and look like a success. Framing
     // violations such as a lying Content-Length already error out upstream.
     if total > 0 && downloaded < total {
-        return Err(DlError::Retryable(anyhow::anyhow!(
-            "incomplete transfer: received {downloaded} of {total} bytes"
+        return Err(DlError::Retryable(anyhow::Error::new(
+            crate::output::Coded {
+                code: crate::output::EXIT_NETWORK,
+                message: format!("incomplete transfer: received {downloaded} of {total} bytes"),
+            },
         )));
     }
     Ok(())
@@ -732,6 +811,18 @@ fn is_expired_link_status(status: reqwest::StatusCode) -> bool {
         || status == reqwest::StatusCode::GONE
 }
 
+/// The exit code for a CDN status that outlasted its retries. Not the API's
+/// mapping: a 401/403 here is the signed link refusing us — the account token
+/// was checked when the link was refreshed — so a new token would not help.
+fn transfer_status_code(status: reqwest::StatusCode) -> u8 {
+    use crate::output::{EXIT_NETWORK, EXIT_NOT_FOUND, EXIT_REFUSED};
+    match status.as_u16() {
+        404 => EXIT_NOT_FOUND,
+        429 | 500.. => EXIT_NETWORK,
+        _ => EXIT_REFUSED,
+    }
+}
+
 async fn create_part(path: &StdPath) -> std::result::Result<tokio::fs::File, DlError> {
     tokio::fs::File::create(path)
         .await
@@ -746,7 +837,10 @@ fn fatal(err: impl std::error::Error + Send + Sync + 'static, ctx: &'static str)
 /// Classify a reqwest error as retryable (transient network) or fatal.
 fn classify(err: reqwest::Error, ctx: &'static str) -> DlError {
     let transient = err.is_timeout() || err.is_connect() || err.is_request() || err.is_body();
-    let e = anyhow::Error::new(err).context(ctx);
+    // As `Error::Http` it reports as `network`; left raw, its transport cause is
+    // an `io::Error` and it would read as a local disk failure. The URL goes:
+    // its query string is a signed credential, and this text reaches logs.
+    let e = anyhow::Error::new(pikpak::Error::Http(err.without_url())).context(ctx);
     if transient {
         DlError::Retryable(e)
     } else {
@@ -793,7 +887,7 @@ async fn collect_folder(
             .await
             .context("failed to create folder")?;
 
-        println!("Scanning folder: {}", current.name);
+        eprintln!("Scanning folder: {}", current.name);
 
         for entry in client.list_folder(&current.id).await? {
             match classify_entry(entry) {
@@ -1081,6 +1175,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn a_cdn_status_maps_to_what_fixes_it_not_to_the_api_meaning() {
+        use crate::output::{EXIT_NETWORK, EXIT_NOT_FOUND, EXIT_REFUSED};
+        use reqwest::StatusCode;
+        assert_eq!(
+            super::transfer_status_code(StatusCode::SERVICE_UNAVAILABLE),
+            EXIT_NETWORK
+        );
+        assert_eq!(
+            super::transfer_status_code(StatusCode::TOO_MANY_REQUESTS),
+            EXIT_NETWORK
+        );
+        assert_eq!(
+            super::transfer_status_code(StatusCode::NOT_FOUND),
+            EXIT_NOT_FOUND
+        );
+        // A stale signed link, not a rejected account token: no `auth`.
+        assert_eq!(
+            super::transfer_status_code(StatusCode::FORBIDDEN),
+            EXIT_REFUSED
+        );
+        assert_eq!(
+            super::transfer_status_code(StatusCode::UNAUTHORIZED),
+            EXIT_REFUSED
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_cdn_is_a_network_failure_without_the_signed_url() {
+        // Bind then drop a listener, so the port is known to refuse connections.
+        let addr = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let err = reqwest::Client::new()
+            .get(format!("http://{addr}/f?sig=SECRET"))
+            .send()
+            .await
+            .unwrap_err();
+
+        let error = super::classify(err, "download request failed").into_inner();
+        assert_eq!(
+            crate::output::exit_code_for(&error),
+            (crate::output::EXIT_NETWORK, "network"),
+            "a refused connection is not a local disk failure"
+        );
+        assert!(!format!("{error:#}").contains("SECRET"), "{error:#}");
+    }
+
     #[tokio::test]
     async fn download_attempt_restarts_on_416() {
         // Remote file is 4 bytes; the local part holds 6 stale bytes, so the
@@ -1215,6 +1359,24 @@ mod tests {
         // 416-style and malformed values yield no usable offset.
         assert_eq!(parse_range_start(&hv("bytes */100")), None);
         assert_eq!(parse_range_start(&hv("nonsense")), None);
+    }
+
+    #[test]
+    fn the_download_summary_keeps_its_json_field_names() {
+        let summary = super::DownloadSummary {
+            output: "./downloads".to_string(),
+            files: 3,
+            downloaded: 2,
+            failed: 1,
+            bytes: 4096,
+        };
+        let json = serde_json::to_value(&summary).unwrap();
+
+        assert_eq!(json["output"], "./downloads");
+        assert_eq!(json["files"], 3);
+        assert_eq!(json["downloaded"], 2);
+        assert_eq!(json["failed"], 1);
+        assert_eq!(json["bytes"], 4096);
     }
 
     #[test]
@@ -1763,7 +1925,9 @@ mod tests {
                 path: "/".to_string(),
                 output: dir.to_string_lossy().into_owned(),
                 jobs: 1,
+                detach: false,
             },
+            crate::output::Output::new(false, false),
         )
         .await
         .expect("downloading the drive root must work");
@@ -1792,7 +1956,9 @@ mod tests {
                 path: "/dir".to_string(),
                 output: dir.to_string_lossy().into_owned(),
                 jobs: 1,
+                detach: false,
             },
+            crate::output::Output::new(false, false),
         )
         .await
         .expect("downloading a folder must walk it");
@@ -1848,7 +2014,9 @@ mod tests {
                 path: "/No Such Folder".to_string(),
                 output: dir.to_string_lossy().into_owned(),
                 jobs: 1,
+                detach: false,
             },
+            crate::output::Output::new(false, false),
         )
         .await
         .expect_err("a missing path must fail");
@@ -2125,7 +2293,9 @@ mod tests {
                     path: "/dir".to_string(),
                     output: out.to_string_lossy().into_owned(),
                     jobs,
+                    detach: false,
                 },
+                crate::output::Output::new(false, false),
             )
             .await
             .unwrap_or_else(|e| panic!("-j {jobs}: both files must download: {e:#}"));
