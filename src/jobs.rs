@@ -528,17 +528,17 @@ async fn wait_for(
                     ui.ok(name, &serde_json::json!({ "job": job }))?;
                     Ok(())
                 }
-                JobState::Cancelled => Err(crate::output::JobFailed {
+                JobState::Cancelled => Err(crate::output::Coded {
                     code: crate::output::EXIT_CANCELLED,
                     message: format!("job {id} was cancelled"),
                 }
                 .into()),
-                JobState::Lost => Err(crate::output::JobFailed {
+                JobState::Lost => Err(crate::output::Coded {
                     code: crate::output::EXIT_UNEXPECTED,
                     message: format!("job {id} lost its worker"),
                 }
                 .into()),
-                _ => Err(crate::output::JobFailed {
+                _ => Err(crate::output::Coded {
                     code: job.exit_code.unwrap_or(crate::output::EXIT_UNEXPECTED),
                     message: format!(
                         "job {id} failed: {}",

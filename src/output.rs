@@ -63,23 +63,25 @@ impl std::fmt::Display for Missing {
 
 impl std::error::Error for Missing {}
 
-/// A detached job that did not succeed, carrying the exit code its own failed
-/// run produced so `jobs wait` reports the same thing a synchronous run would.
+/// A failure that already knows its exit code, where the generic mapping would
+/// guess wrong: a detached job read back from disk (so `jobs wait` reports what
+/// a synchronous run would have), or a CDN status, which carries none of the
+/// account-level meaning the same status has on the API.
 #[derive(Debug)]
-pub struct JobFailed {
-    /// The code the worker's failure maps to.
+pub struct Coded {
+    /// The exit code to report.
     pub code: u8,
     /// What went wrong.
     pub message: String,
 }
 
-impl std::fmt::Display for JobFailed {
+impl std::fmt::Display for Coded {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}", self.message)
     }
 }
 
-impl std::error::Error for JobFailed {}
+impl std::error::Error for Coded {}
 
 /// The `kind` label for an exit code, for the rare case where the code is known
 /// but the original error is not (a job read back from disk).
@@ -180,10 +182,10 @@ pub(crate) fn error_document(command: &str, error: &AnyError) -> Value {
 ///
 /// Codes are a public interface: add new ones, never repurpose them.
 pub fn exit_code_for(error: &AnyError) -> (u8, &'static str) {
-    // A job that already failed carries its own code; do not re-derive it.
+    // A failure that carries its own code; do not re-derive it.
     if let Some(failed) = error
         .chain()
-        .find_map(|cause| cause.downcast_ref::<JobFailed>())
+        .find_map(|cause| cause.downcast_ref::<Coded>())
     {
         return (failed.code, kind_for_code(failed.code));
     }
@@ -342,7 +344,7 @@ mod tests {
 
     #[test]
     fn a_failed_job_reports_the_code_its_own_run_produced() {
-        let failed = anyhow::Error::new(JobFailed {
+        let failed = anyhow::Error::new(Coded {
             code: EXIT_NETWORK,
             message: "job 1-000001 failed: the service is down".into(),
         })
@@ -350,7 +352,7 @@ mod tests {
         assert_eq!(exit_code_for(&failed), (EXIT_NETWORK, "network"));
 
         // A cancelled job is not an auth failure or a network blip.
-        let cancelled = anyhow::Error::new(JobFailed {
+        let cancelled = anyhow::Error::new(Coded {
             code: EXIT_CANCELLED,
             message: "job 1-000001 was cancelled".into(),
         });

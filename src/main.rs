@@ -140,7 +140,12 @@ async fn main() -> ExitCode {
     } else {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"))
     };
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    // Logs are narration: on stdout they would corrupt the one document a
+    // caller parses.
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
 
     match run(cli, env_path, output).await {
         Ok(()) => ExitCode::from(output::EXIT_OK),

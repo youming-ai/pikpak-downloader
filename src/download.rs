@@ -552,6 +552,15 @@ async fn download_file(
         .get_download_url(&file.id)
         .await
         .context("failed to get download URL")?;
+    // An empty link would only fail later as an opaque request-builder error,
+    // reported as a network blip worth retrying. It is the service declining.
+    if dl.web_content_link.is_empty() {
+        return Err(crate::output::Coded {
+            code: crate::output::EXIT_REFUSED,
+            message: format!("PikPak returned no download link for {dest_name}"),
+        }
+        .into());
+    }
 
     let safe_dest_name = safe_component(dest_name)?;
     // The detail response may leave the size out; the directory listing we already
@@ -604,7 +613,11 @@ async fn download_file(
                 tokio::time::sleep(delay).await;
                 // The link is time-limited, so fetch a fresh one for the next try.
                 match client.get_download_url(&file.id).await {
-                    Ok(fresh) => link = fresh.web_content_link,
+                    Ok(fresh) if !fresh.web_content_link.is_empty() => {
+                        link = fresh.web_content_link
+                    }
+                    // An empty link is no better than the one we have.
+                    Ok(_) => {}
                     // A rejected account token cannot be repaired by retrying:
                     // surface it now instead of spending the whole budget and then
                     // blaming the CDN status that the stale link produced.
@@ -707,7 +720,10 @@ async fn download_attempt(
         } else {
             let retry = is_retryable_status(status) || is_expired_link_status(status);
             let body = resp.text().await.unwrap_or_default();
-            let err = anyhow::anyhow!("download failed with status {}: {body}", status.as_u16());
+            let err = anyhow::Error::new(crate::output::Coded {
+                code: transfer_status_code(status),
+                message: format!("download failed with status {}: {body}", status.as_u16()),
+            });
             return Err(if retry {
                 DlError::Retryable(err)
             } else {
@@ -757,8 +773,11 @@ async fn download_attempt(
     // size) would be renamed to the final name and look like a success. Framing
     // violations such as a lying Content-Length already error out upstream.
     if total > 0 && downloaded < total {
-        return Err(DlError::Retryable(anyhow::anyhow!(
-            "incomplete transfer: received {downloaded} of {total} bytes"
+        return Err(DlError::Retryable(anyhow::Error::new(
+            crate::output::Coded {
+                code: crate::output::EXIT_NETWORK,
+                message: format!("incomplete transfer: received {downloaded} of {total} bytes"),
+            },
         )));
     }
     Ok(())
@@ -792,6 +811,18 @@ fn is_expired_link_status(status: reqwest::StatusCode) -> bool {
         || status == reqwest::StatusCode::GONE
 }
 
+/// The exit code for a CDN status that outlasted its retries. Not the API's
+/// mapping: a 401/403 here is the signed link refusing us — the account token
+/// was checked when the link was refreshed — so a new token would not help.
+fn transfer_status_code(status: reqwest::StatusCode) -> u8 {
+    use crate::output::{EXIT_NETWORK, EXIT_NOT_FOUND, EXIT_REFUSED};
+    match status.as_u16() {
+        404 => EXIT_NOT_FOUND,
+        429 | 500.. => EXIT_NETWORK,
+        _ => EXIT_REFUSED,
+    }
+}
+
 async fn create_part(path: &StdPath) -> std::result::Result<tokio::fs::File, DlError> {
     tokio::fs::File::create(path)
         .await
@@ -806,7 +837,10 @@ fn fatal(err: impl std::error::Error + Send + Sync + 'static, ctx: &'static str)
 /// Classify a reqwest error as retryable (transient network) or fatal.
 fn classify(err: reqwest::Error, ctx: &'static str) -> DlError {
     let transient = err.is_timeout() || err.is_connect() || err.is_request() || err.is_body();
-    let e = anyhow::Error::new(err).context(ctx);
+    // As `Error::Http` it reports as `network`; left raw, its transport cause is
+    // an `io::Error` and it would read as a local disk failure. The URL goes:
+    // its query string is a signed credential, and this text reaches logs.
+    let e = anyhow::Error::new(pikpak::Error::Http(err.without_url())).context(ctx);
     if transient {
         DlError::Retryable(e)
     } else {
@@ -1139,6 +1173,56 @@ mod tests {
         let got = std::fs::read(&part).unwrap();
         assert_eq!(got, full, "resumed file must equal the full content");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cdn_status_maps_to_what_fixes_it_not_to_the_api_meaning() {
+        use crate::output::{EXIT_NETWORK, EXIT_NOT_FOUND, EXIT_REFUSED};
+        use reqwest::StatusCode;
+        assert_eq!(
+            super::transfer_status_code(StatusCode::SERVICE_UNAVAILABLE),
+            EXIT_NETWORK
+        );
+        assert_eq!(
+            super::transfer_status_code(StatusCode::TOO_MANY_REQUESTS),
+            EXIT_NETWORK
+        );
+        assert_eq!(
+            super::transfer_status_code(StatusCode::NOT_FOUND),
+            EXIT_NOT_FOUND
+        );
+        // A stale signed link, not a rejected account token: no `auth`.
+        assert_eq!(
+            super::transfer_status_code(StatusCode::FORBIDDEN),
+            EXIT_REFUSED
+        );
+        assert_eq!(
+            super::transfer_status_code(StatusCode::UNAUTHORIZED),
+            EXIT_REFUSED
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_cdn_is_a_network_failure_without_the_signed_url() {
+        // Bind then drop a listener, so the port is known to refuse connections.
+        let addr = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let err = reqwest::Client::new()
+            .get(format!("http://{addr}/f?sig=SECRET"))
+            .send()
+            .await
+            .unwrap_err();
+
+        let error = super::classify(err, "download request failed").into_inner();
+        assert_eq!(
+            crate::output::exit_code_for(&error),
+            (crate::output::EXIT_NETWORK, "network"),
+            "a refused connection is not a local disk failure"
+        );
+        assert!(!format!("{error:#}").contains("SECRET"), "{error:#}");
     }
 
     #[tokio::test]

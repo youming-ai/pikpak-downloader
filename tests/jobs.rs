@@ -72,6 +72,25 @@ fn listing_jobs_needs_no_credentials() {
 }
 
 #[test]
+fn debug_logging_never_reaches_stdout() {
+    let state = state_dir("verbose");
+    // An unreadable record is skipped with a debug log line.
+    std::fs::write(state.join("jobs").join("1-000001.json"), b"{ not json").unwrap();
+
+    let (code, stdout, stderr) = run(&state, &["--json", "--verbose", "jobs", "list"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stderr.contains("skipping"),
+        "the log line goes to stderr: {stderr}"
+    );
+    assert_eq!(
+        document(&stdout)["result"]["jobs"].as_array().map(Vec::len),
+        Some(0)
+    );
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[test]
 fn an_empty_state_directory_lists_nothing_and_still_succeeds() {
     let state = state_dir("empty");
 
