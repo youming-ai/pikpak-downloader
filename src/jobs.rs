@@ -126,18 +126,30 @@ pub(crate) struct JobStore {
 impl JobStore {
     /// Open (creating if needed) the store under `root`.
     pub(crate) fn open(root: &StdPath) -> Result<Self> {
-        // Private: a worker's log can hold a rotated refresh token it had nowhere
-        // else to put, and records carry the service's error text.
+        // Ancestors of a `PIKPAK_STATE_DIR` get the usual permissions; they are
+        // not ours to lock down.
+        if let Some(parent) = root.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        // The state directory itself is private: a worker's log can hold a
+        // rotated refresh token it had nowhere else to put, and records carry
+        // the service's error text.
         let mut dirs = std::fs::DirBuilder::new();
-        dirs.recursive(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
             dirs.mode(0o700);
         }
-        for dir in [root.join("jobs"), root.join("logs")] {
-            dirs.create(&dir)
-                .with_context(|| format!("failed to create {}", dir.display()))?;
+        for dir in [root.to_path_buf(), root.join("jobs"), root.join("logs")] {
+            match dirs.create(&dir) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to create {}", dir.display()))
+                }
+            }
         }
         Ok(Self {
             root: root.to_path_buf(),
@@ -812,6 +824,22 @@ mod tests {
             assert_eq!(mode, 0o700, "{}", dir.display());
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ancestors_of_the_state_directory_keep_their_usual_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = temp_state("ancestors");
+        let mode = |dir: &StdPath| std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+
+        JobStore::open(&base.join("a").join("state")).unwrap();
+        // What a plain mkdir gives under this umask, for comparison.
+        std::fs::create_dir_all(base.join("plain")).unwrap();
+
+        assert_eq!(mode(&base.join("a")), mode(&base.join("plain")));
+        assert_eq!(mode(&base.join("a").join("state")), 0o700);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
