@@ -341,6 +341,8 @@ impl TokenManager {
             expires_in,
             sub,
         } = serde_json::from_value(response)?;
+        let sub = sub.unwrap_or_default();
+        let expires_in = expires_in.unwrap_or(ASSUMED_TOKEN_TTL_SECS);
         let effective_ttl = expires_in.saturating_sub(60).max(5);
         let refresh_at = Instant::now() + Duration::from_secs(effective_ttl);
 
@@ -379,7 +381,7 @@ impl TokenManager {
         })?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
+            let body = redact(&resp.text().await.unwrap_or_default(), refresh_token);
             return Err(ExchangeFailure {
                 grant_rejected: is_grant_rejection(&body),
                 error: explain_auth_failure(status, &body),
@@ -462,12 +464,36 @@ pub(crate) fn explain_auth_failure(status: u16, body: &str) -> Error {
     ))
 }
 
-/// The rest of a token response, read once its refresh token is safe.
+/// The rest of a token response, read once its refresh token is safe — and
+/// leniently, because a run that fails here has already spent the token it sent.
 #[derive(Debug, Deserialize)]
 struct AccessGrant {
     access_token: String,
-    expires_in: u64,
-    sub: String,
+    /// Seconds, as a number or a decimal string.
+    #[serde(
+        default,
+        deserialize_with = "crate::types::deserialize_optional_lenient_u64"
+    )]
+    expires_in: Option<u64>,
+    /// Only the captcha flow uses it.
+    #[serde(default)]
+    sub: Option<String>,
+}
+
+/// Lifetime assumed when a token response leaves `expires_in` out. Long on
+/// purpose: every refresh rotates the single-use refresh token, and a guess
+/// that turns out too long costs one 401, after which the token is refreshed.
+const ASSUMED_TOKEN_TTL_SECS: u64 = 3600;
+
+/// `body` with every occurrence of `secret` blanked out, for error text that
+/// ends up in logs, job records and JSON documents. A server that echoes the
+/// token it rejected must not get it written down in the clear.
+pub(crate) fn redact(body: &str, secret: &str) -> String {
+    // An empty secret would "match" between every character.
+    if secret.is_empty() {
+        return body.to_string();
+    }
+    body.replace(secret, "[redacted]")
 }
 
 #[cfg(test)]
@@ -706,6 +732,25 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_rejected_token_echoed_by_the_server_is_not_repeated() {
+        let (addr, _) = scripted_auth_server(vec![(
+            400,
+            r#"{"error":"invalid_grant","error_description":"bad token sent-token-123"}"#,
+        )])
+        .await;
+        let tokens = manager_for(addr, "sent-token-123");
+
+        let text = format!("{:#}", tokens.access_token().await.unwrap_err());
+        assert!(!text.contains("sent-token-123"), "{text}");
+        assert!(text.contains("[redacted]"), "{text}");
+    }
+
+    #[test]
+    fn redacting_nothing_changes_nothing() {
+        assert_eq!(super::redact("body", ""), "body");
+    }
+
     #[test]
     fn debug_output_never_shows_a_token() {
         let tokens = TokenManager::new(
@@ -857,15 +902,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_rotated_token_survives_a_response_that_cannot_be_read_in_full() {
-        // The server rotated (and so invalidated) the token we sent, then
-        // answered with a field we cannot parse. The replacement must still reach
-        // the store and the hook, or the account is locked out.
+    async fn a_token_response_with_odd_fields_is_read_leniently() {
+        // `expires_in` as a string, `sub` missing: read leniently, so the run
+        // carries on instead of failing after its token was already spent.
         let (addr, _) = scripted_auth_server(vec![(
             200,
             r#"{"access_token":"access-2","refresh_token":"rotated-2","expires_in":"7200"}"#,
         )])
         .await;
+        let tokens = manager_for(addr, "old-token");
+
+        assert_eq!(tokens.access_token().await.unwrap(), "access-2");
+        assert_eq!(tokens.current_refresh_token().await, "rotated-2");
+    }
+
+    #[tokio::test]
+    async fn a_rotated_token_survives_a_response_that_cannot_be_read_in_full() {
+        // The server rotated (and so invalidated) the token we sent, then left
+        // out the access token. The run fails, but the replacement must still
+        // reach the store and the hook, or the account is locked out.
+        let (addr, _) = scripted_auth_server(vec![(200, r#"{"refresh_token":"rotated-2"}"#)]).await;
         let tokens = manager_for(addr, "old-token");
         let persisted = Arc::new(std::sync::Mutex::new(None));
         let sink = persisted.clone();

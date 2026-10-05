@@ -187,7 +187,8 @@ impl CaptchaManager {
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
-            let text = resp.text().await.unwrap_or_default();
+            // Like every error body: never repeat the bearer token it carried.
+            let text = crate::auth::redact(&resp.text().await.unwrap_or_default(), &access);
             return Err(Error::Api {
                 status,
                 message: text,
