@@ -445,6 +445,8 @@ impl Client {
             // A rejected refresh token means the same thing whichever endpoint
             // reports it, so give it the actionable message the token exchange
             // uses instead of relaying a raw body from a drive call.
+            // What the server said goes into error text, but never the token.
+            let text = crate::auth::redact(&text, &access);
             if crate::auth::is_grant_rejection(&text) {
                 return Err(crate::auth::explain_auth_failure(status.as_u16(), &text));
             }
