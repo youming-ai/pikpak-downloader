@@ -126,10 +126,19 @@ pub(crate) struct JobStore {
 impl JobStore {
     /// Open (creating if needed) the store under `root`.
     pub(crate) fn open(root: &StdPath) -> Result<Self> {
-        std::fs::create_dir_all(root.join("jobs"))
-            .with_context(|| format!("failed to create {}", root.join("jobs").display()))?;
-        std::fs::create_dir_all(root.join("logs"))
-            .with_context(|| format!("failed to create {}", root.join("logs").display()))?;
+        // Private: a worker's log can hold a rotated refresh token it had nowhere
+        // else to put, and records carry the service's error text.
+        let mut dirs = std::fs::DirBuilder::new();
+        dirs.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            dirs.mode(0o700);
+        }
+        for dir in [root.join("jobs"), root.join("logs")] {
+            dirs.create(&dir)
+                .with_context(|| format!("failed to create {}", dir.display()))?;
+        }
         Ok(Self {
             root: root.to_path_buf(),
         })
@@ -368,7 +377,17 @@ fn spawn_worker(id: &str, store: &JobStore, token_from_file: bool) -> Result<std
     use std::process::Stdio;
 
     let exe = std::env::current_exe().context("cannot locate this executable to detach")?;
-    let log = std::fs::File::create(store.log_path(id))
+    // Owner-only, even inside a state directory created by an older version
+    // without private permissions: the log can hold a refresh token.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let log = options
+        .open(store.log_path(id))
         .with_context(|| format!("failed to create {}", store.log_path(id).display()))?;
     let log_err = log
         .try_clone()
@@ -778,6 +797,20 @@ mod tests {
         assert!(store.cancel_requested("1-000001"));
         // Asking to cancel an unknown job is a not-found, not a silent success.
         assert!(store.request_cancel("nope").is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_state_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_state("private");
+        JobStore::open(&root).unwrap();
+
+        for dir in [&root, &root.join("jobs"), &root.join("logs")] {
+            let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", dir.display());
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
