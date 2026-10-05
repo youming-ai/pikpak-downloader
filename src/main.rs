@@ -22,7 +22,7 @@ mod output;
     name = "pikpak",
     version,
     about = "PikPak cloud storage CLI",
-    after_help = "Config via .env or environment:\n  PIKPAK_REFRESH_TOKEN  (required) refresh token from the web UI\n  PIKPAK_PROXY          (optional) HTTP(S) proxy URL\n  PIKPAK_CLIENT_ID      (optional) override OAuth client id\n  PIKPAK_CLIENT_SECRET  (optional) override OAuth client secret\n  PIKPAK_DEVICE_ID      (optional) device id; saved to .env on first run"
+    after_help = "Config via .env or environment:\n  PIKPAK_REFRESH_TOKEN  (required) refresh token from the web UI\n  PIKPAK_PROXY          (optional) HTTP(S) proxy URL\n  PIKPAK_CLIENT_ID      (optional) override OAuth client id\n  PIKPAK_CLIENT_SECRET  (optional) override OAuth client secret\n  PIKPAK_DEVICE_ID      (optional) device id; saved on first run to the .env\n                        the token came from"
 )]
 struct Cli {
     #[arg(long, global = true)]

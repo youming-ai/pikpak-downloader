@@ -162,6 +162,16 @@ impl JobStore {
         })
     }
 
+    /// The store under `root`, as it is: nothing is created. For the `jobs`
+    /// commands, which only read — asking what is running must not create a
+    /// state tree (perhaps beside a `.env` in a parent directory) or fail
+    /// because that directory is read-only.
+    pub(crate) fn at(root: &StdPath) -> Self {
+        Self {
+            root: root.to_path_buf(),
+        }
+    }
+
     /// The state directory this store lives in, for passing to a worker.
     pub(crate) fn root(&self) -> &StdPath {
         &self.root
@@ -240,10 +250,15 @@ impl JobStore {
     pub(crate) fn list(&self) -> Result<Vec<JobRecord>> {
         let dir = self.root.join("jobs");
         let mut records = Vec::new();
-        for entry in std::fs::read_dir(&dir)
-            .with_context(|| format!("failed to read {}", dir.display()))?
-            .flatten()
-        {
+        // No store yet means no jobs yet.
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(records),
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to read {}", dir.display()))
+            }
+        };
+        for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
@@ -486,7 +501,8 @@ impl JobsCommand {
 
 /// `pikpak jobs …`.
 pub(crate) async fn cmd_jobs(command: JobsCommand, ui: Output, state: &StdPath) -> Result<()> {
-    let store = JobStore::open(state)?;
+    // A job that exists has its directory; one that does not is `not_found`.
+    let store = JobStore::at(state);
     let name = command.name();
 
     match command {

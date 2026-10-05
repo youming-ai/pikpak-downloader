@@ -34,9 +34,14 @@ fn write_record(state: &Path, id: &str, job_state: &str, updated_at: u64) {
 
 /// Run the CLI in `state`, with no credentials in reach.
 fn run(state: &Path, args: &[&str]) -> (i32, String, String) {
+    run_in(state, state, args)
+}
+
+/// Run the CLI from `cwd` against the state directory `state`.
+fn run_in(cwd: &Path, state: &Path, args: &[&str]) -> (i32, String, String) {
     let output = Command::new(env!("CARGO_BIN_EXE_pikpak"))
         .args(args)
-        .current_dir(state)
+        .current_dir(cwd)
         .env("PIKPAK_STATE_DIR", state)
         .env_remove("PIKPAK_REFRESH_TOKEN")
         .env_remove("PIKPAK_PROXY")
@@ -97,8 +102,12 @@ fn the_state_directory_sits_beside_the_env_file_not_the_working_directory() {
     let sub = base.join("sub");
     std::fs::create_dir_all(&sub).unwrap();
 
-    // dotenvy finds the parent's `.env` from `sub`; the jobs must live beside it,
-    // so a job started here is found again from the parent.
+    // A job recorded beside the `.env`, as one started from the parent is.
+    let anchored = base.join(".pikpak");
+    std::fs::create_dir_all(anchored.join("jobs")).unwrap();
+    write_record(&anchored, "1-000001", "succeeded", now());
+
+    // dotenvy finds the parent's `.env` from `sub`, so the same jobs are seen.
     let output = Command::new(env!("CARGO_BIN_EXE_pikpak"))
         .args(["--json", "jobs", "list"])
         .current_dir(&sub)
@@ -108,9 +117,27 @@ fn the_state_directory_sits_beside_the_env_file_not_the_working_directory() {
         .expect("the binary runs");
     assert_eq!(output.status.code(), Some(0), "{output:?}");
 
-    assert!(base.join(".pikpak").join("jobs").is_dir());
+    let doc = document(&String::from_utf8_lossy(&output.stdout));
+    assert_eq!(doc["result"]["jobs"][0]["id"], "1-000001");
     assert!(!sub.join(".pikpak").exists());
     let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn listing_jobs_creates_nothing() {
+    let state = std::env::temp_dir().join(format!("pikpak-it-readonly-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&state);
+
+    let (code, stdout, stderr) = run_in(&std::env::temp_dir(), &state, &["--json", "jobs", "list"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(
+        document(&stdout)["result"]["jobs"].as_array().map(Vec::len),
+        Some(0)
+    );
+    assert!(
+        !state.exists(),
+        "a read-only command must not create the state tree"
+    );
 }
 
 #[test]

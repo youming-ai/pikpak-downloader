@@ -84,9 +84,15 @@ pub(crate) fn device_id(env_path: Option<&StdPath>, refresh_token: &str) -> Opti
     // ponytail: no file lock — a token rotation written back in the same
     // millisecond could be lost to this write, once per `.env`. Lock the file if
     // that ever shows up.
-    if let Err(e) = set_env_var(path, DEVICE_KEY, &id, true) {
+    let failure = match set_env_var(path, DEVICE_KEY, &id, true) {
+        Ok(true) => None,
+        // The file vanished after it was loaded.
+        Ok(false) => Some("it no longer exists".to_string()),
+        Err(e) => Some(e.to_string()),
+    };
+    if let Some(why) = failure {
         eprintln!(
-            "warning: could not save {DEVICE_KEY} to {} ({e}); this run uses {id}",
+            "warning: could not save {DEVICE_KEY} to {} ({why}); this run uses {id}",
             path.display()
         );
     }
