@@ -116,6 +116,9 @@ State lives under `PIKPAK_STATE_DIR` (default `.pikpak` beside your `.env`):
 
 ## Library
 
+Depend on it with `default-features = false` to leave out the CLI's own
+dependencies (clap, dotenvy, tracing-subscriber, humansize, anyhow).
+
 ```rust,no_run
 use pikpak::Client;
 use std::time::Duration;

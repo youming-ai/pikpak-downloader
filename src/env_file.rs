@@ -114,12 +114,18 @@ fn set_env_var(env_path: &StdPath, key: &str, value: &str, append: bool) -> std:
     // link would replace the link and leave its target holding the dead token.
     let env_path = &std::fs::canonicalize(env_path)?;
     let content = std::fs::read_to_string(env_path)?;
+    // Keep the file's own line endings: a Windows-edited `.env` stays CRLF.
+    let newline = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     let mut found = false;
     let mut out = String::with_capacity(content.len() + key.len() + value.len() + 2);
     for line in content.lines() {
         let Some(offset) = key_offset(line, key) else {
             out.push_str(line);
-            out.push('\n');
+            out.push_str(newline);
             continue;
         };
         // Keep whatever the user wrote before the key (`export `, indentation).
@@ -127,7 +133,7 @@ fn set_env_var(env_path: &StdPath, key: &str, value: &str, append: bool) -> std:
         out.push_str(key);
         out.push('=');
         out.push_str(&env_quote(value));
-        out.push('\n');
+        out.push_str(newline);
         found = true;
     }
     if !found {
@@ -139,7 +145,7 @@ fn set_env_var(env_path: &StdPath, key: &str, value: &str, append: bool) -> std:
         out.push_str(key);
         out.push('=');
         out.push_str(&env_quote(value));
-        out.push('\n');
+        out.push_str(newline);
     }
     write_atomically(env_path, out.as_bytes())?;
     Ok(true)
@@ -203,8 +209,9 @@ fn env_quote(value: &str) -> String {
 
 /// Write `bytes` to `path` through a sibling temporary file and a rename.
 ///
-/// Windows cannot rename over an existing file, so there the rewrite falls back
-/// to an in-place write — correct, though not atomic.
+/// If the rename fails (another process holding the file open on Windows, a
+/// filesystem that refuses it), the rewrite falls back to an in-place write —
+/// correct, though not atomic.
 fn write_atomically(path: &StdPath, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
@@ -222,7 +229,16 @@ fn write_atomically(path: &StdPath, bytes: &[u8]) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options.open(&tmp)?.write_all(bytes)?;
+    // Synced before the rename, so a crash cannot leave a renamed but empty
+    // file; removed on failure, so no copy of the token is left lying around.
+    let written = options.open(&tmp).and_then(|mut file| {
+        file.write_all(bytes)?;
+        file.sync_all()
+    });
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
 
     // Keep whatever the real file had, so an existing 0600 stays 0600.
     #[cfg(unix)]
@@ -397,6 +413,22 @@ mod tests {
                 ("PIKPAK_DEVICE_ID".to_string(), "dev-1".to_string()),
             ],
             "{content:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_crlf_env_keeps_its_line_endings() {
+        let dir = std::env::temp_dir().join(format!("pikpak-envcrlf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let env_path = dir.join(".env");
+        std::fs::write(&env_path, "PIKPAK_REFRESH_TOKEN=old\r\nPIKPAK_PROXY=\r\n").unwrap();
+
+        assert!(update_env_token(&env_path, "new").unwrap());
+
+        assert_eq!(
+            std::fs::read_to_string(&env_path).unwrap(),
+            "PIKPAK_REFRESH_TOKEN=new\r\nPIKPAK_PROXY=\r\n"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

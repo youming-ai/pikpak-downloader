@@ -331,16 +331,19 @@ impl Client {
 
             let resp = self.drive_get(&url, action, &params).await?;
             let body: ListResponse = serde_json::from_str(&resp)?;
-            all.extend(body.files);
+            all.extend(body.files.unwrap_or_default());
 
-            // Stop when the server stops paginating, or names a page that has
-            // already been fetched.
+            // Stop when the server stops paginating. A page it names twice
+            // would loop forever, and stopping there quietly would report a
+            // partial listing as the whole folder — files silently missing.
             let next = match body.next_page_token {
                 Some(token) if !token.is_empty() => token,
                 _ => break,
             };
             if !followed.insert(next.clone()) {
-                break;
+                return Err(Error::Protocol(format!(
+                    "the listing of folder {parent_id:?} repeated a page token; it may be incomplete"
+                )));
             }
             page_token = Some(next);
         }
@@ -386,10 +389,11 @@ impl Client {
             };
 
             let status = resp.status();
+            let retry_after = retry_after(resp.headers());
             let text = match resp.text().await {
                 Ok(t) => t,
                 Err(e) if is_transient(&e) && net_retries < MAX_NET_RETRIES => {
-                    let delay = jittered_backoff(backoff_delay(net_retries));
+                    let delay = jittered_backoff(backoff_delay(net_retries)).max(retry_after);
                     net_retries += 1;
                     tokio::time::sleep(delay).await;
                     continue;
@@ -407,7 +411,7 @@ impl Client {
                     "access token rejected, invalidating and retrying"
                 );
                 auth_retried = true;
-                self.tokens.invalidate().await;
+                self.tokens.invalidate_if_current(&access).await;
                 continue;
             }
 
@@ -430,7 +434,8 @@ impl Client {
 
             // Server-side transient failures (5xx, 429) are worth a backoff retry.
             if is_retryable_status(status) && net_retries < MAX_NET_RETRIES {
-                let delay = jittered_backoff(backoff_delay(net_retries));
+                // The server's own wait, when it names one, beats our guess.
+                let delay = jittered_backoff(backoff_delay(net_retries)).max(retry_after);
                 tracing::debug!(action = %action, status = %status.as_u16(), ?delay, "server error, retrying");
                 net_retries += 1;
                 tokio::time::sleep(delay).await;
@@ -621,6 +626,22 @@ pub fn jittered_backoff(base: Duration) -> Duration {
     Duration::from_millis(base_ms - span + entropy % (span + 1))
 }
 
+/// Longest `Retry-After` honoured: past this, waiting inside one call is worse
+/// than failing and letting the caller retry later.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// The wait a `Retry-After: <seconds>` header asks for, capped; zero when the
+/// header is absent or names a date (rare, and not worth a date parser).
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Duration {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map_or(Duration::ZERO, |secs| {
+            Duration::from_secs(secs).min(MAX_RETRY_AFTER)
+        })
+}
+
 /// Whether a reqwest error is a transient network condition worth retrying.
 fn is_transient(err: &reqwest::Error) -> bool {
     err.is_timeout() || err.is_connect() || err.is_request() || err.is_body()
@@ -630,9 +651,6 @@ fn is_transient(err: &reqwest::Error) -> bool {
 struct ApiError {
     #[serde(default)]
     error_code: i64,
-    #[serde(default)]
-    #[allow(dead_code)]
-    error: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -650,7 +668,9 @@ struct AboutQuota {
 
 #[derive(Debug, Deserialize)]
 struct ListResponse {
-    files: Vec<FileInfo>,
+    /// Absent or `null` on an empty folder from some servers: no entries.
+    #[serde(default)]
+    files: Option<Vec<FileInfo>>,
     #[serde(default)]
     next_page_token: Option<String>,
 }
@@ -907,6 +927,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_null_file_list_is_an_empty_folder() {
+        let mock = Mock::start(vec![(200, r#"{"files":null}"#.to_string())]).await;
+        assert!(mock.client().list_folder("").await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn retry_after_is_read_in_seconds_and_capped() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+        let with = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(RETRY_AFTER, HeaderValue::from_str(value).unwrap());
+            super::retry_after(&headers)
+        };
+        assert_eq!(with("3"), Duration::from_secs(3));
+        assert_eq!(with("86400"), super::MAX_RETRY_AFTER);
+        // The date form is not parsed: fall back to our own backoff.
+        assert_eq!(with("Wed, 21 Oct 2026 07:28:00 GMT"), Duration::ZERO);
+        assert_eq!(super::retry_after(&HeaderMap::new()), Duration::ZERO);
+    }
+
+    #[tokio::test]
     async fn listing_terminates_when_the_server_repeats_a_page_token() {
         // A server that keeps returning the same token must not spin forever.
         // The final scripted 500 keeps a regression from hanging the suite: the
@@ -920,7 +961,10 @@ mod tests {
         ])
         .await;
 
-        mock.client().list_folder("").await.unwrap();
+        // Ended, and as a failure: a quiet stop would pass a partial listing
+        // off as the whole folder.
+        let err = mock.client().list_folder("").await.unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "{err:?}");
 
         assert_eq!(
             mock.drive_targets().len(),
@@ -942,7 +986,8 @@ mod tests {
         ])
         .await;
 
-        mock.client().list_folder("").await.unwrap();
+        let err = mock.client().list_folder("").await.unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "{err:?}");
 
         let drive = mock.drive_targets();
         assert_eq!(

@@ -164,11 +164,14 @@ impl NameClaims {
         let mut n = 2u32;
         loop {
             let suffix = format!(" ({n})");
+            // An extension long enough to leave no room for the suffix gives
+            // way too, or the name would overrun `max_len`.
+            let fit_ext = truncate_utf8(ext, max_len.saturating_sub(suffix.len()));
             let max_stem = max_len
-                .saturating_sub(ext.len())
+                .saturating_sub(fit_ext.len())
                 .saturating_sub(suffix.len());
             let fit_stem = truncate_utf8(stem, max_stem);
-            let candidate = format!("{fit_stem}{suffix}{ext}");
+            let candidate = format!("{fit_stem}{suffix}{fit_ext}");
             if take_name(&candidate) {
                 return Ok(candidate);
             }
@@ -325,21 +328,36 @@ pub(crate) async fn cmd_download(
 
     let sem = Arc::new(Semaphore::new(jobs));
     let mut set = tokio::task::JoinSet::new();
-    for task in tasks {
+    // A panicked task returns no value, only its id: map that back to the file.
+    let mut index_of = HashMap::new();
+    for (index, task) in tasks.into_iter().enumerate() {
         let client = client.clone();
         let sem = sem.clone();
-        set.spawn(async move {
+        let handle = set.spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore is never closed");
-            download_file(&client, &task.file, &task.dir, &task.name, show_progress).await
+            let result =
+                download_file(&client, &task.file, &task.dir, &task.name, show_progress).await;
+            (index, result)
         });
+        index_of.insert(handle.id(), index);
     }
 
-    let mut first_err: Option<anyhow::Error> = None;
+    // The failure reported (and so the exit code) is the earliest file's in
+    // listing order, not whichever finished failing first: the same run fails
+    // the same way every time.
+    let mut first_err: Option<(usize, anyhow::Error)> = None;
     let mut downloaded = 0usize;
     let mut failed = 0usize;
     let mut bytes = 0u64;
     while let Some(joined) = set.join_next().await {
-        match joined.context("download task panicked")? {
+        // A panicking transfer is one failed file, not the end of the others.
+        let (index, result) = joined.unwrap_or_else(|panic| {
+            (
+                index_of.get(&panic.id()).copied().unwrap_or(usize::MAX),
+                Err(anyhow::anyhow!("download task panicked: {panic}")),
+            )
+        });
+        match result {
             Ok(size) => {
                 downloaded += 1;
                 bytes += size;
@@ -347,12 +365,13 @@ pub(crate) async fn cmd_download(
             Err(e) => {
                 failed += 1;
                 ui.note(format!("error: {e:#}"));
-                if first_err.is_none() {
-                    first_err = Some(e);
+                if first_err.as_ref().is_none_or(|(first, _)| index < *first) {
+                    first_err = Some((index, e));
                 }
             }
         }
     }
+    let first_err = first_err.map(|(_, e)| e);
 
     let summary = DownloadSummary {
         output: args.output.clone(),
@@ -1126,6 +1145,16 @@ mod tests {
         // The partial's owner still resumes under its own name.
         assert_eq!(claims.claim_file(&dir, "f2", "x").unwrap(), "x");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_colliding_name_with_a_huge_extension_still_fits() {
+        let dir = std::path::Path::new("/tmp/test");
+        let mut claims = super::NameClaims::with_case_folding(false);
+        let name = format!("a.{}", "x".repeat(243));
+        claims.claim(dir, &name, true).unwrap();
+        let second = claims.claim(dir, &name, true).unwrap();
+        assert!(second.len() <= super::MAX_FILE_NAME_LEN, "{}", second.len());
     }
 
     #[test]

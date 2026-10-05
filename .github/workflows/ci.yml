@@ -30,6 +30,25 @@ jobs:
       - name: Tests
         run: cargo test
 
+      # The library must build and pass without the CLI's dependencies.
+      - name: Library without the CLI
+        run: cargo test --lib --no-default-features
+
+  macos:
+    name: test (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # macOS folds case, which changes how same-named remote files are
+      # claimed; the Linux job never exercises that path.
+      - name: Tests
+        run: cargo test
+
   msrv:
     name: MSRV
     runs-on: ubuntu-latest
@@ -47,3 +66,6 @@ jobs:
 
       - name: Build with the minimum supported Rust version
         run: cargo check --locked --all-targets
+
+      - name: Library without the CLI, at the minimum version
+        run: cargo check --locked --lib --no-default-features
