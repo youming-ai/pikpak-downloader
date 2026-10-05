@@ -2,3 +2,6 @@
 .env
 .DS_Store
 *~
+# Job state (can hold a rotated token) and the default download directory
+.pikpak/
+/downloads/

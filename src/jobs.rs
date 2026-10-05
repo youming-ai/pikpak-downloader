@@ -126,10 +126,31 @@ pub(crate) struct JobStore {
 impl JobStore {
     /// Open (creating if needed) the store under `root`.
     pub(crate) fn open(root: &StdPath) -> Result<Self> {
-        std::fs::create_dir_all(root.join("jobs"))
-            .with_context(|| format!("failed to create {}", root.join("jobs").display()))?;
-        std::fs::create_dir_all(root.join("logs"))
-            .with_context(|| format!("failed to create {}", root.join("logs").display()))?;
+        // Ancestors of a `PIKPAK_STATE_DIR` get the usual permissions; they are
+        // not ours to lock down.
+        if let Some(parent) = root.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        // The state directory itself is private: a worker's log can hold a
+        // rotated refresh token it had nowhere else to put, and records carry
+        // the service's error text.
+        let mut dirs = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            dirs.mode(0o700);
+        }
+        for dir in [root.to_path_buf(), root.join("jobs"), root.join("logs")] {
+            match dirs.create(&dir) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to create {}", dir.display()))
+                }
+            }
+        }
         Ok(Self {
             root: root.to_path_buf(),
         })
@@ -368,7 +389,17 @@ fn spawn_worker(id: &str, store: &JobStore, token_from_file: bool) -> Result<std
     use std::process::Stdio;
 
     let exe = std::env::current_exe().context("cannot locate this executable to detach")?;
-    let log = std::fs::File::create(store.log_path(id))
+    // Owner-only, even inside a state directory created by an older version
+    // without private permissions: the log can hold a refresh token.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let log = options
+        .open(store.log_path(id))
         .with_context(|| format!("failed to create {}", store.log_path(id).display()))?;
     let log_err = log
         .try_clone()
@@ -779,6 +810,36 @@ mod tests {
         // Asking to cancel an unknown job is a not-found, not a silent success.
         assert!(store.request_cancel("nope").is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_state_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_state("private");
+        JobStore::open(&root).unwrap();
+
+        for dir in [&root, &root.join("jobs"), &root.join("logs")] {
+            let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", dir.display());
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ancestors_of_the_state_directory_keep_their_usual_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = temp_state("ancestors");
+        let mode = |dir: &StdPath| std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+
+        JobStore::open(&base.join("a").join("state")).unwrap();
+        // What a plain mkdir gives under this umask, for comparison.
+        std::fs::create_dir_all(base.join("plain")).unwrap();
+
+        assert_eq!(mode(&base.join("a")), mode(&base.join("plain")));
+        assert_eq!(mode(&base.join("a").join("state")), 0o700);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -286,14 +286,17 @@ impl TokenManager {
             Err(failure) => return Err(failure.error),
         };
 
-        let RefreshResponse {
-            access_token,
-            refresh_token,
-            expires_in,
-            sub,
-        } = response;
-        let effective_ttl = expires_in.saturating_sub(60).max(5);
-        let refresh_at = Instant::now() + Duration::from_secs(effective_ttl);
+        // Take the rotated refresh token before reading anything else: the server
+        // has already invalidated the one we sent, so a response we cannot make
+        // full sense of must not take the only valid token down with it.
+        let refresh_token = match response.get("refresh_token") {
+            Some(serde_json::Value::String(token)) if !token.is_empty() => token.clone(),
+            _ => {
+                return Err(Error::Auth(
+                    "the token response carried no refresh_token".to_string(),
+                ))
+            }
+        };
 
         // Store the rotated refresh token before publishing the access token, so
         // an invalidate() racing with this can never resurrect the previous
@@ -306,6 +309,14 @@ impl TokenManager {
         if let Some(hook) = self.inner.rotation_hook.get() {
             (hook.0)(&refresh_token);
         }
+
+        let AccessGrant {
+            access_token,
+            expires_in,
+            sub,
+        } = serde_json::from_value(response)?;
+        let effective_ttl = expires_in.saturating_sub(60).max(5);
+        let refresh_at = Instant::now() + Duration::from_secs(effective_ttl);
 
         **guard = Some(CachedToken {
             access_token: access_token.clone(),
@@ -322,7 +333,7 @@ impl TokenManager {
     async fn exchange(
         &self,
         refresh_token: &str,
-    ) -> std::result::Result<RefreshResponse, ExchangeFailure> {
+    ) -> std::result::Result<serde_json::Value, ExchangeFailure> {
         let req = self
             .inner
             .http
@@ -402,6 +413,15 @@ pub(crate) fn is_grant_rejection(body: &str) -> bool {
 /// the user can act on.
 pub(crate) fn explain_auth_failure(status: u16, body: &str) -> Error {
     if !is_grant_rejection(body) {
+        // An overloaded or failing auth service says nothing about the token:
+        // report it as the service's failure, so the caller retries later
+        // instead of replacing a token that may be perfectly good.
+        if status == 429 || status >= 500 {
+            return Error::Api {
+                status,
+                message: body.to_string(),
+            };
+        }
         return Error::Auth(format!("status {status}: {body}"));
     }
     Error::Auth(format!(
@@ -416,10 +436,10 @@ pub(crate) fn explain_auth_failure(status: u16, body: &str) -> Error {
     ))
 }
 
+/// The rest of a token response, read once its refresh token is safe.
 #[derive(Debug, Deserialize)]
-struct RefreshResponse {
+struct AccessGrant {
     access_token: String,
-    refresh_token: String,
     expires_in: u64,
     sub: String,
 }
@@ -769,7 +789,29 @@ mod tests {
             .expect_err("the failed exchange must fail");
         let text = format!("{err:#}");
 
-        assert!(text.contains("status 503"), "{text}");
+        assert!(text.contains("503"), "{text}");
         assert!(!text.contains("single-use"), "{text}");
+        // The service's failure, not the token's: retry later, keep the token.
+        assert!(matches!(err, Error::Api { status: 503, .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_rotated_token_survives_a_response_that_cannot_be_read_in_full() {
+        // The server rotated (and so invalidated) the token we sent, then
+        // answered with a field we cannot parse. The replacement must still reach
+        // the store and the hook, or the account is locked out.
+        let (addr, _) = scripted_auth_server(vec![(
+            200,
+            r#"{"access_token":"access-2","refresh_token":"rotated-2","expires_in":"7200"}"#,
+        )])
+        .await;
+        let tokens = manager_for(addr, "old-token");
+        let persisted = Arc::new(std::sync::Mutex::new(None));
+        let sink = persisted.clone();
+        tokens.set_rotation_hook(move |token| *sink.lock().unwrap() = Some(token.to_string()));
+
+        assert!(tokens.access_token().await.is_err());
+        assert_eq!(tokens.current_refresh_token().await, "rotated-2");
+        assert_eq!(persisted.lock().unwrap().as_deref(), Some("rotated-2"));
     }
 }

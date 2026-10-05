@@ -66,6 +66,9 @@ fn update_env_token(env_path: &StdPath, new_token: &str) -> std::io::Result<bool
     if !env_path.exists() {
         return Ok(false);
     }
+    // Write through a symlinked `.env` to the file it names; renaming over the
+    // link would replace the link and leave its target holding the dead token.
+    let env_path = &std::fs::canonicalize(env_path)?;
     let content = std::fs::read_to_string(env_path)?;
     let mut found = false;
     let mut out = String::with_capacity(content.len() + new_token.len());
@@ -110,7 +113,12 @@ fn token_key_offset(line: &str) -> Option<usize> {
         }
         None => rest,
     };
-    rest.starts_with("PIKPAK_REFRESH_TOKEN=").then_some(offset)
+    // dotenvy accepts blanks between the key and `=`; a line it loads the token
+    // from must be one the rotation can rewrite, or the new token is lost.
+    rest.strip_prefix("PIKPAK_REFRESH_TOKEN")?
+        .trim_start_matches([' ', '\t'])
+        .starts_with('=')
+        .then_some(offset)
 }
 
 /// Quote a value for a `.env` file when it contains characters dotenv would
@@ -245,6 +253,12 @@ mod tests {
         );
         assert_eq!(super::token_key_offset("PIKPAK_PROXY=http://x"), None);
         assert_eq!(super::token_key_offset("export PIKPAK_PROXY=x"), None);
+        // dotenvy loads the token from a line with blanks around `=`, so the
+        // rotation must be able to rewrite it.
+        assert_eq!(super::token_key_offset("PIKPAK_REFRESH_TOKEN = x"), Some(0));
+        assert_eq!(super::token_key_offset("PIKPAK_REFRESH_TOKEN\t=x"), Some(0));
+        // A longer key that merely starts with ours is a different variable.
+        assert_eq!(super::token_key_offset("PIKPAK_REFRESH_TOKEN_OLD=x"), None);
     }
 
     #[test]
@@ -306,6 +320,31 @@ mod tests {
             assert_eq!(loaded, token, "dotenvy must read the exact token back");
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_env_writes_through_a_symlinked_env() {
+        let dir = std::env::temp_dir().join(format!("pikpak-envlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("real.env");
+        let link = dir.join(".env");
+        std::fs::write(&target, "PIKPAK_REFRESH_TOKEN=old\n").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(update_env_token(&link, "new-token").unwrap());
+
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().is_symlink(),
+            "the link must stay a link"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "PIKPAK_REFRESH_TOKEN=new-token\n",
+            "the file the link names holds the new token"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
