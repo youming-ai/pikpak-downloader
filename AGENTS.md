@@ -12,6 +12,9 @@ CI job — may rely on. Anything not stated here is an implementation detail.
    result on success, the failure on error. One line, one document. A run that
    fails emits only the failure; for a download that lost files the counts are
    in `error.message`, because two documents on one stream is not a contract.
+   The only exceptions come from argument parsing, before any command runs:
+   `--help` and `--version` print plain text and exit 0, and a usage error
+   prints clap's message on stderr, nothing on stdout, and exits 2.
 
 The tool never prompts and never reads stdin, so it is safe to run unattended.
 
@@ -118,11 +121,12 @@ Each reports `command` as `jobs.list`, `jobs.status`, `jobs.cancel` or
   running. The worker refreshes `updated_at` every 5s while it is alive.
 - **`jobs wait` exits with the outcome**: `0` succeeded, or the same code a
   synchronous run would have produced (`3` auth, `5` network, …), `9` if it was
-  cancelled, `8` if your deadline passed first. The record carries the worker's
+  cancelled, `1` if its worker was lost, `8` if your deadline passed first. The record carries the worker's
   own `exit_code` for exactly this.
-- **`jobs cancel` is cooperative**: it drops a marker and the worker stops at its
-  next check (within a few seconds; a chunk in flight finishes). The `.part` file
-  is left in place, so re-running the same download resumes. Cancelling a job
+- **`jobs cancel` is cooperative**: it drops a marker and the worker exits at its
+  next check (within a few seconds), mid-transfer if need be. The `.part` file
+  is left in place, so re-running the same download resumes from the bytes
+  already written. Cancelling a job
   that already finished changes nothing and reports `"cancelled":false` with its
   final state.
 - **`jobs list`/`status`/`cancel` need no credentials** — they only read the

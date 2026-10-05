@@ -15,8 +15,6 @@
 //! ```
 
 use std::path::{Path as StdPath, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -417,7 +415,7 @@ pub(crate) enum JobsCommand {
         /// Job id, as printed by `download --detach`.
         id: String,
     },
-    /// Ask a running job to stop at its next chunk boundary.
+    /// Ask a running job to stop; its worker exits within a few seconds.
     Cancel {
         /// Job id.
         id: String,
@@ -480,7 +478,7 @@ pub(crate) async fn cmd_jobs(command: JobsCommand, ui: Output) -> Result<()> {
             let (job, cancelled) = store.request_cancel(&id)?;
             if cancelled {
                 ui.note(format!(
-                    "cancel requested for {}; the worker stops at its next chunk boundary",
+                    "cancel requested for {}; the worker stops within a few seconds",
                     job.id
                 ));
             } else {
@@ -578,7 +576,6 @@ pub(crate) async fn run_worker_download(
     state_root: Option<PathBuf>,
 ) -> Result<()> {
     let store = JobStore::open(state_root.as_deref().unwrap_or(&state_dir()))?;
-    let stop = Arc::new(AtomicBool::new(false));
 
     // The watcher is the worker's only tie to the outside world: it beats so
     // `jobs list` can tell a live worker from a dead one, and it honours a
@@ -588,14 +585,12 @@ pub(crate) async fn run_worker_download(
     let watcher = {
         let store_id = id.clone();
         let store_root = store.root().to_path_buf();
-        let stop = stop.clone();
         tokio::spawn(async move {
             let Ok(store) = JobStore::open(&store_root) else {
                 return;
             };
             loop {
                 if store.cancel_requested(&store_id) {
-                    stop.store(true, Ordering::Relaxed);
                     if let Ok(mut record) = store.read(&store_id) {
                         record.state = JobState::Cancelled;
                         record.error = Some("cancelled on request".to_string());

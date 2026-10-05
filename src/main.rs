@@ -135,6 +135,16 @@ async fn main() -> ExitCode {
     let output = output::Output::new(cli.json, cli.no_progress);
     let command = cli.command.name();
 
+    // A panic is a bug, but still a failure the caller must be able to parse:
+    // one failure document and the documented exit 1, not Rust's bare 101. The
+    // process ends here, so no second document can follow from `main`.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        output.fail(command, &anyhow::anyhow!("internal error: {info}"));
+        std::process::exit(output::EXIT_UNEXPECTED.into());
+    }));
+
     let filter = if cli.verbose {
         EnvFilter::new("pikpak=debug")
     } else {

@@ -105,7 +105,7 @@ id=$(pikpak download --detach --path "/My Pack/Movies" --output /data)
 pikpak jobs list                 # id, state, progress, path
 pikpak jobs status "$id"
 pikpak jobs wait "$id"           # blocks; exits with the job's own outcome
-pikpak jobs cancel "$id"         # stops at the worker's next chunk boundary
+pikpak jobs cancel "$id"         # the worker stops within a few seconds
 ```
 
 State lives under `PIKPAK_STATE_DIR` (default `.pikpak`): `jobs/<id>.json`,
