@@ -77,6 +77,22 @@ usage: 42.3%
 | `--human` | human-readable sizes (`ls`; long flag only — `-h` is `--help`) |
 | `--raw` | byte counts instead of sizes (`quota`) |
 | `--verbose` | debug logs, before or after the subcommand |
+| `--json` | one JSON document on stdout: the result, or the failure |
+| `--no-progress` | never draw byte-level progress |
+
+### Machine-readable output
+
+`--json` writes exactly one JSON document to stdout — the result, or the failure —
+and keeps every narration line (progress, retries, `Saved:`) on stderr, so a
+script or an agent can parse stdout without scraping prose. Exit codes separate
+the cases worth branching on: `3` auth, `4` not found, `5` network, `6` refused,
+`7` local I/O. The full contract — document shapes, codes, recipes — is in
+[AGENTS.md](AGENTS.md).
+
+```console
+$ pikpak --json quota
+{"ok":true,"command":"quota","result":{"total":10995116277760,"used":4650000000000,"free":6345116277760,"usage_percent":42.3}}
+```
 
 ## Library
 

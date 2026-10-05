@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
 
+use crate::output::Output;
 use crate::DownloadArgs;
 use pikpak::{
     exponential_backoff, is_drive_root, is_retryable_status, jittered_backoff, Client, FileKind,
@@ -211,7 +212,26 @@ fn push_file(
     Ok(())
 }
 
-pub(crate) async fn cmd_download(client: &Client, args: DownloadArgs) -> Result<()> {
+/// What a download run did, as reported in `--json` output.
+#[derive(Debug, Serialize)]
+pub(crate) struct DownloadSummary {
+    /// Output directory, as given on the command line.
+    pub output: String,
+    /// Files the run planned to transfer.
+    pub files: usize,
+    /// Files that finished, including ones resumed from an earlier run.
+    pub downloaded: usize,
+    /// Files that failed.
+    pub failed: usize,
+    /// Bytes across the files that finished.
+    pub bytes: u64,
+}
+
+pub(crate) async fn cmd_download(
+    client: &Client,
+    args: DownloadArgs,
+    ui: Output,
+) -> Result<DownloadSummary> {
     let output = StdPath::new(&args.output);
     tokio::fs::create_dir_all(output)
         .await
@@ -250,15 +270,24 @@ pub(crate) async fn cmd_download(client: &Client, args: DownloadArgs) -> Result<
         }
     }
 
+    let empty = DownloadSummary {
+        output: args.output.clone(),
+        files: 0,
+        downloaded: 0,
+        failed: 0,
+        bytes: 0,
+    };
     if tasks.is_empty() {
-        println!("(nothing to download)");
-        return Ok(());
+        ui.note("(nothing to download)");
+        ui.ok("download", &empty)?;
+        return Ok(empty);
     }
 
     let jobs = args.jobs.max(1);
     // Live byte-level progress only reads cleanly with a single active
     // transfer; with concurrency we fall back to per-file start/finish lines.
-    let show_progress = jobs == 1;
+    let show_progress = ui.progress(jobs);
+    let planned = tasks.len();
 
     let sem = Arc::new(Semaphore::new(jobs));
     let mut set = tokio::task::JoinSet::new();
@@ -272,11 +301,18 @@ pub(crate) async fn cmd_download(client: &Client, args: DownloadArgs) -> Result<
     }
 
     let mut first_err: Option<anyhow::Error> = None;
+    let mut downloaded = 0usize;
+    let mut failed = 0usize;
+    let mut bytes = 0u64;
     while let Some(joined) = set.join_next().await {
         match joined.context("download task panicked")? {
-            Ok(()) => {}
+            Ok(size) => {
+                downloaded += 1;
+                bytes += size;
+            }
             Err(e) => {
-                eprintln!("error: {e:#}");
+                failed += 1;
+                ui.note(format!("error: {e:#}"));
                 if first_err.is_none() {
                     first_err = Some(e);
                 }
@@ -284,9 +320,19 @@ pub(crate) async fn cmd_download(client: &Client, args: DownloadArgs) -> Result<
         }
     }
 
+    let summary = DownloadSummary {
+        output: args.output.clone(),
+        files: planned,
+        downloaded,
+        failed,
+        bytes,
+    };
+    // A partial result is still a result: report what landed before failing, so
+    // a caller can tell a clean run from one that lost files.
+    ui.ok("download", &summary)?;
     match first_err {
         Some(e) => Err(e),
-        None => Ok(()),
+        None => Ok(summary),
     }
 }
 
@@ -493,7 +539,7 @@ async fn download_file(
     output_dir: &StdPath,
     dest_name: &str,
     show_progress: bool,
-) -> Result<()> {
+) -> Result<u64> {
     let dl: pikpak::DownloadInfo = client
         .get_download_url(&file.id)
         .await
@@ -513,7 +559,7 @@ async fn download_file(
     // Never resume bytes that might belong to a different version of the file.
     prepare_part(&part_path, &PartIdentity::of(file, expected_size)).await?;
 
-    println!(
+    eprintln!(
         "Downloading: {} ({})",
         safe_dest_name,
         format_size(expected_size, BINARY)
@@ -580,8 +626,14 @@ async fn download_file(
         .await
         .context("failed to finalize output file")?;
     let _ = tokio::fs::remove_file(identity_path(&part_path)).await;
-    println!("Saved: {}", file_path.display());
-    Ok(())
+    eprintln!("Saved: {}", file_path.display());
+
+    // Report what actually landed rather than what was advertised: a resumed or
+    // already-complete file can differ from the size the API claimed.
+    Ok(tokio::fs::metadata(&file_path)
+        .await
+        .map(|meta| meta.len())
+        .unwrap_or(expected_size))
 }
 
 /// A single download attempt. Resumes from an existing `.part` file via an HTTP
@@ -793,7 +845,7 @@ async fn collect_folder(
             .await
             .context("failed to create folder")?;
 
-        println!("Scanning folder: {}", current.name);
+        eprintln!("Scanning folder: {}", current.name);
 
         for entry in client.list_folder(&current.id).await? {
             match classify_entry(entry) {
@@ -1215,6 +1267,24 @@ mod tests {
         // 416-style and malformed values yield no usable offset.
         assert_eq!(parse_range_start(&hv("bytes */100")), None);
         assert_eq!(parse_range_start(&hv("nonsense")), None);
+    }
+
+    #[test]
+    fn the_download_summary_keeps_its_json_field_names() {
+        let summary = super::DownloadSummary {
+            output: "./downloads".to_string(),
+            files: 3,
+            downloaded: 2,
+            failed: 1,
+            bytes: 4096,
+        };
+        let json = serde_json::to_value(&summary).unwrap();
+
+        assert_eq!(json["output"], "./downloads");
+        assert_eq!(json["files"], 3);
+        assert_eq!(json["downloaded"], 2);
+        assert_eq!(json["failed"], 1);
+        assert_eq!(json["bytes"], 4096);
     }
 
     #[test]
@@ -1764,6 +1834,7 @@ mod tests {
                 output: dir.to_string_lossy().into_owned(),
                 jobs: 1,
             },
+            crate::output::Output::new(false, false),
         )
         .await
         .expect("downloading the drive root must work");
@@ -1793,6 +1864,7 @@ mod tests {
                 output: dir.to_string_lossy().into_owned(),
                 jobs: 1,
             },
+            crate::output::Output::new(false, false),
         )
         .await
         .expect("downloading a folder must walk it");
@@ -1849,6 +1921,7 @@ mod tests {
                 output: dir.to_string_lossy().into_owned(),
                 jobs: 1,
             },
+            crate::output::Output::new(false, false),
         )
         .await
         .expect_err("a missing path must fail");
@@ -2126,6 +2199,7 @@ mod tests {
                     output: out.to_string_lossy().into_owned(),
                     jobs,
                 },
+                crate::output::Output::new(false, false),
             )
             .await
             .unwrap_or_else(|e| panic!("-j {jobs}: both files must download: {e:#}"));
