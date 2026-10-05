@@ -31,16 +31,35 @@ struct FolderToWalk {
     dir: PathBuf,
 }
 
+/// Maximum byte length for a single filesystem path component across common OSes.
+const MAX_COMPONENT_LEN: usize = 255;
+
+/// Truncate `s` to at most `max_bytes`, ending on a valid UTF-8 character boundary.
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    &s[..boundary]
+}
+
 /// Local names already handed out, per directory.
 ///
 /// PikPak identifies entries by id, so one folder may hold several entries with
 /// the same name — and names that differ only in case, or only in characters
 /// Windows replaces, collide on the local filesystem too. Every entry claims its
 /// local name here before anything is written; a taken name gets a ` (2)`,
-/// ` (3)`, … suffix. Claims follow listing order, so a rerun assigns the same
-/// names and partial files still resume.
+/// ` (3)`, … suffix.
+///
+/// To preserve resumability when listings change order or items are removed,
+/// existing `.part.meta` sidecars in the destination directory are read so that
+/// partially-downloaded files retain their previously claimed names.
 struct NameClaims {
     taken: HashMap<PathBuf, HashSet<String>>,
+    persisted: HashMap<PathBuf, HashMap<String, String>>,
     case_insensitive: bool,
 }
 
@@ -54,14 +73,57 @@ impl NameClaims {
     fn with_case_folding(case_insensitive: bool) -> Self {
         Self {
             taken: HashMap::new(),
+            persisted: HashMap::new(),
             case_insensitive,
         }
+    }
+
+    fn ensure_dir_scanned(&mut self, dir: &StdPath) {
+        if self.persisted.contains_key(dir) {
+            return;
+        }
+        let mut id_map = HashMap::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if let Some(dest_name) = name.strip_suffix(".part.meta") {
+                    if let Ok(bytes) = std::fs::read(entry.path()) {
+                        if let Ok(meta) = serde_json::from_slice::<PartIdentity>(&bytes) {
+                            id_map.insert(meta.id, dest_name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        self.persisted.insert(dir.to_path_buf(), id_map);
+    }
+
+    /// Claim a name for a file, retaining its previously bound name if an existing
+    /// `.part.meta` file in `dir` matches `file_id`.
+    fn claim_file(&mut self, dir: &StdPath, file_id: &str, raw: &str) -> Result<String> {
+        self.ensure_dir_scanned(dir);
+        let key_fn = |name: &str| {
+            if self.case_insensitive {
+                name.to_lowercase()
+            } else {
+                name.to_string()
+            }
+        };
+        if let Some(bound_name) = self.persisted.get(dir).and_then(|m| m.get(file_id)) {
+            let taken = self.taken.entry(dir.to_path_buf()).or_default();
+            if taken.insert(key_fn(bound_name)) {
+                return Ok(bound_name.clone());
+            }
+        }
+        self.claim(dir, raw, true)
     }
 
     /// Claim a safe, unused name for the remote `raw` name inside `dir`.
     ///
     /// Files keep their extension after the suffix (`movie (2).mp4`); folders
-    /// are suffixed as a whole.
+    /// are suffixed as a whole. Generated names are guaranteed to fit within
+    /// [`MAX_COMPONENT_LEN`] bytes, truncating the stem without splitting UTF-8
+    /// characters.
     fn claim(&mut self, dir: &StdPath, raw: &str, is_file: bool) -> Result<String> {
         let base = safe_component(raw)?;
         let taken = self.taken.entry(dir.to_path_buf()).or_default();
@@ -72,17 +134,31 @@ impl NameClaims {
                 name.to_string()
             }
         };
-        if taken.insert(key(&base)) {
-            return Ok(base);
-        }
+
+        // Split stem and extension so suffixes insert before the extension.
         // A leading dot marks a hidden name, not an extension.
-        let (stem, ext) = match base.rfind('.') {
+        let (raw_stem, raw_ext) = match base.rfind('.') {
             Some(dot) if is_file && dot > 0 => base.split_at(dot),
             _ => (base.as_str(), ""),
         };
+
+        let ext = truncate_utf8(raw_ext, MAX_COMPONENT_LEN.saturating_sub(1));
+        let max_stem = MAX_COMPONENT_LEN.saturating_sub(ext.len());
+        let stem = truncate_utf8(raw_stem, max_stem);
+
+        let initial = format!("{stem}{ext}");
+        if taken.insert(key(&initial)) {
+            return Ok(initial);
+        }
+
         let mut n = 2u32;
         loop {
-            let candidate = format!("{stem} ({n}){ext}");
+            let suffix = format!(" ({n})");
+            let max_stem = MAX_COMPONENT_LEN
+                .saturating_sub(ext.len())
+                .saturating_sub(suffix.len());
+            let fit_stem = truncate_utf8(stem, max_stem);
+            let candidate = format!("{fit_stem}{suffix}{ext}");
             if taken.insert(key(&candidate)) {
                 return Ok(candidate);
             }
@@ -126,7 +202,7 @@ fn push_file(
     } else {
         file.name.clone()
     };
-    let name = claims.claim(dir, &raw, true)?;
+    let name = claims.claim_file(dir, &file.id, &raw)?;
     tasks.push(DownloadTask {
         file,
         dir: dir.to_path_buf(),
@@ -860,6 +936,66 @@ mod tests {
         assert_eq!(claims.claim(dir, "file.txt", true).unwrap(), "file.txt");
         // "FILE.txt" collides under case folding, gets disambiguated.
         assert_eq!(claims.claim(dir, "FILE.txt", true).unwrap(), "FILE (2).txt");
+    }
+
+    #[test]
+    fn name_claims_truncates_long_names_and_preserves_limits() {
+        let dir = std::path::Path::new("/tmp/test");
+        let mut claims = super::NameClaims::with_case_folding(false);
+
+        // A 251-byte stem + ".txt" (4 bytes) = 255 bytes (MAX_COMPONENT_LEN).
+        let long_stem = "a".repeat(251);
+        let name = format!("{long_stem}.txt");
+        let first = claims.claim(dir, &name, true).unwrap();
+        assert_eq!(first.len(), 255);
+        assert_eq!(first, name);
+
+        // Second colliding file must truncate the stem to keep the total length <= 255 bytes.
+        let second = claims.claim(dir, &name, true).unwrap();
+        assert!(second.len() <= 255);
+        assert!(second.ends_with(" (2).txt"));
+
+        // Multi-byte UTF-8 (each character 3 bytes) near 255 bytes must truncate safely
+        // without splitting a UTF-8 character boundary.
+        let cjk_stem = "测".repeat(84); // 84 * 3 = 252 bytes
+        let cjk_name = format!("{cjk_stem}.bin"); // 252 + 4 = 256 bytes (> 255)
+        let cjk_first = claims.claim(dir, &cjk_name, true).unwrap();
+        assert!(cjk_first.len() <= 255);
+        assert!(cjk_first.ends_with(".bin"));
+
+        let cjk_second = claims.claim(dir, &cjk_name, true).unwrap();
+        assert!(cjk_second.len() <= 255);
+        assert!(cjk_second.ends_with(" (2).bin"));
+    }
+
+    #[test]
+    fn name_claims_rebinds_from_persisted_meta_sidecars() {
+        let dir = std::env::temp_dir().join(format!("pikpak-claims-rebind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Simulate an interrupted download where file "d2" was previously assigned "dup (2).bin"
+        let meta = super::PartIdentity {
+            id: "d2".to_string(),
+            size: 1024,
+            modified_time: None,
+        };
+        std::fs::write(
+            dir.join("dup (2).bin.part.meta"),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .unwrap();
+
+        let mut claims = super::NameClaims::with_case_folding(false);
+        // Even if file "d2" is claimed first in the next run, it recovers its previously assigned name.
+        let claimed = claims.claim_file(&dir, "d2", "dup.bin").unwrap();
+        assert_eq!(claimed, "dup (2).bin");
+
+        // Another file with the same remote name will not collide with the recovered name.
+        let claimed_other = claims.claim_file(&dir, "d1", "dup.bin").unwrap();
+        assert_eq!(claimed_other, "dup.bin");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     async fn spawn_range_server(full: Vec<u8>) -> std::net::SocketAddr {
