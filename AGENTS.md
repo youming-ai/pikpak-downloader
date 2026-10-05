@@ -110,6 +110,9 @@ pikpak --json jobs cancel <id>                   # {"cancelled":true,"job":{…}
 pikpak --json jobs wait <id> --timeout-seconds 600
 ```
 
+Each reports `command` as `jobs.list`, `jobs.status`, `jobs.cancel` or
+`jobs.wait` — the same name on success and on failure.
+
 - **States**: `running`, `succeeded`, `failed`, `cancelled`, `lost`. A `running`
   job whose worker has not beat for ~30s is reported `lost` — never forever
   running. The worker refreshes `updated_at` every 5s while it is alive.
@@ -119,7 +122,9 @@ pikpak --json jobs wait <id> --timeout-seconds 600
   own `exit_code` for exactly this.
 - **`jobs cancel` is cooperative**: it drops a marker and the worker stops at its
   next check (within a few seconds; a chunk in flight finishes). The `.part` file
-  is left in place, so re-running the same download resumes.
+  is left in place, so re-running the same download resumes. Cancelling a job
+  that already finished changes nothing and reports `"cancelled":false` with its
+  final state.
 - **`jobs list`/`status`/`cancel` need no credentials** — they only read the
   state directory. That is deliberate: asking what is running must not fail
   because the token has since rotated away.

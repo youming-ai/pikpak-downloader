@@ -65,7 +65,7 @@ fn listing_jobs_needs_no_credentials() {
 
     let doc = document(&stdout);
     assert_eq!(doc["ok"], true);
-    assert_eq!(doc["command"], "jobs");
+    assert_eq!(doc["command"], "jobs.list");
     assert_eq!(doc["result"]["jobs"][0]["id"], "1-000001");
     assert_eq!(doc["result"]["jobs"][0]["state"], "succeeded");
     let _ = std::fs::remove_dir_all(&state);
@@ -111,6 +111,8 @@ fn an_unknown_job_is_a_not_found_with_the_matching_exit_code() {
 
     let doc = document(&stdout);
     assert_eq!(doc["ok"], false);
+    // The same name a successful `jobs status` reports.
+    assert_eq!(doc["command"], "jobs.status");
     assert_eq!(doc["error"]["kind"], "not_found");
     assert_eq!(doc["error"]["exit_code"], 4);
     let _ = std::fs::remove_dir_all(&state);
@@ -130,6 +132,21 @@ fn cancelling_writes_the_marker_the_worker_watches() {
         state.join("jobs").join("1-000001.cancel").exists(),
         "the worker looks for this file"
     );
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[test]
+fn cancelling_a_finished_job_reports_that_nothing_was_cancelled() {
+    let state = state_dir("cancel-done");
+    write_record(&state, "1-000001", "succeeded", now());
+
+    let (code, stdout, _) = run(&state, &["--json", "jobs", "cancel", "1-000001"]);
+    assert_eq!(code, 0);
+
+    let doc = document(&stdout);
+    assert_eq!(doc["result"]["cancelled"], false);
+    assert_eq!(doc["result"]["job"]["state"], "succeeded");
+    assert!(!state.join("jobs").join("1-000001.cancel").exists());
     let _ = std::fs::remove_dir_all(&state);
 }
 

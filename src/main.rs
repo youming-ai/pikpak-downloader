@@ -61,7 +61,7 @@ impl Command {
             Command::Ls(_) => "ls",
             Command::Download(_) => "download",
             Command::Quota(_) => "quota",
-            Command::Jobs(_) => "jobs",
+            Command::Jobs(args) => args.command.name(),
         }
     }
 }
@@ -178,7 +178,7 @@ async fn run(cli: Cli, env_path: Option<PathBuf>, output: output::Output) -> Res
             // Fail here rather than start a job that cannot authenticate.
             (None, true) => {
                 validate_refresh_token(std::env::var("PIKPAK_REFRESH_TOKEN").ok())?;
-                jobs::start_detached(&args, output).map(|_| ())
+                jobs::start_detached(&args, output, env_path.is_some()).map(|_| ())
             }
             (None, false) => download::cmd_download(&client()?, args, output)
                 .await
