@@ -110,8 +110,9 @@ pikpak jobs wait "$id"           # blocks; exits with the job's own outcome
 pikpak jobs cancel "$id"         # the worker stops within a few seconds
 ```
 
-State lives under `PIKPAK_STATE_DIR` (default `.pikpak`): `jobs/<id>.json`,
-`jobs/<id>.cancel`, and the worker's output in `logs/<id>.log`.
+State lives under `PIKPAK_STATE_DIR` (default `.pikpak` beside your `.env`):
+`jobs/<id>.json`, `jobs/<id>.cancel`, and the worker's output in
+`logs/<id>.log`.
 
 ## Library
 

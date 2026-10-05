@@ -131,6 +131,8 @@ async fn main() -> ExitCode {
         env_file::env_file_for_persistence(loaded_env.as_deref(), StdPath::new(".env"))
     };
 
+    let state = jobs::state_dir(loaded_env.as_deref());
+
     let cli = Cli::parse();
     let output = output::Output::new(cli.json, cli.no_progress);
     let command = cli.command.name();
@@ -157,7 +159,7 @@ async fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
 
-    match run(cli, env_path, output).await {
+    match run(cli, env_path, &state, output).await {
         Ok(()) => ExitCode::from(output::EXIT_OK),
         Err(e) => {
             // The human line always goes to stderr; the JSON document is what a
@@ -169,7 +171,12 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(cli: Cli, env_path: Option<PathBuf>, output: output::Output) -> Result<()> {
+async fn run(
+    cli: Cli,
+    env_path: Option<PathBuf>,
+    state: &StdPath,
+    output: output::Output,
+) -> Result<()> {
     // Set by the rotation hook when a rotation happened that could not be
     // written anywhere, so the run can end with a nudge about it.
     let rotated_unpersisted = Arc::new(AtomicBool::new(false));
@@ -186,21 +193,22 @@ async fn run(cli: Cli, env_path: Option<PathBuf>, output: output::Output) -> Res
                 args,
                 output,
                 id.clone(),
-                cli.internal_state.clone(),
+                // The worker's parent always passes its own state directory.
+                cli.internal_state.as_deref().unwrap_or(state),
             )
             .await
             .map(|_| ()),
             // Fail here rather than start a job that cannot authenticate.
             (None, true) => {
                 validate_refresh_token(std::env::var("PIKPAK_REFRESH_TOKEN").ok())?;
-                jobs::start_detached(&args, output, env_path.is_some()).map(|_| ())
+                jobs::start_detached(&args, output, env_path.is_some(), state).map(|_| ())
             }
             (None, false) => download::cmd_download(&client()?, args, output)
                 .await
                 .map(|_| ()),
         },
         Command::Quota(args) => cmd_quota(&client()?, args, output).await,
-        Command::Jobs(args) => jobs::cmd_jobs(args.command, output).await,
+        Command::Jobs(args) => jobs::cmd_jobs(args.command, output, state).await,
     };
     if let Some(note) = rotation_reminder(rotated_unpersisted.load(Ordering::SeqCst)) {
         eprintln!("{note}");

@@ -6,7 +6,7 @@
 //! cancel or wait on the job.
 //!
 //! Everything lives under the state directory (`PIKPAK_STATE_DIR`, else
-//! `.pikpak` in the working directory):
+//! `.pikpak` beside the `.env` that was loaded, else in the working directory):
 //!
 //! ```text
 //! .pikpak/jobs/<id>.json     the record
@@ -40,13 +40,19 @@ pub(crate) fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Where jobs are stored: `PIKPAK_STATE_DIR`, else `.pikpak` in the working
-/// directory. Relative on purpose — a job belongs to the directory it was
-/// started from, alongside the `.env` and the output it writes.
-pub(crate) fn state_dir() -> PathBuf {
-    std::env::var_os("PIKPAK_STATE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(".pikpak"))
+/// Where jobs are stored: `PIKPAK_STATE_DIR`, else `.pikpak` beside `env_file`
+/// (the `.env` that was loaded), else `.pikpak` in the working directory.
+///
+/// Anchored to the `.env` because dotenvy finds that file from any directory
+/// below it: a job started from a subdirectory must be found again from its
+/// parent, and the other way round.
+pub(crate) fn state_dir(env_file: Option<&StdPath>) -> PathBuf {
+    if let Some(dir) = std::env::var_os("PIKPAK_STATE_DIR") {
+        return PathBuf::from(dir);
+    }
+    env_file
+        .and_then(StdPath::parent)
+        .map_or_else(|| PathBuf::from(".pikpak"), |dir| dir.join(".pikpak"))
 }
 
 /// Where a job is in its life.
@@ -314,8 +320,13 @@ pub(crate) fn new_id() -> String {
 /// `token_from_file` says the token came from a `.env` this process could write
 /// back to; the worker is then made to load it from that file too, so it writes
 /// its rotations back there instead of only printing them.
-pub(crate) fn start_detached(args: &DownloadArgs, ui: Output, token_from_file: bool) -> Result<()> {
-    let store = JobStore::open(&state_dir())?;
+pub(crate) fn start_detached(
+    args: &DownloadArgs,
+    ui: Output,
+    token_from_file: bool,
+    state: &StdPath,
+) -> Result<()> {
+    let store = JobStore::open(state)?;
     let id = new_id();
     let mut record = JobRecord {
         id: id.clone(),
@@ -474,8 +485,8 @@ impl JobsCommand {
 }
 
 /// `pikpak jobs …`.
-pub(crate) async fn cmd_jobs(command: JobsCommand, ui: Output) -> Result<()> {
-    let store = JobStore::open(&state_dir())?;
+pub(crate) async fn cmd_jobs(command: JobsCommand, ui: Output, state: &StdPath) -> Result<()> {
+    let store = JobStore::open(state)?;
     let name = command.name();
 
     match command {
@@ -604,9 +615,9 @@ pub(crate) async fn run_worker_download(
     args: DownloadArgs,
     ui: Output,
     id: String,
-    state_root: Option<PathBuf>,
+    state_root: &StdPath,
 ) -> Result<()> {
-    let store = JobStore::open(state_root.as_deref().unwrap_or(&state_dir()))?;
+    let store = JobStore::open(state_root)?;
 
     // The watcher is the worker's only tie to the outside world: it beats so
     // `jobs list` can tell a live worker from a dead one, and it honours a

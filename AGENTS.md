@@ -103,7 +103,9 @@ $ pikpak --json download --detach --path "/My Pack/Movies" --output /data
 ```
 
 `result.job.id` is what every later call takes. The job's records live under
-`PIKPAK_STATE_DIR` (default `.pikpak`), beside the `.env` you started from:
+`PIKPAK_STATE_DIR`, by default `.pikpak` beside the `.env` that was loaded (or
+in the working directory when there is none) — so any directory that finds the
+same `.env` finds the same jobs:
 
 | path | what |
 | --- | --- |
