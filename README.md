@@ -29,7 +29,9 @@ cp .env.example .env
 
 Read from the environment, or from the first `.env` found in the working
 directory and then its parents. `PIKPAK_REFRESH_TOKEN` is required;
-`PIKPAK_PROXY`, `PIKPAK_CLIENT_ID` and `PIKPAK_CLIENT_SECRET` are optional.
+`PIKPAK_PROXY`, `PIKPAK_CLIENT_ID`, `PIKPAK_CLIENT_SECRET` and
+`PIKPAK_DEVICE_ID` are optional — the CLI saves a device id to `.env` on its
+first run, so every later run reports the same device.
 
 PikPak refresh tokens are **single-use**: every login rotates them, and the CLI
 writes each replacement back into the file it loaded — so keep the token in
@@ -108,8 +110,9 @@ pikpak jobs wait "$id"           # blocks; exits with the job's own outcome
 pikpak jobs cancel "$id"         # the worker stops within a few seconds
 ```
 
-State lives under `PIKPAK_STATE_DIR` (default `.pikpak`): `jobs/<id>.json`,
-`jobs/<id>.cancel`, and the worker's output in `logs/<id>.log`.
+State lives under `PIKPAK_STATE_DIR` (default `.pikpak` beside your `.env`):
+`jobs/<id>.json`, `jobs/<id>.cancel`, and the worker's output in
+`logs/<id>.log`.
 
 ## Library
 

@@ -100,8 +100,9 @@ impl ClientBuilder {
         self
     }
 
-    /// Override the device id. If unset, we derive a stable id via
-    /// `md5(refresh_token)` so users don't need to pick one.
+    /// Override the device id. If unset, it is derived from the refresh token
+    /// with [`device_id_from`] — which changes whenever the token rotates, so
+    /// pass a saved id to keep one device across runs.
     pub fn device_id(mut self, id: impl Into<String>) -> Self {
         self.device_id = Some(id.into());
         self
@@ -559,8 +560,12 @@ pub struct DownloadInfo {
     pub size: Option<u64>,
 }
 
-/// Derive a stable device id from the refresh token (md5 hex of the token).
-fn device_id_from(refresh_token: &str) -> String {
+/// Derive a device id from a refresh token (md5 hex of the token).
+///
+/// Only as stable as the token: PikPak rotates it on every refresh, so a caller
+/// that wants one device across runs should save the result and pass it to
+/// [`ClientBuilder::device_id`] from then on.
+pub fn device_id_from(refresh_token: &str) -> String {
     let mut hasher = Md5::new();
     hasher.update(refresh_token.as_bytes());
     hex::encode(hasher.finalize())

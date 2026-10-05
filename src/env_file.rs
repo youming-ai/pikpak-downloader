@@ -1,4 +1,5 @@
-//! Persisting the rotated refresh token back into the `.env` file it came from.
+//! Persisting the rotated refresh token — and the device id that goes with it —
+//! back into the `.env` file it came from.
 
 use std::path::{Path as StdPath, PathBuf};
 
@@ -55,14 +56,57 @@ pub(crate) fn persist_rotated_token(env_path: Option<&StdPath>, token: &str) {
     }
 }
 
+const TOKEN_KEY: &str = "PIKPAK_REFRESH_TOKEN";
+const DEVICE_KEY: &str = "PIKPAK_DEVICE_ID";
+
 /// Rewrite the `PIKPAK_REFRESH_TOKEN=` line in `env_path`, preserving every
 /// other line. Returns `Ok(true)` if the key was found and rewritten, or
 /// `Ok(false)` if the file is absent or has no such key.
+fn update_env_token(env_path: &StdPath, new_token: &str) -> std::io::Result<bool> {
+    set_env_var(env_path, TOKEN_KEY, new_token, false)
+}
+
+/// The device id to send: `PIKPAK_DEVICE_ID` if set, else one fixed now and
+/// saved to `env_path`, so every later run sends the same one.
+///
+/// The library's default derives it from the refresh token, which rotates on
+/// every run, so each run would otherwise announce itself as a new device. The
+/// saved id is that same derivation, so the first run sends what it always
+/// did. `None` — nowhere to save it — leaves the library's default in place.
+pub(crate) fn device_id(env_path: Option<&StdPath>, refresh_token: &str) -> Option<String> {
+    if let Ok(id) = std::env::var(DEVICE_KEY) {
+        if !id.trim().is_empty() {
+            return Some(id);
+        }
+    }
+    let path = env_path?;
+    let id = pikpak::device_id_from(refresh_token);
+    // ponytail: no file lock — a token rotation written back in the same
+    // millisecond could be lost to this write, once per `.env`. Lock the file if
+    // that ever shows up.
+    let failure = match set_env_var(path, DEVICE_KEY, &id, true) {
+        Ok(true) => None,
+        // The file vanished after it was loaded.
+        Ok(false) => Some("it no longer exists".to_string()),
+        Err(e) => Some(e.to_string()),
+    };
+    if let Some(why) = failure {
+        eprintln!(
+            "warning: could not save {DEVICE_KEY} to {} ({why}); this run uses {id}",
+            path.display()
+        );
+    }
+    Some(id)
+}
+
+/// Rewrite every `key=` line in `env_path`, preserving every other line; when
+/// there is none and `append` is set, add one at the end. Returns whether the
+/// file was written.
 ///
 /// The rewrite is atomic (a sibling temporary file, then a rename), so an
 /// interrupted process cannot leave a truncated `.env` behind — that file holds
 /// the only copy of a credential the user can no longer recover.
-fn update_env_token(env_path: &StdPath, new_token: &str) -> std::io::Result<bool> {
+fn set_env_var(env_path: &StdPath, key: &str, value: &str, append: bool) -> std::io::Result<bool> {
     if !env_path.exists() {
         return Ok(false);
     }
@@ -71,35 +115,44 @@ fn update_env_token(env_path: &StdPath, new_token: &str) -> std::io::Result<bool
     let env_path = &std::fs::canonicalize(env_path)?;
     let content = std::fs::read_to_string(env_path)?;
     let mut found = false;
-    let mut out = String::with_capacity(content.len() + new_token.len());
+    let mut out = String::with_capacity(content.len() + key.len() + value.len() + 2);
     for line in content.lines() {
-        let Some(offset) = token_key_offset(line) else {
+        let Some(offset) = key_offset(line, key) else {
             out.push_str(line);
             out.push('\n');
             continue;
         };
         // Keep whatever the user wrote before the key (`export `, indentation).
         out.push_str(&line[..offset]);
-        out.push_str("PIKPAK_REFRESH_TOKEN=");
-        out.push_str(&env_quote(new_token));
+        out.push_str(key);
+        out.push('=');
+        out.push_str(&env_quote(value));
         out.push('\n');
         found = true;
     }
     if !found {
-        return Ok(false);
+        if !append {
+            return Ok(false);
+        }
+        // Rebuilt line by line above, so `out` ends in a newline: the new line
+        // can never be glued onto the last one — which may be the token.
+        out.push_str(key);
+        out.push('=');
+        out.push_str(&env_quote(value));
+        out.push('\n');
     }
     write_atomically(env_path, out.as_bytes())?;
     Ok(true)
 }
 
-/// Byte offset of the `PIKPAK_REFRESH_TOKEN=` key within `line`, if present.
+/// Byte offset of `key` within `line`, when the line assigns it.
 ///
 /// Tolerates leading indentation and an `export ` prefix, both of which must be
 /// reproduced verbatim when the line is rewritten. `export` only counts as that
 /// prefix when whitespace separates it from the key: dotenvy loads
 /// `exportPIKPAK_REFRESH_TOKEN=…` under the *distinct* key
 /// `exportPIKPAK_REFRESH_TOKEN`, so such a line must not be rewritten.
-fn token_key_offset(line: &str) -> Option<usize> {
+fn key_offset(line: &str, key: &str) -> Option<usize> {
     let rest = line.trim_start_matches([' ', '\t']);
     let mut offset = line.len() - rest.len();
     let rest = match rest
@@ -115,7 +168,7 @@ fn token_key_offset(line: &str) -> Option<usize> {
     };
     // dotenvy accepts blanks between the key and `=`; a line it loads the token
     // from must be one the rotation can rewrite, or the new token is lost.
-    rest.strip_prefix("PIKPAK_REFRESH_TOKEN")?
+    rest.strip_prefix(key)?
         .trim_start_matches([' ', '\t'])
         .starts_with('=')
         .then_some(offset)
@@ -189,6 +242,10 @@ fn write_atomically(path: &StdPath, bytes: &[u8]) -> std::io::Result<()> {
 mod tests {
     use super::update_env_token;
 
+    fn token_key_offset(line: &str) -> Option<usize> {
+        super::key_offset(line, super::TOKEN_KEY)
+    }
+
     #[test]
     fn update_env_rewrites_token_line() {
         let dir = std::env::temp_dir().join(format!("pikpak-env-{}", std::process::id()));
@@ -229,36 +286,27 @@ mod tests {
 
     #[test]
     fn token_key_offset_recognises_export_and_indentation() {
-        assert_eq!(super::token_key_offset("PIKPAK_REFRESH_TOKEN=x"), Some(0));
-        assert_eq!(super::token_key_offset("  PIKPAK_REFRESH_TOKEN=x"), Some(2));
+        assert_eq!(token_key_offset("PIKPAK_REFRESH_TOKEN=x"), Some(0));
+        assert_eq!(token_key_offset("  PIKPAK_REFRESH_TOKEN=x"), Some(2));
+        assert_eq!(token_key_offset("export PIKPAK_REFRESH_TOKEN=x"), Some(7));
         assert_eq!(
-            super::token_key_offset("export PIKPAK_REFRESH_TOKEN=x"),
-            Some(7)
-        );
-        assert_eq!(
-            super::token_key_offset("\texport  PIKPAK_REFRESH_TOKEN=x"),
+            token_key_offset("\texport  PIKPAK_REFRESH_TOKEN=x"),
             Some(9)
         );
         // A tab after `export` separates it from the key for dotenvy too.
-        assert_eq!(
-            super::token_key_offset("export\tPIKPAK_REFRESH_TOKEN=x"),
-            Some(7)
-        );
+        assert_eq!(token_key_offset("export\tPIKPAK_REFRESH_TOKEN=x"), Some(7));
         // Glued to the key, `export` is part of a *different* variable's name:
         // dotenvy loads it as `exportPIKPAK_REFRESH_TOKEN`, so it must not be
         // rewritten.
-        assert_eq!(
-            super::token_key_offset("exportPIKPAK_REFRESH_TOKEN=x"),
-            None
-        );
-        assert_eq!(super::token_key_offset("PIKPAK_PROXY=http://x"), None);
-        assert_eq!(super::token_key_offset("export PIKPAK_PROXY=x"), None);
+        assert_eq!(token_key_offset("exportPIKPAK_REFRESH_TOKEN=x"), None);
+        assert_eq!(token_key_offset("PIKPAK_PROXY=http://x"), None);
+        assert_eq!(token_key_offset("export PIKPAK_PROXY=x"), None);
         // dotenvy loads the token from a line with blanks around `=`, so the
         // rotation must be able to rewrite it.
-        assert_eq!(super::token_key_offset("PIKPAK_REFRESH_TOKEN = x"), Some(0));
-        assert_eq!(super::token_key_offset("PIKPAK_REFRESH_TOKEN\t=x"), Some(0));
+        assert_eq!(token_key_offset("PIKPAK_REFRESH_TOKEN = x"), Some(0));
+        assert_eq!(token_key_offset("PIKPAK_REFRESH_TOKEN\t=x"), Some(0));
         // A longer key that merely starts with ours is a different variable.
-        assert_eq!(super::token_key_offset("PIKPAK_REFRESH_TOKEN_OLD=x"), None);
+        assert_eq!(token_key_offset("PIKPAK_REFRESH_TOKEN_OLD=x"), None);
     }
 
     #[test]
@@ -320,6 +368,54 @@ mod tests {
             assert_eq!(loaded, token, "dotenvy must read the exact token back");
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// What dotenvy reads back from `content`, the way the next run would.
+    fn parsed(content: &str) -> Vec<(String, String)> {
+        dotenvy::from_read_iter(std::io::Cursor::new(content))
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn a_device_id_is_appended_without_touching_the_token_line() {
+        let dir = std::env::temp_dir().join(format!("pikpak-envdev-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let env_path = dir.join(".env");
+        // The case that could lock the account: the token is the last line and
+        // the file does not end in a newline.
+        std::fs::write(&env_path, "PIKPAK_PROXY=http://x\nPIKPAK_REFRESH_TOKEN=tok").unwrap();
+
+        assert!(super::set_env_var(&env_path, super::DEVICE_KEY, "dev-1", true).unwrap());
+
+        let content = std::fs::read_to_string(&env_path).unwrap();
+        assert_eq!(
+            parsed(&content),
+            vec![
+                ("PIKPAK_PROXY".to_string(), "http://x".to_string()),
+                ("PIKPAK_REFRESH_TOKEN".to_string(), "tok".to_string()),
+                ("PIKPAK_DEVICE_ID".to_string(), "dev-1".to_string()),
+            ],
+            "{content:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_blank_device_id_line_is_filled_in_place() {
+        let dir = std::env::temp_dir().join(format!("pikpak-envdev2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let env_path = dir.join(".env");
+        std::fs::write(&env_path, "PIKPAK_DEVICE_ID=\nPIKPAK_REFRESH_TOKEN=tok\n").unwrap();
+
+        assert!(super::set_env_var(&env_path, super::DEVICE_KEY, "dev-1", true).unwrap());
+
+        assert_eq!(
+            std::fs::read_to_string(&env_path).unwrap(),
+            "PIKPAK_DEVICE_ID=dev-1\nPIKPAK_REFRESH_TOKEN=tok\n",
+            "filled where it was, not appended a second time"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]

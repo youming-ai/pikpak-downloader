@@ -83,7 +83,9 @@ $ pikpak --json quota
 
 Read from the environment, or from the first `.env` in the working directory or
 its parents: `PIKPAK_REFRESH_TOKEN` (required), and optionally `PIKPAK_PROXY`,
-`PIKPAK_CLIENT_ID`, `PIKPAK_CLIENT_SECRET`.
+`PIKPAK_CLIENT_ID`, `PIKPAK_CLIENT_SECRET`, `PIKPAK_DEVICE_ID`. Without a
+device id the CLI saves one to that `.env` on its first run, so the account
+sees one device across runs instead of a new one each time.
 
 Refresh tokens are **single-use**: every login rotates them, and this tool
 authenticates as the PikPak **Android** client. The CLI writes each replacement
@@ -101,7 +103,11 @@ $ pikpak --json download --detach --path "/My Pack/Movies" --output /data
 ```
 
 `result.job.id` is what every later call takes. The job's records live under
-`PIKPAK_STATE_DIR` (default `.pikpak`), beside the `.env` you started from:
+`PIKPAK_STATE_DIR`, by default `.pikpak` beside the `.env` that was loaded (or
+in the working directory when there is none) — so any directory that finds the
+same `.env` finds the same jobs. Before this default, `.pikpak` was created in
+the working directory; jobs started from a subdirectory that way stay in that
+subdirectory's `.pikpak` and are not found from here:
 
 | path | what |
 | --- | --- |
