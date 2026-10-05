@@ -72,7 +72,10 @@ $ pikpak --json quota
   are `null` when the server did not report them. `path` is what you asked for.
   An empty listing is `entries: []`, not an error.
 - **`download`** — `{output, files, downloaded, failed, bytes}`. Reported when the
-  run finished everything it planned. If some files failed, the run emits the
+  run finished everything it planned. A non-empty file already on disk at its
+  listed size is skipped and counted in `downloaded`, so re-running a finished
+  download is cheap. Empty files are always fetched again: a listed size of 0
+  may mean the size was not reported. If some files failed, the run emits the
   *failure* document instead, with the counts in `error.message`; there is never
   a second document on stdout.
 
