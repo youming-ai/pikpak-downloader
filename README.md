@@ -25,8 +25,8 @@ Checksums are in each release's `SHA256SUMS`. Or build from source, with Rust
 1.86 or newer (`rust-version` in `Cargo.toml`, pinned by the CI MSRV job):
 
 ```bash
-cargo install --git https://github.com/youming-ai/pikpak-downloader
-# or, in a clone: cargo install --path .
+cargo install --locked --git https://github.com/youming-ai/pikpak-downloader
+# or, in a clone: cargo install --locked --path .
 ```
 
 ## Configure
