@@ -35,6 +35,13 @@ struct FolderToWalk {
 /// Maximum byte length for a single filesystem path component across common OSes.
 const MAX_COMPONENT_LEN: usize = 255;
 
+/// What a file's download writes beside it, under its name plus these.
+const TEMP_SUFFIXES: [&str; 2] = [".part", ".part.meta"];
+
+/// Longest name a file may claim: its sidecar, the longest temp name, must
+/// still fit in one path component.
+const MAX_FILE_NAME_LEN: usize = MAX_COMPONENT_LEN - ".part.meta".len();
+
 /// Truncate `s` to at most `max_bytes`, ending on a valid UTF-8 character boundary.
 fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
@@ -103,16 +110,9 @@ impl NameClaims {
     /// `.part.meta` file in `dir` matches `file_id`.
     fn claim_file(&mut self, dir: &StdPath, file_id: &str, raw: &str) -> Result<String> {
         self.ensure_dir_scanned(dir);
-        let key_fn = |name: &str| {
-            if self.case_insensitive {
-                name.to_lowercase()
-            } else {
-                name.to_string()
-            }
-        };
         if let Some(bound_name) = self.persisted.get(dir).and_then(|m| m.get(file_id)) {
             let taken = self.taken.entry(dir.to_path_buf()).or_default();
-            if taken.insert(key_fn(bound_name)) {
+            if take(taken, &fold(bound_name, self.case_insensitive), true) {
                 return Ok(bound_name.clone());
             }
         }
@@ -128,12 +128,12 @@ impl NameClaims {
     fn claim(&mut self, dir: &StdPath, raw: &str, is_file: bool) -> Result<String> {
         let base = safe_component(raw)?;
         let taken = self.taken.entry(dir.to_path_buf()).or_default();
-        let key = |name: &str| {
-            if self.case_insensitive {
-                name.to_lowercase()
-            } else {
-                name.to_string()
-            }
+        let case_insensitive = self.case_insensitive;
+        let mut take_name = |name: &str| take(taken, &fold(name, case_insensitive), is_file);
+        let max_len = if is_file {
+            MAX_FILE_NAME_LEN
+        } else {
+            MAX_COMPONENT_LEN
         };
 
         // Split stem and extension so suffixes insert before the extension.
@@ -143,29 +143,53 @@ impl NameClaims {
             _ => (base.as_str(), ""),
         };
 
-        let ext = truncate_utf8(raw_ext, MAX_COMPONENT_LEN.saturating_sub(1));
-        let max_stem = MAX_COMPONENT_LEN.saturating_sub(ext.len());
+        let ext = truncate_utf8(raw_ext, max_len.saturating_sub(1));
+        let max_stem = max_len.saturating_sub(ext.len());
         let stem = truncate_utf8(raw_stem, max_stem);
 
         let initial = format!("{stem}{ext}");
-        if taken.insert(key(&initial)) {
+        if take_name(&initial) {
             return Ok(initial);
         }
 
         let mut n = 2u32;
         loop {
             let suffix = format!(" ({n})");
-            let max_stem = MAX_COMPONENT_LEN
+            let max_stem = max_len
                 .saturating_sub(ext.len())
                 .saturating_sub(suffix.len());
             let fit_stem = truncate_utf8(stem, max_stem);
             let candidate = format!("{fit_stem}{suffix}{ext}");
-            if taken.insert(key(&candidate)) {
+            if take_name(&candidate) {
                 return Ok(candidate);
             }
             n += 1;
         }
     }
+}
+
+/// The key a name is claimed under: folded where the filesystem folds case.
+fn fold(name: &str, case_insensitive: bool) -> String {
+    if case_insensitive {
+        name.to_lowercase()
+    } else {
+        name.to_string()
+    }
+}
+
+/// Take `key` — and, for a file, the temp names its download writes beside it —
+/// all or nothing. Otherwise a remote `x.part` would be claimed as the partial
+/// of a remote `x`, and one transfer would delete the other's finished bytes.
+fn take(taken: &mut HashSet<String>, key: &str, is_file: bool) -> bool {
+    let mut names = vec![key.to_string()];
+    if is_file {
+        names.extend(TEMP_SUFFIXES.iter().map(|suffix| format!("{key}{suffix}")));
+    }
+    if names.iter().any(|name| taken.contains(name)) {
+        return false;
+    }
+    taken.extend(names);
+    true
 }
 
 /// A remote entry classified by what downloading it means.
@@ -219,7 +243,8 @@ pub(crate) struct DownloadSummary {
     pub output: String,
     /// Files the run planned to transfer.
     pub files: usize,
-    /// Files that finished, including ones resumed from an earlier run.
+    /// Files that finished, including ones resumed from an earlier run and ones
+    /// already on disk at their listed size, which are skipped.
     pub downloaded: usize,
     /// Files that failed.
     pub failed: usize,
@@ -548,6 +573,18 @@ async fn download_file(
     dest_name: &str,
     show_progress: bool,
 ) -> Result<u64> {
+    // ponytail: "already complete" means the listed size, not a hash — the
+    // listing carries none. A size of 0 may mean "not reported", so an empty
+    // file is always fetched again (it costs nothing).
+    let safe_dest_name = safe_component(dest_name)?;
+    let file_path = output_dir.join(&safe_dest_name);
+    if let Ok(meta) = tokio::fs::metadata(&file_path).await {
+        if meta.is_file() && file.size > 0 && meta.len() == file.size {
+            eprintln!("Skipped (already complete): {safe_dest_name}");
+            return Ok(meta.len());
+        }
+    }
+
     let dl: pikpak::DownloadInfo = client
         .get_download_url(&file.id)
         .await
@@ -562,13 +599,11 @@ async fn download_file(
         .into());
     }
 
-    let safe_dest_name = safe_component(dest_name)?;
     // The detail response may leave the size out; the directory listing we already
     // have knows it. An absent field is not the same as a zero-byte file, which is
     // why the response models it as an `Option`.
     let expected_size = dl.size.unwrap_or(file.size);
 
-    let file_path = output_dir.join(&safe_dest_name);
     let mut part = file_path.clone().into_os_string();
     part.push(".part");
     let part_path = PathBuf::from(part);
@@ -1033,15 +1068,75 @@ mod tests {
     }
 
     #[test]
+    fn a_remote_name_never_claims_another_files_temp_names() {
+        let dir = std::path::Path::new("/tmp/test");
+        // Either order: `x.part` must not become the partial of `x`, nor `y`'s
+        // sidecar be a remote file of its own.
+        for order in [["x", "x.part"], ["x.part", "x"]] {
+            let mut claims = super::NameClaims::with_case_folding(false);
+            let names: Vec<String> = order
+                .iter()
+                .map(|raw| claims.claim(dir, raw, true).unwrap())
+                .collect();
+            let (plain, part) = if order[0] == "x" {
+                (&names[0], &names[1])
+            } else {
+                (&names[1], &names[0])
+            };
+            assert_ne!(&format!("{plain}.part"), part, "{names:?}");
+        }
+
+        let mut claims = super::NameClaims::with_case_folding(false);
+        assert_eq!(claims.claim(dir, "y", true).unwrap(), "y");
+        assert_eq!(
+            claims.claim(dir, "y.part.meta", true).unwrap(),
+            "y.part (2).meta"
+        );
+    }
+
+    #[test]
+    fn a_maximal_remote_name_leaves_room_for_its_sidecar() {
+        let dir = std::path::Path::new("/tmp/test");
+        let mut claims = super::NameClaims::with_case_folding(false);
+        let name = claims.claim(dir, &"a".repeat(255), true).unwrap();
+        assert!(name.len() + ".part.meta".len() <= 255, "{}", name.len());
+    }
+
+    #[tokio::test]
+    async fn a_file_already_complete_on_disk_is_not_fetched_again() {
+        // Nothing listens on the API: reaching it would fail the test.
+        let client = pikpak::Client::builder()
+            .refresh_token("dummy")
+            .auth_base_url("http://127.0.0.1:1")
+            .api_base_url("http://127.0.0.1:1")
+            .build()
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!("pikpak-skip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("done.bin"), b"1234").unwrap();
+        let file: pikpak::FileInfo =
+            serde_json::from_str(r#"{"id":"f1","name":"done.bin","size":"4","kind":"drive#file"}"#)
+                .unwrap();
+
+        let size = super::download_file(&client, &file, &dir, "done.bin", false)
+            .await
+            .expect("a complete file is skipped, not fetched");
+        assert_eq!(size, 4);
+        assert_eq!(std::fs::read(dir.join("done.bin")).unwrap(), b"1234");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn name_claims_truncates_long_names_and_preserves_limits() {
         let dir = std::path::Path::new("/tmp/test");
         let mut claims = super::NameClaims::with_case_folding(false);
 
-        // A 251-byte stem + ".txt" (4 bytes) = 255 bytes (MAX_COMPONENT_LEN).
-        let long_stem = "a".repeat(251);
+        // A 241-byte stem + ".txt" (4 bytes) = 245 bytes (MAX_FILE_NAME_LEN):
+        // room is left for the ".part.meta" sidecar written beside it.
+        let long_stem = "a".repeat(241);
         let name = format!("{long_stem}.txt");
         let first = claims.claim(dir, &name, true).unwrap();
-        assert_eq!(first.len(), 255);
+        assert_eq!(first.len(), 245);
         assert_eq!(first, name);
 
         // Second colliding file must truncate the stem to keep the total length <= 255 bytes.
