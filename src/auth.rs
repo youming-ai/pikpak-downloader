@@ -106,6 +106,17 @@ impl std::fmt::Debug for TokenSource {
     }
 }
 
+// Hand-written so `{:?}` never prints a live token: the cached access token and
+// the refresh token both stay out of it.
+impl std::fmt::Debug for TokenManagerInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenManagerInner")
+            .field("auth_endpoint", &self.auth_endpoint)
+            .field("device_id", &self.device_id)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Token manager: keeps the current access token and refreshes it on demand.
 ///
 /// Cheap to clone — internally shares state behind an `Arc<RwLock<_>>` so
@@ -115,7 +126,6 @@ pub struct TokenManager {
     inner: Arc<TokenManagerInner>,
 }
 
-#[derive(Debug)]
 struct TokenManagerInner {
     http: reqwest::Client,
     auth_endpoint: String,
@@ -243,6 +253,22 @@ impl TokenManager {
     pub async fn invalidate(&self) {
         let mut guard = self.inner.cached.write().await;
         *guard = None;
+    }
+
+    /// Like [`invalidate`], but only while `rejected` is still the cached
+    /// token. Concurrent requests rejected together would otherwise each wipe
+    /// the token the first of them just refreshed, and each rotation costs a
+    /// single-use refresh token.
+    ///
+    /// [`invalidate`]: Self::invalidate
+    pub async fn invalidate_if_current(&self, rejected: &str) {
+        let mut guard = self.inner.cached.write().await;
+        if guard
+            .as_ref()
+            .is_some_and(|cached| cached.access_token == rejected)
+        {
+            *guard = None;
+        }
     }
 
     /// Return the `sub` (user id) claim from the current token, refreshing
@@ -657,6 +683,41 @@ mod tests {
             "device-1",
             token,
         )
+    }
+
+    #[tokio::test]
+    async fn only_the_rejected_access_token_is_invalidated() {
+        let (addr, seen) = scripted_auth_server(vec![(200, ROTATED_OK), (200, ROTATED_OK)]).await;
+        let tokens = manager_for(addr, "token-1");
+        assert_eq!(tokens.access_token().await.unwrap(), "access-2");
+
+        // A request rejected with an older token must not wipe the current one:
+        // that would spend another single-use refresh token for nothing.
+        tokens.invalidate_if_current("access-1").await;
+        tokens.access_token().await.unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1, "no second refresh");
+
+        tokens.invalidate_if_current("access-2").await;
+        tokens.access_token().await.unwrap();
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "the rejected token is replaced"
+        );
+    }
+
+    #[test]
+    fn debug_output_never_shows_a_token() {
+        let tokens = TokenManager::new(
+            reqwest::Client::new(),
+            "http://127.0.0.1:1/v1/auth/token".to_string(),
+            OAuthCredentials::default(),
+            "device-1",
+            "secret-refresh-token",
+        );
+        let shown = format!("{tokens:?}");
+        assert!(!shown.contains("secret-refresh-token"), "{shown}");
+        assert!(shown.contains("device-1"), "{shown}");
     }
 
     const GRANT_REJECTION: &str = r#"{"error":"invalid_grant","error_code":4126}"#;

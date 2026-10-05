@@ -150,12 +150,22 @@ impl JobStore {
         for dir in [root.to_path_buf(), root.join("jobs"), root.join("logs")] {
             match dirs.create(&dir) {
                 Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                // `mkdir` says this for a plain file too; only a directory will do.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {
+                }
                 Err(error) => {
                     return Err(error)
                         .with_context(|| format!("failed to create {}", dir.display()))
                 }
             }
+        }
+        // `jobs` and `logs` are this tool's own, so ones an older version created
+        // world-readable are tightened too. The root may be a directory the user
+        // pointed `PIKPAK_STATE_DIR` at; that one is left as it is.
+        #[cfg(unix)]
+        for dir in [root.join("jobs"), root.join("logs")] {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
         }
         Ok(Self {
             root: root.to_path_buf(),
@@ -163,9 +173,10 @@ impl JobStore {
     }
 
     /// The store under `root`, as it is: nothing is created. For the `jobs`
-    /// commands, which only read — asking what is running must not create a
-    /// state tree (perhaps beside a `.env` in a parent directory) or fail
-    /// because that directory is read-only.
+    /// commands — asking what is running must not create a state tree (perhaps
+    /// beside a `.env` in a parent directory) or fail where that is read-only.
+    /// The one write among them, `cancel`'s marker, happens only for a job whose
+    /// record exists, so its directory does too.
     pub(crate) fn at(root: &StdPath) -> Self {
         Self {
             root: root.to_path_buf(),
@@ -212,7 +223,17 @@ impl JobStore {
         // replace it in one step — through a temp file of this process's own, so
         // two writers never share one.
         let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-        std::fs::write(&tmp, &body)
+        // Owner-only, like the log: a record carries the service's error text.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
+            .open(&tmp)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, &body))
             .with_context(|| format!("failed to write {}", tmp.display()))?;
         std::fs::rename(&tmp, &path)
             .with_context(|| format!("failed to replace {}", path.display()))
@@ -850,6 +871,37 @@ mod tests {
             let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "{}", dir.display());
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_older_world_readable_store_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_state("tighten");
+        for dir in ["jobs", "logs"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::set_permissions(root.join(dir), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        let store = JobStore::open(&root).unwrap();
+        store
+            .create(&record("1-000001", JobState::Running, now_secs()))
+            .unwrap();
+
+        let mode = |path: PathBuf| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(root.join("jobs")), 0o700);
+        assert_eq!(mode(root.join("logs")), 0o700);
+        assert_eq!(mode(root.join("jobs").join("1-000001.json")), 0o600);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_file_where_the_jobs_directory_belongs_is_an_error() {
+        let root = temp_state("not-a-dir");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("jobs"), b"").unwrap();
+        assert!(JobStore::open(&root).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -38,50 +38,29 @@ pub const EXIT_CANCELLED: u8 = 9;
 
 /// A deadline the caller set expired. Its own type so the exit code can say
 /// "timed out" rather than "something went wrong".
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
 pub struct Timeout(pub String);
-
-impl std::fmt::Display for Timeout {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}", self.0)
-    }
-}
-
-impl std::error::Error for Timeout {}
 
 /// Something the caller named does not exist. Its own type so the message can
 /// name the right kind of thing — a job id is not a path — while the exit code
 /// stays `not_found`.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
 pub struct Missing(pub String);
-
-impl std::fmt::Display for Missing {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}", self.0)
-    }
-}
-
-impl std::error::Error for Missing {}
 
 /// A failure that already knows its exit code, where the generic mapping would
 /// guess wrong: a detached job read back from disk (so `jobs wait` reports what
 /// a synchronous run would have), or a CDN status, which carries none of the
 /// account-level meaning the same status has on the API.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
 pub struct Coded {
     /// The exit code to report.
     pub code: u8,
     /// What went wrong.
     pub message: String,
 }
-
-impl std::fmt::Display for Coded {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}", self.message)
-    }
-}
-
-impl std::error::Error for Coded {}
 
 /// The `kind` label for an exit code, for the rare case where the code is known
 /// but the original error is not (a job read back from disk).
@@ -182,12 +161,18 @@ pub(crate) fn error_document(command: &str, error: &AnyError) -> Value {
 ///
 /// Codes are a public interface: add new ones, never repurpose them.
 pub fn exit_code_for(error: &AnyError) -> (u8, &'static str) {
+    let code = code_for(error);
+    (code, kind_for_code(code))
+}
+
+/// The exit code alone; [`kind_for_code`] names it, so the two never disagree.
+fn code_for(error: &AnyError) -> u8 {
     // A failure that carries its own code; do not re-derive it.
     if let Some(failed) = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<Coded>())
     {
-        return (failed.code, kind_for_code(failed.code));
+        return failed.code;
     }
 
     if let Some(source) = error
@@ -196,17 +181,17 @@ pub fn exit_code_for(error: &AnyError) -> (u8, &'static str) {
     {
         use pikpak::Error;
         return match source {
-            Error::Auth(_) | Error::TokenExpired | Error::NotConfigured(_) => (EXIT_AUTH, "auth"),
-            Error::NotFound { .. } => (EXIT_NOT_FOUND, "not_found"),
-            Error::Http(_) => (EXIT_NETWORK, "network"),
+            Error::Auth(_) | Error::TokenExpired | Error::NotConfigured(_) => EXIT_AUTH,
+            Error::NotFound { .. } => EXIT_NOT_FOUND,
+            Error::Http(_) => EXIT_NETWORK,
             Error::Api { status, .. } => match *status {
-                401 | 403 => (EXIT_AUTH, "auth"),
-                404 => (EXIT_NOT_FOUND, "not_found"),
-                429 => (EXIT_NETWORK, "network"),
-                status if status >= 500 => (EXIT_NETWORK, "network"),
-                _ => (EXIT_REFUSED, "refused"),
+                401 | 403 => EXIT_AUTH,
+                404 => EXIT_NOT_FOUND,
+                429 => EXIT_NETWORK,
+                status if status >= 500 => EXIT_NETWORK,
+                _ => EXIT_REFUSED,
             },
-            _ => (EXIT_UNEXPECTED, "unexpected"),
+            _ => EXIT_UNEXPECTED,
         };
     }
 
@@ -214,14 +199,14 @@ pub fn exit_code_for(error: &AnyError) -> (u8, &'static str) {
         .chain()
         .any(|cause| cause.downcast_ref::<Missing>().is_some())
     {
-        return (EXIT_NOT_FOUND, "not_found");
+        return EXIT_NOT_FOUND;
     }
 
     if error
         .chain()
         .any(|cause| cause.downcast_ref::<Timeout>().is_some())
     {
-        return (EXIT_TIMEOUT, "timeout");
+        return EXIT_TIMEOUT;
     }
 
     // The download path wraps filesystem failures in context of its own, so look
@@ -230,10 +215,10 @@ pub fn exit_code_for(error: &AnyError) -> (u8, &'static str) {
         .chain()
         .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
     {
-        return (EXIT_IO, "io");
+        return EXIT_IO;
     }
 
-    (EXIT_UNEXPECTED, "unexpected")
+    EXIT_UNEXPECTED
 }
 
 #[cfg(test)]

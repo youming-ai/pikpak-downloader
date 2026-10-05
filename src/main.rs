@@ -140,9 +140,16 @@ async fn main() -> ExitCode {
     // A panic is a bug, but still a failure the caller must be able to parse:
     // one failure document and the documented exit 1, not Rust's bare 101. The
     // process ends here, so no second document can follow from `main`.
+    //
+    // Only on the main thread, where the command itself runs. A panic in a
+    // spawned task surfaces through its join handle — one failed file in a
+    // download — and must not take the rest of the run down with it.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         default_hook(info);
+        if std::thread::current().name() != Some("main") {
+            return;
+        }
         output.fail(command, &anyhow::anyhow!("internal error: {info}"));
         std::process::exit(output::EXIT_UNEXPECTED.into());
     }));
@@ -241,7 +248,8 @@ fn validate_refresh_token(value: Option<String>) -> Result<String> {
         // report it as such so a caller gets the `auth` exit code and can tell
         // "fix your credentials" from "the service broke".
         Some(_) => {
-            Err(pikpak::Error::NotConfigured("PIKPAK_REFRESH_TOKEN is set but empty").into())
+            // Reads as "not configured: missing PIKPAK_REFRESH_TOKEN (set, but blank)".
+            Err(pikpak::Error::NotConfigured("PIKPAK_REFRESH_TOKEN (set, but blank)").into())
         }
         None => Err(pikpak::Error::NotConfigured("PIKPAK_REFRESH_TOKEN").into()),
     }
@@ -480,11 +488,6 @@ mod tests {
     fn missing_credentials_are_reported_as_an_auth_failure() {
         for problem in [None, Some(String::new()), Some("  ".to_string())] {
             let error = super::validate_refresh_token(problem)
-                .map(|token| {
-                    tokio::runtime::Runtime::new()
-                        .unwrap()
-                        .block_on(async { token })
-                })
                 .expect_err("a blank token must not be accepted");
             assert_eq!(
                 crate::output::exit_code_for(&error),

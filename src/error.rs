@@ -48,9 +48,10 @@ pub enum Error {
     #[error("invalid path: {0}")]
     InvalidPath(&'static str),
 
-    /// Url construction error.
-    #[error("url error: {0}")]
-    Url(#[from] url::ParseError),
+    /// The service answered in a way that breaks its own protocol (a listing
+    /// that repeats a page, say), so the result cannot be trusted.
+    #[error("unexpected response: {0}")]
+    Protocol(String),
 }
 
 /// Result alias with [`Error`] as the error type.
