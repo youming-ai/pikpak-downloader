@@ -29,34 +29,68 @@ cargo install --locked --git https://github.com/youming-ai/pikpak-downloader
 # or, in a clone: cargo install --locked --path .
 ```
 
-## Configure
+## Get started
+
+**1. Copy your refresh token.** Log in at [mypikpak.com](https://mypikpak.com),
+open DevTools (F12), go to **Application** → **Local Storage** →
+`https://mypikpak.com`, and copy `refresh_token` from the `credentials` entry.
+Then close the tab — but do not log out, which may revoke the token you just
+copied. Do steps 2 and 3 straight away: an open web app refreshes the token in
+the background, and whichever side refreshes first leaves the other's copy dead.
+
+**2. Put it in a `.env`** in the directory you will work from. This prompts for
+the token without echoing it, keeps it out of your shell history, and makes the
+file readable by you alone (the CLI keeps those permissions when it rewrites
+the file):
 
 ```bash
-cp .env.example .env
+mkdir -p ~/pikpak && cd ~/pikpak
+printf 'refresh token: '; read -rs token; echo
+(umask 077; printf 'PIKPAK_REFRESH_TOKEN=%s\n' "$token" > .env); unset token
 ```
 
-Read from the environment, or from the first `.env` found in the working
-directory and then its parents. `PIKPAK_REFRESH_TOKEN` is required;
-`PIKPAK_PROXY`, `PIKPAK_CLIENT_ID`, `PIKPAK_CLIENT_SECRET` and
-`PIKPAK_DEVICE_ID` are optional — the CLI saves a device id to `.env` on its
-first run, so every later run reports the same device.
+(In a clone of this repository, `cp .env.example .env` gives you a template
+with every setting.)
 
-PikPak refresh tokens are **single-use**: every login rotates them, and the CLI
-writes each replacement back into the file it loaded — so keep the token in
-`.env` rather than your shell environment, where the tool can only *print* the
-replacement. Two clients refreshing one account at once is handled as well: the
-CLI re-reads that file and retries once.
+**3. Check that it works:**
 
-<details>
-<summary>Where to get the token</summary>
+```console
+$ pikpak quota
+total: 10.00 TiB
+used:  4.23 TiB
+free:  5.77 TiB
+usage: 42.3%
+```
 
-1. Log in at [mypikpak.com](https://mypikpak.com) and open DevTools.
-2. **Application** → **Local Storage** → `https://mypikpak.com`.
-3. Find `credentials`, or search the values for `refresh_token`.
+Run `pikpak` from that directory or any directory below it: it reads the first
+`.env` it finds there or in a parent.
 
-The web app issues platform-bound tokens, so a freshly copied one can be refused
-outright by this Android-client tool.
-</details>
+### What to know about the token
+
+- **It is single-use.** Every time the CLI authenticates with PikPak the token
+  rotates, and the CLI writes the replacement back into the `.env` it loaded.
+  (`jobs` commands never authenticate, so they never rotate it.) Keep it in `.env`, not in your
+  shell environment — from there the CLI can only *print* the replacement, and
+  missing it leaves you with a dead token.
+- **One client at a time.** The web app, or a second copy of this tool on the
+  same account, rotates the token too. If another process got there first, the
+  CLI re-reads `.env` and retries once.
+- **Exit code 3 is an `auth` failure.** With `invalid_grant` in the message the
+  token is dead: copy a fresh one into `.env` as in step 1, and keep the web app
+  closed while the CLI runs. Otherwise the token is missing or blank. The web
+  app issues platform-bound tokens, so even a fresh copy can occasionally be
+  refused by this Android-client tool.
+
+### Other settings
+
+All optional, in `.env` or the environment:
+
+| variable | meaning |
+| --- | --- |
+| `PIKPAK_PROXY` | HTTP(S) proxy URL, e.g. `http://127.0.0.1:7890` |
+| `PIKPAK_DEVICE_ID` | device id; filled in on the first run, so every run reports the same device |
+| `PIKPAK_CLIENT_ID`, `PIKPAK_CLIENT_SECRET` | override the OAuth client |
+| `PIKPAK_STATE_DIR` | where background jobs are kept (default `.pikpak` beside your `.env`) |
 
 ## CLI
 
@@ -70,13 +104,9 @@ pikpak download --path /                      # drive root, expanded into its ch
 pikpak --verbose download --path "/My Pack/video.mp4"
 ```
 
-```console
-$ pikpak quota
-total: 10.00 TiB
-used:  4.23 TiB
-free:  5.77 TiB
-usage: 42.3%
-```
+Re-running an interrupted download resumes it, and non-empty files already
+complete on disk are skipped, so the same command can simply be run again.
+(Empty files are fetched again: a listed size of 0 may mean "not reported".)
 
 | flag | meaning |
 | --- | --- |
@@ -102,7 +132,7 @@ the cases worth branching on: `3` auth, `4` not found, `5` network, `6` refused,
 
 ```console
 $ pikpak --json quota
-{"ok":true,"command":"quota","result":{"total":10995116277760,"used":4650000000000,"free":6345116277760,"usage_percent":42.3}}
+{"command":"quota","ok":true,"result":{"free":6345116277760,"total":10995116277760,"usage_percent":42.3,"used":4650000000000}}
 ```
 
 ### Long downloads

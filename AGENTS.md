@@ -37,29 +37,32 @@ Branch on these rather than on the message text. They are append-only.
 | code | `error.kind` | meaning | what to do |
 | --- | --- | --- | --- |
 | 0 | — | success | parse `result` |
-| 1 | `unexpected` | a bug, or a response we could not parse | report it; retrying rarely helps |
+| 1 | `unexpected` | a bug, a response we could not parse, or one that contradicts itself (a listing that repeats a page) | report it; retrying rarely helps |
 | 2 | — | usage error (clap) | fix the arguments |
 | 3 | `auth` | token missing, blank, rejected or no longer refreshable | supply a fresh `PIKPAK_REFRESH_TOKEN` |
-| 4 | `not_found` | the remote path does not exist | fix the path |
-| 5 | `network` | transport failure, or 429/5xx after retries | retry later |
-| 6 | `refused` | the service refused it for another reason | report it; do not retry blindly |
+| 4 | `not_found` | the remote path, the file's content (CDN 404) or the job id does not exist | fix the path or id |
+| 5 | `network` | transport failure, or the service overloaded or failing (429/5xx) | retry later |
+| 6 | `refused` | the service refused it for another reason — including a download link that stays rejected after refreshing | report it; do not retry blindly |
 | 7 | `io` | a local filesystem operation failed | fix permissions/space |
 | 8 | `timeout` | `jobs wait` hit the deadline you gave it | the job is still running; wait again or cancel |
 | 9 | `cancelled` | the job was cancelled before it finished | nothing to fix |
 
 ## Documents
 
+Parse them as JSON: the order of fields is not part of the contract. (Today
+the CLI sorts them, as the examples below show; do not depend on that.)
+
 Failure — the process exit code equals `error.exit_code`:
 
 ```json
-{"ok":false,"command":"ls","error":{"kind":"auth","message":"not configured: missing PIKPAK_REFRESH_TOKEN","exit_code":3}}
+{"command":"ls","error":{"exit_code":3,"kind":"auth","message":"not configured: missing PIKPAK_REFRESH_TOKEN"},"ok":false}
 ```
 
 Success — always `{"ok":true,"command":<name>,"result":<payload>}`:
 
 ```bash
 $ pikpak --json quota
-{"ok":true,"command":"quota","result":{"total":10995116277760,"used":4650000000000,"free":6345116277760,"usage_percent":42.3}}
+{"command":"quota","ok":true,"result":{"free":6345116277760,"total":10995116277760,"usage_percent":42.3,"used":4650000000000}}
 ```
 
 `result` payloads:
@@ -99,7 +102,7 @@ immediately. The worker keeps running after that process exits.
 
 ```console
 $ pikpak --json download --detach --path "/My Pack/Movies" --output /data
-{"ok":true,"command":"download","result":{"path":"/My Pack/Movies","output":"/data","started_at":1770000000,"log":".pikpak/logs/1770000000-123456.log","job":{"id":"1770000000-123456",…}}}
+{"command":"download","ok":true,"result":{"job":{…,"id":"1770000000-123456",…},"log":"/home/me/pikpak/.pikpak/logs/1770000000-123456.log","output":"/data","path":"/My Pack/Movies","started_at":1770000000}}
 ```
 
 `result.job.id` is what every later call takes. The job's records live under
