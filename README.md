@@ -34,14 +34,19 @@ cargo install --locked --git https://github.com/youming-ai/pikpak-downloader
 **1. Copy your refresh token.** Log in at [mypikpak.com](https://mypikpak.com),
 open DevTools (F12), go to **Application** → **Local Storage** →
 `https://mypikpak.com`, and copy `refresh_token` from the `credentials` entry.
-Then log out of the web app: it refreshes the token in the background, which
-would make your copy stale.
+Then close the tab — but do not log out, which may revoke the token you just
+copied. Do steps 2 and 3 straight away: an open web app refreshes the token in
+the background, and whichever side refreshes first leaves the other's copy dead.
 
-**2. Put it in a `.env`** in the directory you will work from:
+**2. Put it in a `.env`** in the directory you will work from. This prompts for
+the token without echoing it, keeps it out of your shell history, and makes the
+file readable by you alone (the CLI keeps those permissions when it rewrites
+the file):
 
 ```bash
 mkdir -p ~/pikpak && cd ~/pikpak
-echo 'PIKPAK_REFRESH_TOKEN=paste-your-token-here' > .env
+printf 'refresh token: '; read -rs token; echo
+(umask 077; printf 'PIKPAK_REFRESH_TOKEN=%s\n' "$token" > .env); unset token
 ```
 
 (In a clone of this repository, `cp .env.example .env` gives you a template
@@ -62,16 +67,19 @@ Run `pikpak` from that directory or any directory below it: it reads the first
 
 ### What to know about the token
 
-- **It is single-use.** Every run rotates it, and the CLI writes the
-  replacement back into the `.env` it loaded. Keep it in `.env`, not in your
+- **It is single-use.** Every time the CLI authenticates with PikPak the token
+  rotates, and the CLI writes the replacement back into the `.env` it loaded.
+  (`jobs` commands never authenticate, so they never rotate it.) Keep it in `.env`, not in your
   shell environment — from there the CLI can only *print* the replacement, and
   missing it leaves you with a dead token.
 - **One client at a time.** The web app, or a second copy of this tool on the
   same account, rotates the token too. If another process got there first, the
   CLI re-reads `.env` and retries once.
-- **Exit code 3 (`invalid_grant`) means the token is dead.** Copy a fresh one
-  into `.env` and log the web app out. The web app issues platform-bound tokens,
-  so even a fresh copy can occasionally be refused by this Android-client tool.
+- **Exit code 3 is an `auth` failure.** With `invalid_grant` in the message the
+  token is dead: copy a fresh one into `.env` as in step 1, and keep the web app
+  closed while the CLI runs. Otherwise the token is missing or blank. The web
+  app issues platform-bound tokens, so even a fresh copy can occasionally be
+  refused by this Android-client tool.
 
 ### Other settings
 
@@ -96,8 +104,9 @@ pikpak download --path /                      # drive root, expanded into its ch
 pikpak --verbose download --path "/My Pack/video.mp4"
 ```
 
-Re-running an interrupted download resumes it, and files already complete on
-disk are skipped, so the same command can simply be run again.
+Re-running an interrupted download resumes it, and non-empty files already
+complete on disk are skipped, so the same command can simply be run again.
+(Empty files are fetched again: a listed size of 0 may mean "not reported".)
 
 | flag | meaning |
 | --- | --- |
