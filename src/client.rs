@@ -572,6 +572,26 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Duration {
         })
 }
 
+/// Send the request `build` makes, retrying with the API backoff while the
+/// failure is one `retryable` accepts, at most [`MAX_NET_RETRIES`] times.
+pub(crate) async fn send_retrying(
+    build: impl Fn() -> reqwest::RequestBuilder,
+    retryable: fn(&reqwest::Error) -> bool,
+) -> reqwest::Result<reqwest::Response> {
+    let mut attempt = 0;
+    loop {
+        match build().send().await {
+            Err(e) if retryable(&e) && attempt < MAX_NET_RETRIES => {
+                let delay = jittered_backoff(backoff_delay(attempt));
+                tracing::debug!(error = %e, ?delay, "transient network error, retrying");
+                attempt += 1;
+                tokio::time::sleep(delay).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Whether a reqwest error is a transient network condition worth retrying.
 pub(crate) fn is_transient(err: &reqwest::Error) -> bool {
     err.is_timeout() || err.is_connect() || err.is_request() || err.is_body()

@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path as StdPath, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -140,6 +141,9 @@ struct Plan {
     tasks: Vec<DownloadTask>,
     folders: VecDeque<FolderToWalk>,
     claims: NameClaims,
+    /// Names of entries whose kind this crate does not model: refused, not
+    /// guessed at — each one failed file, so the rest still download.
+    refused: Vec<String>,
 }
 
 impl Plan {
@@ -153,6 +157,7 @@ impl Plan {
             tasks: Vec::new(),
             folders: VecDeque::new(),
             claims,
+            refused: Vec::new(),
         }
     }
 
@@ -181,11 +186,7 @@ impl Plan {
                     name: entry.name,
                 });
             }
-            // A kind this crate does not model is refused, not guessed at.
-            FileKind::Unknown => bail!(
-                "refusing to download {:?}: unsupported entry kind reported by the server",
-                entry.name
-            ),
+            FileKind::Unknown => self.refused.push(entry.name),
         }
         Ok(())
     }
@@ -203,6 +204,17 @@ impl Plan {
         }
         Ok(())
     }
+}
+
+/// A run's counts as they change, so a detached job's record can report them
+/// while the run is still going.
+#[derive(Debug, Default)]
+pub(crate) struct Tally {
+    /// Files the run planned to transfer, once planning is done.
+    pub files: AtomicUsize,
+    pub downloaded: AtomicUsize,
+    pub failed: AtomicUsize,
+    pub bytes: AtomicU64,
 }
 
 /// What a download run did, as reported in `--json` output.
@@ -225,6 +237,7 @@ pub(crate) async fn cmd_download(
     client: &Client,
     args: DownloadArgs,
     ui: Output,
+    tally: &Tally,
 ) -> Result<DownloadSummary> {
     let output = StdPath::new(&args.output);
     tokio::fs::create_dir_all(output)
@@ -244,9 +257,11 @@ pub(crate) async fn cmd_download(
         plan.add(client.resolve_path_info(&args.path).await?, output)?;
     }
     plan.walk(client).await?;
-    let tasks = plan.tasks;
+    let Plan { tasks, refused, .. } = plan;
+    let planned = tasks.len() + refused.len();
+    tally.files.store(planned, Ordering::Relaxed);
 
-    if tasks.is_empty() {
+    if planned == 0 {
         eprintln!("(nothing to download)");
         return Ok(DownloadSummary {
             output: args.output,
@@ -266,7 +281,6 @@ pub(crate) async fn cmd_download(
     // Live byte-level progress only reads cleanly with a single active
     // transfer; with concurrency we fall back to per-file start/finish lines.
     let show_progress = ui.progress(jobs);
-    let planned = tasks.len();
 
     let sem = Arc::new(Semaphore::new(jobs));
     let mut set = tokio::task::JoinSet::new();
@@ -286,11 +300,17 @@ pub(crate) async fn cmd_download(
 
     // The failure reported (and so the exit code) is the earliest file's in
     // listing order, not whichever finished failing first: the same run fails
-    // the same way every time.
+    // the same way every time. Refusals are known before any transfer, so they
+    // come first.
     let mut first_err: Option<(usize, anyhow::Error)> = None;
-    let mut downloaded = 0usize;
-    let mut failed = 0usize;
-    let mut bytes = 0u64;
+    for name in &refused {
+        let e = anyhow::anyhow!(
+            "refusing to download {name:?}: unsupported entry kind reported by the server"
+        );
+        eprintln!("error: {e}");
+        tally.failed.fetch_add(1, Ordering::Relaxed);
+        first_err.get_or_insert((0, e));
+    }
     while let Some(joined) = set.join_next().await {
         // A panicking transfer is one failed file, not the end of the others.
         let (index, result) = joined.unwrap_or_else(|panic| {
@@ -301,11 +321,11 @@ pub(crate) async fn cmd_download(
         });
         match result {
             Ok(size) => {
-                downloaded += 1;
-                bytes += size;
+                tally.downloaded.fetch_add(1, Ordering::Relaxed);
+                tally.bytes.fetch_add(size, Ordering::Relaxed);
             }
             Err(e) => {
-                failed += 1;
+                tally.failed.fetch_add(1, Ordering::Relaxed);
                 eprintln!("error: {e:#}");
                 if first_err.as_ref().is_none_or(|(first, _)| index < *first) {
                     first_err = Some((index, e));
@@ -315,6 +335,9 @@ pub(crate) async fn cmd_download(
     }
     // Gone once nothing is left to resume; kept, with its partials, otherwise.
     let _ = tokio::fs::remove_dir(&parts).await;
+    let downloaded = tally.downloaded.load(Ordering::Relaxed);
+    let failed = tally.failed.load(Ordering::Relaxed);
+    let bytes = tally.bytes.load(Ordering::Relaxed);
     // A failed run reports only its failure, so the counts travel in its message.
     match first_err {
         Some((_, e)) => Err(e).context(format!(
@@ -756,14 +779,12 @@ mod tests {
         addr
     }
 
-    /// The tree most tests walk: root -> dir -> sub -> big.bin, plus a folder
-    /// holding an entry whose kind this crate does not model.
+    /// The tree most tests walk: root -> dir -> sub -> big.bin.
     fn nested_tree(content: &[u8]) -> Vec<Entry> {
         vec![
             ("", "A", "dir", "drive#folder", Vec::new()),
             ("A", "B", "sub", "drive#folder", Vec::new()),
             ("B", "f1", "big.bin", "drive#file", content.to_vec()),
-            ("U", "u1", "weird.link", "drive#shortcut", Vec::new()),
         ]
     }
 
@@ -807,6 +828,7 @@ mod tests {
                 detach: false,
             },
             crate::output::Output::new(false, false),
+            &super::Tally::default(),
         )
         .await
     }
@@ -852,27 +874,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unknown_entry_kind_is_refused_not_downloaded() {
-        // Entries whose kind the library does not model must be refused with a
-        // clear error, not silently treated as files.
-        let client = mock_client(spawn_drive(nested_tree(&[])).await);
+    async fn an_unknown_entry_kind_fails_alone_while_the_rest_download() {
+        // An entry whose kind the library does not model is refused with a
+        // clear error, never treated as a file — but as one failed file, not the
+        // end of the run: its neighbours still land.
+        let data = vec![7u8; 16];
+        let client = mock_client(
+            spawn_drive(vec![
+                ("", "M", "mixed", "drive#folder", Vec::new()),
+                ("M", "u1", "weird.link", "drive#shortcut", Vec::new()),
+                ("M", "f2", "ok.bin", "drive#file", data.clone()),
+            ])
+            .await,
+        );
         let dir = std::env::temp_dir().join(format!("pikpak-unknown-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        let mut plan = super::Plan::new(&dir);
-        plan.folders.push_back(super::FolderToWalk {
-            id: "U".to_string(),
-            name: "weird-dir".to_string(),
-            dir: dir.join("weird-dir"),
-        });
-        let err = plan
-            .walk(&client)
-            .await
-            .expect_err("an unknown entry kind must be refused");
+        let tally = super::Tally::default();
+        let err = super::cmd_download(
+            &client,
+            crate::DownloadArgs {
+                path: "/mixed".to_string(),
+                output: dir.to_string_lossy().into_owned(),
+                jobs: 1,
+                detach: false,
+            },
+            crate::output::Output::new(false, false),
+            &tally,
+        )
+        .await
+        .expect_err("a refused entry fails the run");
 
         let text = format!("{err:#}");
         assert!(text.contains("unsupported entry kind"), "{text}");
         assert!(text.contains("weird.link"), "{text}");
+        assert!(text.contains("1 of 2 files failed"), "{text}");
+        assert_eq!(
+            std::fs::read(dir.join("mixed").join("ok.bin")).unwrap(),
+            data
+        );
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(tally.files.load(Relaxed), 2);
+        assert_eq!(tally.downloaded.load(Relaxed), 1);
+        assert_eq!(tally.failed.load(Relaxed), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

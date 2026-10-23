@@ -311,20 +311,29 @@ impl TokenManager {
         &self,
         refresh_token: &str,
     ) -> std::result::Result<serde_json::Value, ExchangeFailure> {
-        let req = self
-            .inner
-            .http
-            .post(&self.inner.auth_endpoint)
-            .header("X-Device-Id", &self.inner.device_id)
-            .json(&serde_json::json!({
-                "client_id": self.inner.credentials.client_id,
-                "client_secret": self.inner.credentials.client_secret,
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-            }));
+        let body = serde_json::json!({
+            "client_id": self.inner.credentials.client_id,
+            "client_secret": self.inner.credentials.client_secret,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        });
 
         tracing::debug!(endpoint = %self.inner.auth_endpoint, "refreshing access token");
-        let resp = req.send().await.map_err(|error| ExchangeFailure {
+        let resp = crate::client::send_retrying(
+            || {
+                self.inner
+                    .http
+                    .post(&self.inner.auth_endpoint)
+                    .header("X-Device-Id", &self.inner.device_id)
+                    .json(&body)
+            },
+            // Only a connection that never opened is safe to repeat: once the
+            // token reached the server it may be spent already, with the
+            // response that would carry its replacement lost.
+            reqwest::Error::is_connect,
+        )
+        .await
+        .map_err(|error| ExchangeFailure {
             grant_rejected: false,
             error: error.into(),
         })?;
@@ -899,5 +908,48 @@ mod tests {
         assert!(tokens.access_token().await.is_err());
         assert_eq!(tokens.current_refresh_token().await, "rotated-2");
         assert_eq!(persisted.lock().unwrap().as_deref(), Some("rotated-2"));
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_never_opened_is_retried() {
+        // The auth server is not up yet for the first attempt: nothing was sent,
+        // so trying again cannot spend the token twice.
+        let addr = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let tokens = manager_for(addr, "initial-token");
+        let server = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let _ = crate::test_http::read_request(&mut sock).await;
+            crate::test_http::respond_json(&mut sock, 200, "OK", crate::test_http::TOKEN_JSON)
+                .await;
+        });
+
+        assert_eq!(tokens.access_token().await.unwrap(), "access");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_request_that_reached_the_server_is_not_repeated() {
+        // The server took the request and hung up without answering: the token
+        // may be spent, so sending it again could only make things worse.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = crate::test_http::read_request(&mut sock).await;
+            }
+        });
+
+        let tokens = manager_for(addr, "initial-token");
+        assert!(tokens.access_token().await.is_err());
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

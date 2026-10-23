@@ -174,15 +174,20 @@ impl CaptchaManager {
         );
 
         tracing::debug!(action = %action, "initializing captcha token");
-        let resp = self
-            .inner
-            .http
-            .post(&url)
-            .bearer_auth(&access)
-            .header("X-Device-Id", &self.inner.device_id)
-            .json(&body)
-            .send()
-            .await?;
+        // Asking again only issues another token, so any transient failure
+        // is worth a retry.
+        let resp = crate::client::send_retrying(
+            || {
+                self.inner
+                    .http
+                    .post(&url)
+                    .bearer_auth(&access)
+                    .header("X-Device-Id", &self.inner.device_id)
+                    .json(&body)
+            },
+            crate::client::is_transient,
+        )
+        .await?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
