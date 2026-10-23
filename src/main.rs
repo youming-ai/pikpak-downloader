@@ -190,7 +190,8 @@ async fn run(cli: Cli, home: TokenHome, state: &StdPath, output: output::Output)
                 document(detached)
             }
             Command::Download(args) => {
-                document(download::cmd_download(&client()?, args, output).await?)
+                let tally = download::Tally::default();
+                document(download::cmd_download(&client()?, args, output, &tally).await?)
             }
             Command::Quota(args) => document(cmd_quota(&client()?, args, output).await?),
             Command::Jobs(args) => jobs::cmd_jobs(args.command, output, state).await,

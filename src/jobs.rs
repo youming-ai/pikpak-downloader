@@ -15,6 +15,8 @@
 //! ```
 
 use std::path::{Path as StdPath, PathBuf};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -22,7 +24,7 @@ use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::download::DownloadSummary;
+use crate::download::{DownloadSummary, Tally};
 use crate::output::Output;
 use crate::DownloadArgs;
 
@@ -97,6 +99,9 @@ pub(crate) struct JobRecord {
     pub created_at: u64,
     /// Epoch seconds; the worker refreshes this as a heartbeat.
     pub updated_at: u64,
+    /// Files the run planned to transfer; 0 until planning is done.
+    #[serde(default)]
+    pub files: usize,
     /// Files finished so far.
     pub downloaded: usize,
     /// Files that failed.
@@ -109,6 +114,16 @@ pub(crate) struct JobRecord {
     /// with what a synchronous run would have.
     #[serde(default)]
     pub exit_code: Option<u8>,
+}
+
+impl JobRecord {
+    /// Copy the run's counts into the record.
+    fn count(&mut self, tally: &Tally) {
+        self.files = tally.files.load(Ordering::Relaxed);
+        self.downloaded = tally.downloaded.load(Ordering::Relaxed);
+        self.failed = tally.failed.load(Ordering::Relaxed);
+        self.bytes = tally.bytes.load(Ordering::Relaxed);
+    }
 }
 
 /// What `download --detach` reports.
@@ -263,12 +278,14 @@ impl JobStore {
         serde_json::from_slice(&body).with_context(|| format!("failed to read {}", path.display()))
     }
 
-    /// The worker's heartbeat: refresh `updated_at` and record its pid. Only a
-    /// running record is touched, so a beat can never undo an outcome.
-    pub(crate) fn beat(&self, id: &str) -> Result<()> {
+    /// The worker's heartbeat: refresh `updated_at`, record its pid and the
+    /// run's counts so far. Only a running record is touched, so a beat can
+    /// never undo an outcome.
+    pub(crate) fn beat(&self, id: &str, tally: &Tally) -> Result<()> {
         let mut record = self.read(id)?;
         if record.state == JobState::Running {
             record.pid = Some(std::process::id());
+            record.count(tally);
             self.save(&mut record)?;
         }
         Ok(())
@@ -382,6 +399,7 @@ pub(crate) fn start_detached(
         pid: None,
         created_at: now_secs(),
         updated_at: now_secs(),
+        files: 0,
         downloaded: 0,
         failed: 0,
         bytes: 0,
@@ -563,7 +581,7 @@ pub(crate) async fn cmd_jobs(command: JobsCommand, ui: Output, state: &StdPath) 
                         job.id,
                         state_label(job.state),
                         job.downloaded,
-                        job.downloaded + job.failed,
+                        job.files,
                         job.path
                     );
                 }
@@ -679,7 +697,9 @@ pub(crate) async fn run_worker(
     // cancel request. A cancel ends the process at the next check, which leaves
     // the partial in place — the resume machinery already treats a torn
     // partial as a valid resume point.
+    let tally = Arc::new(Tally::default());
     let watcher = {
+        let tally = tally.clone();
         let store_id = id.clone();
         let store_root = store.root().to_path_buf();
         tokio::spawn(async move {
@@ -698,7 +718,7 @@ pub(crate) async fn run_worker(
                     // is worth waiting for.
                     std::process::exit(crate::output::EXIT_OK.into());
                 }
-                let _ = store.beat(&store_id);
+                let _ = store.beat(&store_id, &tally);
                 tokio::time::sleep(HEARTBEAT_EVERY).await;
             }
         })
@@ -707,7 +727,7 @@ pub(crate) async fn run_worker(
     // A log is no terminal: narration only, no progress redraws.
     let ui = Output::new(false, true);
     let outcome = match client {
-        Ok(client) => crate::download::cmd_download(&client, args, ui).await,
+        Ok(client) => crate::download::cmd_download(&client, args, ui, &tally).await,
         Err(error) => Err(error),
     };
     // Abort only takes effect at the watcher's next await; wait for it, so no
@@ -718,12 +738,11 @@ pub(crate) async fn run_worker(
     store.clear_cancel(&id);
 
     let mut record = store.read(&id)?;
+    // Failed or not, the record keeps what the run got done.
+    record.count(&tally);
     match outcome {
         Ok(summary) => {
             record.state = JobState::Succeeded;
-            record.downloaded = summary.downloaded;
-            record.failed = summary.failed;
-            record.bytes = summary.bytes;
             record.error = None;
             record.exit_code = Some(crate::output::EXIT_OK);
             store.save(&mut record)?;

@@ -18,6 +18,7 @@ fn record(id: &str, state: JobState, updated_at: u64) -> JobRecord {
         pid: Some(4242),
         created_at: updated_at,
         updated_at,
+        files: 1,
         downloaded: 1,
         failed: 0,
         bytes: 10,
@@ -232,16 +233,25 @@ fn a_heartbeat_keeps_a_stalled_worker_running_and_never_undoes_an_outcome() {
     store
         .create(&record("1-000001", JobState::Running, old))
         .unwrap();
-    store.beat("1-000001").unwrap();
+    let tally = Tally::default();
+    tally.files.store(3, Ordering::Relaxed);
+    tally.downloaded.store(2, Ordering::Relaxed);
+    tally.bytes.store(4096, Ordering::Relaxed);
+    store.beat("1-000001", &tally).unwrap();
     let revived = store.get("1-000001").unwrap();
     assert_eq!(revived.state, JobState::Running);
     assert_eq!(revived.pid, Some(std::process::id()));
+    // ...and carries the run's counts so far.
+    assert_eq!(
+        (revived.files, revived.downloaded, revived.bytes),
+        (3, 2, 4096)
+    );
 
     // A beat after the outcome was written leaves the outcome alone.
     store
         .create(&record("2-000002", JobState::Succeeded, old))
         .unwrap();
-    store.beat("2-000002").unwrap();
+    store.beat("2-000002", &tally).unwrap();
     let done = store.get("2-000002").unwrap();
     assert_eq!(done.state, JobState::Succeeded);
     assert_eq!(done.updated_at, old);
