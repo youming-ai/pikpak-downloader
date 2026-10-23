@@ -1,14 +1,13 @@
 use std::io::IsTerminal;
-use std::path::{Path as StdPath, PathBuf};
+use std::path::Path as StdPath;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use humansize::{format_size, BINARY};
 use tracing_subscriber::EnvFilter;
 
+use env_file::TokenHome;
 use pikpak::auth::OAuthCredentials;
 use pikpak::{Client, FileKind};
 use serde::Serialize;
@@ -114,17 +113,10 @@ struct QuotaArgs {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    // Record whether the token came from the real environment *before* dotenvy
-    // can supply it from a file: only the file-loaded case can be written back.
-    // dotenvy never overrides variables already present, so a token taken from
-    // the environment must not be persisted into an unrelated `.env`.
+    // Read before dotenvy can supply the token from a file; see `locate`.
     let token_from_env = std::env::var_os("PIKPAK_REFRESH_TOKEN").is_some();
     let loaded_env = dotenvy::dotenv().ok();
-    let env_path = if token_from_env {
-        None
-    } else {
-        env_file::env_file_for_persistence(loaded_env.as_deref(), StdPath::new(".env"))
-    };
+    let home = TokenHome::locate(token_from_env, loaded_env.as_deref(), StdPath::new(".env"));
 
     let state = jobs::state_dir(loaded_env.as_deref());
 
@@ -165,7 +157,7 @@ async fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
 
-    match run(cli, env_path, &state, output).await {
+    match run(cli, home, &state, output).await {
         Ok(result) => {
             output.ok(command, &result);
             ExitCode::from(output::EXIT_OK)
@@ -180,19 +172,11 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(
-    cli: Cli,
-    env_path: Option<PathBuf>,
-    state: &StdPath,
-    output: output::Output,
-) -> Result<Value> {
-    // Set by the rotation hook when a rotation happened that could not be
-    // written anywhere, so the run can end with a nudge about it.
-    let rotated_unpersisted = Arc::new(AtomicBool::new(false));
+async fn run(cli: Cli, home: TokenHome, state: &StdPath, output: output::Output) -> Result<Value> {
     // Built per command rather than up front: `jobs` needs no credentials, and
     // asking what is already running should not fail because the token has since
     // been rotated away.
-    let client = || build_client(env_path.as_deref(), rotated_unpersisted.clone());
+    let client = || build_client(&home);
     let verbose = cli.verbose;
     // Every command hands back its result; `main` alone turns it into the one
     // document stdout carries.
@@ -202,14 +186,8 @@ async fn run(
             // Fail here rather than start a job that cannot authenticate.
             Command::Download(args) if args.detach => {
                 validate_refresh_token(std::env::var("PIKPAK_REFRESH_TOKEN").ok())?;
-                let token_from_file = env_path.is_some();
-                document(jobs::start_detached(
-                    &args,
-                    output,
-                    token_from_file,
-                    verbose,
-                    state,
-                )?)
+                let detached = jobs::start_detached(&args, output, home.is_file(), verbose, state)?;
+                document(detached)
             }
             Command::Download(args) => {
                 document(download::cmd_download(&client()?, args, output).await?)
@@ -220,7 +198,7 @@ async fn run(
         }
     }
     .await;
-    if let Some(note) = rotation_reminder(rotated_unpersisted.load(Ordering::SeqCst)) {
+    if let Some(note) = home.reminder() {
         eprintln!("{note}");
     }
     result
@@ -229,20 +207,6 @@ async fn run(
 /// A command's result as the JSON value `main` reports.
 fn document(result: impl Serialize) -> Result<Value> {
     Ok(serde_json::to_value(result)?)
-}
-
-/// The end-of-run nudge for a rotation that could not be persisted anywhere.
-///
-/// The rotation hook already printed the replacement token when it happened;
-/// this is the last line for a user whose terminal has scrolled past it. Only
-/// the environment-sourced case needs it — with a `.env`, the rotation is
-/// persisted as it happens.
-fn rotation_reminder(unpersisted_rotation: bool) -> Option<&'static str> {
-    unpersisted_rotation.then_some(
-        "PIKPAK_REFRESH_TOKEN came from your environment, so the rotated replacement printed \
-         above could not be saved automatically. Update your environment with it — or put the \
-         token in a .env file, where every rotation is persisted for you.",
-    )
 }
 
 /// Validate the configured refresh token.
@@ -263,29 +227,20 @@ fn validate_refresh_token(value: Option<String>) -> Result<String> {
     }
 }
 
-fn build_client(
-    env_path: Option<&StdPath>,
-    rotated_unpersisted: Arc<AtomicBool>,
-) -> Result<Client> {
+fn build_client(home: &TokenHome) -> Result<Client> {
     let refresh_token = validate_refresh_token(std::env::var("PIKPAK_REFRESH_TOKEN").ok())?;
 
-    let device_id = env_file::device_id(env_path, &refresh_token);
-    let env_path = env_path.map(StdPath::to_path_buf);
-    let source_path = env_path.clone();
+    let device_id = home.device_id(&refresh_token);
+    let (rotations, source) = (home.clone(), home.clone());
     let mut builder = Client::builder()
         .refresh_token(refresh_token)
         // Persist the moment the server rotates, not when the command ends: a
         // long download can be interrupted at any point, and by then the
         // previous refresh token is already invalid server-side.
-        .on_refresh_token(move |token| {
-            if env_path.is_none() {
-                rotated_unpersisted.store(true, Ordering::SeqCst);
-            }
-            env_file::persist_rotated_token(env_path.as_deref(), token);
-        })
+        .on_refresh_token(move |token| rotations.persist(token))
         // If another process rotated the token first, the replacement it saved is
         // the one that still works — pick it up rather than failing the run.
-        .refresh_token_source(move || env_file::read_env_token(source_path.as_deref()));
+        .refresh_token_source(move || source.reload());
 
     if let Some(id) = device_id {
         builder = builder.device_id(id);
@@ -500,17 +455,6 @@ mod tests {
                 (crate::output::EXIT_AUTH, "auth")
             );
         }
-    }
-
-    #[test]
-    fn rotation_reminder_only_fires_when_nothing_was_persisted() {
-        let note = super::rotation_reminder(true).expect("must remind");
-        assert!(note.contains("could not be saved automatically"), "{note}");
-        assert!(note.contains(".env"), "{note}");
-        assert!(
-            super::rotation_reminder(false).is_none(),
-            "a persisted rotation (the .env case) must not nag"
-        );
     }
 
     #[test]
