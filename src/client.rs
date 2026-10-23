@@ -324,12 +324,17 @@ impl Client {
         // 401 and captcha-expiry each get one targeted retry; transient
         // network failures and 5xx/429 get bounded exponential-backoff retries.
         let mut auth_retried = false;
-        let mut captcha_retried = false;
+        // The captcha the server reported expired, once it has; asking with it
+        // gets a fresh one.
+        let mut expired_captcha: Option<String> = None;
         let mut net_retries: u32 = 0;
 
         loop {
             let access = self.tokens.access_token().await?;
-            let captcha = self.captcha.token_for(action).await?;
+            let captcha = self
+                .captcha
+                .token(action, expired_captcha.as_deref())
+                .await?;
 
             let send = self
                 .http
@@ -380,21 +385,12 @@ impl Client {
                 continue;
             }
 
-            if !captcha_retried {
-                if let Ok(err) = serde_json::from_str::<ApiError>(&text) {
-                    if err.error_code == 9 {
-                        tracing::debug!(
-                            action = %action,
-                            "captcha expired, refreshing and retrying"
-                        );
-                        captcha_retried = true;
-                        let prev = captcha.clone();
-                        // The refreshed token is re-read from the cache on the
-                        // next iteration; only the side effect matters here.
-                        self.captcha.refresh(action, Some(&prev)).await?;
-                        continue;
-                    }
-                }
+            if expired_captcha.is_none()
+                && serde_json::from_str::<ApiError>(&text).is_ok_and(|err| err.error_code == 9)
+            {
+                tracing::debug!(action = %action, "captcha expired, refreshing and retrying");
+                expired_captcha = Some(captcha);
+                continue;
             }
 
             // Server-side transient failures (5xx, 429) are worth a backoff retry.
