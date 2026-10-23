@@ -276,19 +276,11 @@ impl Client {
         &self.tokens
     }
 
-    /// Return the HTTP client used for API calls.
+    /// The HTTP client used for file **content** transfers.
     ///
-    /// It carries the configured total request deadline. For file content use
-    /// [`download_client`](Self::download_client) instead.
-    pub fn http_client(&self) -> &reqwest::Client {
-        &self.http
-    }
-
-    /// Return the HTTP client used for file **content** transfers.
-    ///
-    /// Unlike [`http_client`](Self::http_client) it has no total deadline, only
-    /// a per-read stall timeout, so a large file is never cut off mid-transfer.
-    pub fn download_client(&self) -> &reqwest::Client {
+    /// Unlike the API client it has no total deadline, only a per-read stall
+    /// timeout, so a large file is never cut off mid-transfer.
+    pub(crate) fn download_client(&self) -> &reqwest::Client {
         &self.download_http
     }
 
@@ -584,9 +576,9 @@ const MAX_NET_RETRIES: u32 = 4;
 /// Exponential backoff for a retry attempt (0-based): `base`, then doubling,
 /// capped at `cap`.
 ///
-/// Shared by the API retries here and the CLI's download retries, which differ
-/// only in their base and cap.
-pub fn exponential_backoff(base: Duration, cap: Duration, attempt: u32) -> Duration {
+/// Shared by the API retries here and the content transfers, which differ only
+/// in their base and cap.
+pub(crate) fn exponential_backoff(base: Duration, cap: Duration, attempt: u32) -> Duration {
     let ms = (base.as_millis() as u64).saturating_mul(1u64 << attempt.min(5));
     Duration::from_millis(ms.min(cap.as_millis() as u64))
 }
@@ -601,7 +593,7 @@ fn backoff_delay(attempt: u32) -> Duration {
 ///
 /// 5xx responses and 429 (Too Many Requests) both mean "try again later";
 /// repeating any other client error unchanged cannot succeed.
-pub fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+pub(crate) fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
 }
 
@@ -611,11 +603,7 @@ pub fn is_retryable_status(status: reqwest::StatusCode) -> bool {
 /// jittered downwards by up to half. The entropy is the clock's sub-second
 /// component: not a quality random source, but sufficient to decorrelate
 /// concurrent retries without taking on a `rand` dependency.
-///
-/// This is public because both the API retries here and the CLI's download
-/// retries use it; the underlying backoff remains deterministic and separately
-/// tested.
-pub fn jittered_backoff(base: Duration) -> Duration {
+pub(crate) fn jittered_backoff(base: Duration) -> Duration {
     let base_ms = base.as_millis() as u64;
     let span = base_ms / 2;
     if span == 0 {
@@ -645,7 +633,7 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Duration {
 }
 
 /// Whether a reqwest error is a transient network condition worth retrying.
-fn is_transient(err: &reqwest::Error) -> bool {
+pub(crate) fn is_transient(err: &reqwest::Error) -> bool {
     err.is_timeout() || err.is_connect() || err.is_request() || err.is_body()
 }
 

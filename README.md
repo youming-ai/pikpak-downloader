@@ -181,25 +181,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("- {} (Kind: {:?}, Size: {} bytes)", file.name, file.kind, file.size);
     }
 
-    // 4. Resolve path and get download URL
-    let path = "/My Pack/video.mp4";
-    let file_info = client.resolve_path_info(path).await?;
-    if file_info.kind.is_file() {
-        let download_info = client.get_download_url(&file_info.id).await?;
-        println!("Download URL: {}", download_info.web_content_link);
+    // 4. Resolve a path and download it, resumably
+    let file = client.resolve_path_info("/My Pack/video.mp4").await?;
+    if file.kind.is_file() {
+        let dest = std::path::Path::new("video.mp4");
+        let part = std::path::Path::new("video.mp4.part");
+        let bytes = client.download_file(&file, dest, part, &|_done, _total| {}).await?;
+        println!("Saved {bytes} bytes");
     }
 
     Ok(())
 }
 ```
 
-- `client.http_client()` for API calls (total request timeout);
-  `client.download_client()` for file content — no total deadline, only a
-  per-read stall timeout, so large transfers are not cut off.
+- `download_file` resumes a partial left by an earlier call only while it still
+  matches the remote file, refreshes the time-limited link on each retry, and
+  has no total deadline — only a per-read stall timeout, so large transfers are
+  not cut off.
 - Persist each rotation as it happens with `ClientBuilder::on_refresh_token`;
   recover from another process's rotation with
   `ClientBuilder::refresh_token_source`.
-- The library never writes your files.
+- The library writes only the paths you hand `download_file`; persisting tokens
+  is yours to do.
 
 ## License
 
