@@ -80,7 +80,8 @@ $ pikpak --json quota
   download is cheap. Empty files are always fetched again: a listed size of 0
   may mean the size was not reported. If some files failed, the run emits the
   *failure* document instead, with the counts in `error.message`; there is never
-  a second document on stdout.
+  a second document on stdout. An entry of a kind this tool does not model is
+  refused and counted as one failed file; the rest of the run still downloads.
 
 ## Credentials
 
@@ -130,7 +131,10 @@ Each reports `command` as `jobs.list`, `jobs.status`, `jobs.cancel` or
 
 - **States**: `running`, `succeeded`, `failed`, `cancelled`, `lost`. A `running`
   job whose worker has not beat for ~30s is reported `lost` — never forever
-  running. The worker refreshes `updated_at` every 5s while it is alive.
+  running. The worker refreshes `updated_at` every 5s while it is alive, along
+  with the counts so far: `files` (planned; 0 until planning is done),
+  `downloaded`, `failed` and `bytes`. A finished job keeps its final counts,
+  failed or not.
 - **`jobs wait` exits with the outcome**: `0` succeeded, or the same code a
   synchronous run would have produced (`3` auth, `5` network, …), `9` if it was
   cancelled, `1` if its worker was lost, `8` if your deadline passed first. The record carries the worker's
