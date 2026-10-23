@@ -4,9 +4,10 @@
 PikPak from the terminal. Listing, quota and downloading, as a CLI or a Rust
 library. Captcha signing and refresh-token rotation are handled for you.
 
-- **Resumable + concurrent.** `.part` + `Range` — resumed only while the partial
-  still matches the remote file (id/size/mtime) — jittered backoff, `-j N` trees,
-  and a transfer is never finalized short of the reported size.
+- **Resumable + concurrent.** Partials kept by file id in `<output>/.pikpak-parts`,
+  resumed with `Range` only while they still match the remote file
+  (id/size/mtime); jittered backoff, `-j N` trees, and a transfer is never
+  finalized short of the reported size.
 - **Defensive.** Server names are sanitized (traversal, `..`, Windows `CON`/`NUL`)
   and each file is renamed into place only once it is complete.
 - **Automatic.** Captcha and token rotation; rotated tokens are written back to

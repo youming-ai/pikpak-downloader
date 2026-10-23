@@ -136,9 +136,9 @@ Each reports `command` as `jobs.list`, `jobs.status`, `jobs.cancel` or
   cancelled, `1` if its worker was lost, `8` if your deadline passed first. The record carries the worker's
   own `exit_code` for exactly this.
 - **`jobs cancel` is cooperative**: it drops a marker and the worker exits at its
-  next check (within a few seconds), mid-transfer if need be. The `.part` file
-  is left in place, so re-running the same download resumes from the bytes
-  already written. Cancelling a job
+  next check (within a few seconds), mid-transfer if need be. The partial, under
+  `<output>/.pikpak-parts/`, is left in place, so re-running the same download
+  resumes from the bytes already written. Cancelling a job
   that already finished changes nothing and reports `"cancelled":false` with its
   final state.
 - **`jobs list`/`status`/`cancel` need no credentials** — they only read the

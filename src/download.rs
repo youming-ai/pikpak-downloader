@@ -1,4 +1,4 @@
-//! Downloading: task collection, resumable transfers, retry policy.
+//! Downloading: planning local names, resumable transfers, retry policy.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path as StdPath, PathBuf};
@@ -17,12 +17,11 @@ use pikpak::{
     exponential_backoff, is_drive_root, is_retryable_status, jittered_backoff, Client, FileKind,
 };
 
-/// One file to fetch, the directory it belongs in, and the local name it gets.
+/// One file to fetch, and the local path it lands at.
 struct DownloadTask {
     file: pikpak::FileInfo,
-    dir: PathBuf,
-    /// Unique within `dir`; see [`NameClaims`].
-    name: String,
+    /// Unique among the run's destinations; see [`NameClaims`].
+    dest: PathBuf,
 }
 
 /// A folder still to be walked, and where its contents belong.
@@ -35,12 +34,12 @@ struct FolderToWalk {
 /// Maximum byte length for a single filesystem path component across common OSes.
 const MAX_COMPONENT_LEN: usize = 255;
 
-/// What a file's download writes beside it, under its name plus these.
-const TEMP_SUFFIXES: [&str; 2] = [".part", ".part.meta"];
-
-/// Longest name a file may claim: its sidecar, the longest temp name, must
-/// still fit in one path component.
-const MAX_FILE_NAME_LEN: usize = MAX_COMPONENT_LEN - ".part.meta".len();
+/// Directory, directly inside the output directory, that holds every transfer
+/// in progress as `<file id>.part` beside its `.part.meta` identity sidecar.
+///
+/// Keyed by id rather than by local name, a partial is found again however the
+/// names are handed out next time, and no remote name can land on one.
+const PARTS_DIR: &str = ".pikpak-parts";
 
 /// Truncate `s` to at most `max_bytes`, ending on a valid UTF-8 character boundary.
 fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
@@ -61,13 +60,8 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
 /// Windows replaces, collide on the local filesystem too. Every entry claims its
 /// local name here before anything is written; a taken name gets a ` (2)`,
 /// ` (3)`, … suffix.
-///
-/// To preserve resumability when listings change order or items are removed,
-/// existing `.part.meta` sidecars in the destination directory are read so that
-/// partially-downloaded files retain their previously claimed names.
 struct NameClaims {
     taken: HashMap<PathBuf, HashSet<String>>,
-    persisted: HashMap<PathBuf, HashMap<String, String>>,
     case_insensitive: bool,
 }
 
@@ -81,49 +75,8 @@ impl NameClaims {
     fn with_case_folding(case_insensitive: bool) -> Self {
         Self {
             taken: HashMap::new(),
-            persisted: HashMap::new(),
             case_insensitive,
         }
-    }
-
-    /// Read `dir`'s sidecars once, and reserve every name they bind before any
-    /// claim is made there: otherwise an entry listed earlier — a remote
-    /// `x.part`, say — could take a name a partial already owns, and its
-    /// download would overwrite that partial.
-    fn ensure_dir_scanned(&mut self, dir: &StdPath) {
-        if self.persisted.contains_key(dir) {
-            return;
-        }
-        let mut id_map = HashMap::new();
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if let Some(dest_name) = name.strip_suffix(".part.meta") {
-                    if let Ok(bytes) = std::fs::read(entry.path()) {
-                        if let Ok(meta) = serde_json::from_slice::<PartIdentity>(&bytes) {
-                            id_map.insert(meta.id, dest_name.to_string());
-                        }
-                    }
-                }
-            }
-        }
-        // Two sidecars whose names overlap (`x` and `x.part`) cannot both be
-        // honoured; the one left out is claimed afresh.
-        let taken = self.taken.entry(dir.to_path_buf()).or_default();
-        let case_insensitive = self.case_insensitive;
-        id_map.retain(|_, name| take(taken, &fold(name, case_insensitive), true));
-        self.persisted.insert(dir.to_path_buf(), id_map);
-    }
-
-    /// Claim a name for a file, retaining its previously bound name if an existing
-    /// `.part.meta` file in `dir` matches `file_id`.
-    fn claim_file(&mut self, dir: &StdPath, file_id: &str, raw: &str) -> Result<String> {
-        self.ensure_dir_scanned(dir);
-        // Reserved for this file by the scan; taking it out hands it over once.
-        if let Some(bound_name) = self.persisted.get_mut(dir).and_then(|m| m.remove(file_id)) {
-            return Ok(bound_name);
-        }
-        self.claim(dir, raw, true)
     }
 
     /// Claim a safe, unused name for the remote `raw` name inside `dir`.
@@ -133,17 +86,11 @@ impl NameClaims {
     /// [`MAX_COMPONENT_LEN`] bytes, truncating the stem without splitting UTF-8
     /// characters.
     fn claim(&mut self, dir: &StdPath, raw: &str, is_file: bool) -> Result<String> {
-        // Folders claim here too, and must not take a partial's name either.
-        self.ensure_dir_scanned(dir);
         let base = safe_component(raw)?;
         let taken = self.taken.entry(dir.to_path_buf()).or_default();
         let case_insensitive = self.case_insensitive;
-        let mut take_name = |name: &str| take(taken, &fold(name, case_insensitive), is_file);
-        let max_len = if is_file {
-            MAX_FILE_NAME_LEN
-        } else {
-            MAX_COMPONENT_LEN
-        };
+        let mut take = |name: &str| taken.insert(fold(name, case_insensitive));
+        let max_len = MAX_COMPONENT_LEN;
 
         // Split stem and extension so suffixes insert before the extension.
         // A leading dot marks a hidden name, not an extension.
@@ -152,12 +99,11 @@ impl NameClaims {
             _ => (base.as_str(), ""),
         };
 
-        let ext = truncate_utf8(raw_ext, max_len.saturating_sub(1));
-        let max_stem = max_len.saturating_sub(ext.len());
-        let stem = truncate_utf8(raw_stem, max_stem);
+        let ext = truncate_utf8(raw_ext, max_len - 1);
+        let stem = truncate_utf8(raw_stem, max_len - ext.len());
 
         let initial = format!("{stem}{ext}");
-        if take_name(&initial) {
+        if take(&initial) {
             return Ok(initial);
         }
 
@@ -166,13 +112,10 @@ impl NameClaims {
             let suffix = format!(" ({n})");
             // An extension long enough to leave no room for the suffix gives
             // way too, or the name would overrun `max_len`.
-            let fit_ext = truncate_utf8(ext, max_len.saturating_sub(suffix.len()));
-            let max_stem = max_len
-                .saturating_sub(fit_ext.len())
-                .saturating_sub(suffix.len());
-            let fit_stem = truncate_utf8(stem, max_stem);
+            let fit_ext = truncate_utf8(ext, max_len - suffix.len());
+            let fit_stem = truncate_utf8(stem, max_len - fit_ext.len() - suffix.len());
             let candidate = format!("{fit_stem}{suffix}{fit_ext}");
-            if take_name(&candidate) {
+            if take(&candidate) {
                 return Ok(candidate);
             }
             n += 1;
@@ -189,63 +132,80 @@ fn fold(name: &str, case_insensitive: bool) -> String {
     }
 }
 
-/// Take `key` — and, for a file, the temp names its download writes beside it —
-/// all or nothing. Otherwise a remote `x.part` would be claimed as the partial
-/// of a remote `x`, and one transfer would delete the other's finished bytes.
-fn take(taken: &mut HashSet<String>, key: &str, is_file: bool) -> bool {
-    let mut names = vec![key.to_string()];
-    if is_file {
-        names.extend(TEMP_SUFFIXES.iter().map(|suffix| format!("{key}{suffix}")));
-    }
-    if names.iter().any(|name| taken.contains(name)) {
-        return false;
-    }
-    taken.extend(names);
-    true
-}
-
-/// A remote entry classified by what downloading it means.
-enum Downloadable {
-    File(pikpak::FileInfo),
-    Folder(pikpak::FileInfo),
-    /// An entry whose kind this crate does not model: refused, not guessed at.
-    Unsupported(String),
-}
-
-/// Classify a remote entry for downloading.
+/// Everything a run will fetch, named before any byte moves.
 ///
-/// The single place that decides what an entry kind means, so the download
-/// paths never repeat the cascade. (The similarly-named `classify` below sorts
-/// *transport errors*; this one sorts remote entries.)
-fn classify_entry(entry: pikpak::FileInfo) -> Downloadable {
-    match entry.kind {
-        FileKind::File => Downloadable::File(entry),
-        FileKind::Folder => Downloadable::Folder(entry),
-        FileKind::Unknown => Downloadable::Unsupported(entry.name),
-    }
+/// Folders are walked breadth-first over an explicit queue, so a deep tree is
+/// bounded by memory rather than the call stack. The whole tree is enumerated —
+/// and its directories created — before any transfer starts, so concurrent
+/// downloads never race on `mkdir`, at the cost of delaying the first byte on
+/// very large trees.
+struct Plan {
+    tasks: Vec<DownloadTask>,
+    folders: VecDeque<FolderToWalk>,
+    claims: NameClaims,
 }
 
-/// Queue `file` for download into `dir` under a freshly claimed name.
-fn push_file(
-    tasks: &mut Vec<DownloadTask>,
-    claims: &mut NameClaims,
-    file: pikpak::FileInfo,
-    dir: &StdPath,
-) -> Result<()> {
-    // The listing name is what the user saw; an entry without one still gets
-    // a stable, unique name instead of failing the whole run.
-    let raw = if file.name.trim().is_empty() {
-        file.id.clone()
-    } else {
-        file.name.clone()
-    };
-    let name = claims.claim_file(dir, &file.id, &raw)?;
-    tasks.push(DownloadTask {
-        file,
-        dir: dir.to_path_buf(),
-        name,
-    });
-    Ok(())
+impl Plan {
+    fn new(output: &StdPath) -> Self {
+        let mut claims = NameClaims::new();
+        // Taken before any remote entry can claim it.
+        claims
+            .claim(output, PARTS_DIR, false)
+            .expect("a constant, safe name");
+        Self {
+            tasks: Vec::new(),
+            folders: VecDeque::new(),
+            claims,
+        }
+    }
+
+    /// Queue `entry` under `dir`: a file to fetch, or a folder to walk.
+    fn add(&mut self, entry: pikpak::FileInfo, dir: &StdPath) -> Result<()> {
+        // The listing name is what the user saw; an entry without one still
+        // gets a stable, unique name instead of failing the whole run.
+        let raw = if entry.name.trim().is_empty() {
+            &entry.id
+        } else {
+            &entry.name
+        };
+        match entry.kind {
+            FileKind::File => {
+                let name = self.claims.claim(dir, raw, true)?;
+                self.tasks.push(DownloadTask {
+                    dest: dir.join(name),
+                    file: entry,
+                });
+            }
+            FileKind::Folder => {
+                let name = self.claims.claim(dir, raw, false)?;
+                self.folders.push_back(FolderToWalk {
+                    dir: dir.join(name),
+                    id: entry.id,
+                    name: entry.name,
+                });
+            }
+            // A kind this crate does not model is refused, not guessed at.
+            FileKind::Unknown => bail!(
+                "refusing to download {:?}: unsupported entry kind reported by the server",
+                entry.name
+            ),
+        }
+        Ok(())
+    }
+
+    /// Walk every queued folder: create its directory, queue its contents.
+    async fn walk(&mut self, client: &Client) -> Result<()> {
+        while let Some(folder) = self.folders.pop_front() {
+            tokio::fs::create_dir_all(&folder.dir)
+                .await
+                .context("failed to create folder")?;
+            eprintln!("Scanning folder: {}", folder.name);
+            for entry in client.list_folder(&folder.id).await? {
+                self.add(entry, &folder.dir)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// What a download run did, as reported in `--json` output.
@@ -274,38 +234,20 @@ pub(crate) async fn cmd_download(
         .await
         .context("failed to create output directory")?;
 
-    // Flatten into tasks, creating the directory tree up front so concurrent
-    // downloads never race on mkdir.
-    let mut tasks: Vec<DownloadTask> = Vec::new();
-    let mut claims = NameClaims::new();
-
+    let mut plan = Plan::new(output);
     if is_drive_root(&args.path) {
-        // The virtual root has no entry of its own, so expand it into its
-        // children instead of resolving a path. Files land directly in the
-        // output directory; folders keep their own subdirectory.
-        for child in client.list_folder("").await.context("list_folder failed")? {
-            match classify_entry(child) {
-                Downloadable::Folder(folder) => {
-                    collect_folder(client, &folder, output, &mut tasks, &mut claims).await?
-                }
-                Downloadable::File(file) => push_file(&mut tasks, &mut claims, file, output)?,
-                Downloadable::Unsupported(name) => bail!(
-                    "refusing to download {name:?}: unsupported entry kind reported by the server"
-                ),
-            }
-        }
+        // The virtual root has no entry of its own: walk it as the output
+        // directory itself, so its files land there and its folders beside them.
+        plan.folders.push_back(FolderToWalk {
+            id: String::new(),
+            name: "/".to_string(),
+            dir: output.to_path_buf(),
+        });
     } else {
-        let info = client.resolve_path_info(&args.path).await?;
-        match classify_entry(info) {
-            Downloadable::Folder(folder) => {
-                collect_folder(client, &folder, output, &mut tasks, &mut claims).await?
-            }
-            Downloadable::File(file) => push_file(&mut tasks, &mut claims, file, output)?,
-            Downloadable::Unsupported(name) => bail!(
-                "refusing to download {name:?}: unsupported entry kind reported by the server"
-            ),
-        }
+        plan.add(client.resolve_path_info(&args.path).await?, output)?;
     }
+    plan.walk(client).await?;
+    let tasks = plan.tasks;
 
     let empty = DownloadSummary {
         output: args.output.clone(),
@@ -320,6 +262,11 @@ pub(crate) async fn cmd_download(
         return Ok(empty);
     }
 
+    let parts = output.join(PARTS_DIR);
+    tokio::fs::create_dir_all(&parts)
+        .await
+        .context("failed to create the partials directory")?;
+
     let jobs = args.jobs.max(1);
     // Live byte-level progress only reads cleanly with a single active
     // transfer; with concurrency we fall back to per-file start/finish lines.
@@ -333,10 +280,10 @@ pub(crate) async fn cmd_download(
     for (index, task) in tasks.into_iter().enumerate() {
         let client = client.clone();
         let sem = sem.clone();
+        let part = parts.join(format!("{}.part", safe_component(&task.file.id)?));
         let handle = set.spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore is never closed");
-            let result =
-                download_file(&client, &task.file, &task.dir, &task.name, show_progress).await;
+            let result = download_file(&client, &task.file, &task.dest, &part, show_progress).await;
             (index, result)
         });
         index_of.insert(handle.id(), index);
@@ -371,6 +318,8 @@ pub(crate) async fn cmd_download(
             }
         }
     }
+    // Gone once nothing is left to resume; kept, with its partials, otherwise.
+    let _ = tokio::fs::remove_dir(&parts).await;
     let first_err = first_err.map(|(_, e)| e);
 
     let summary = DownloadSummary {
@@ -456,14 +405,6 @@ fn sanitize_for_windows(name: &str) -> String {
 enum DlError {
     Retryable(anyhow::Error),
     Fatal(anyhow::Error),
-}
-
-impl DlError {
-    fn into_inner(self) -> anyhow::Error {
-        match self {
-            DlError::Retryable(e) | DlError::Fatal(e) => e,
-        }
-    }
 }
 
 /// Maximum *consecutive non-progressing* attempts per file.
@@ -587,28 +528,27 @@ async fn prepare_part(part_path: &StdPath, expected: &PartIdentity) -> Result<()
     Ok(())
 }
 
-/// Download one file into `output_dir`, resuming a matching partial file and
-/// retrying while the transfer keeps making progress.
+/// Download one file to `dest` through the partial file `part`, resuming a
+/// matching partial and retrying while the transfer keeps making progress.
 ///
-/// On failure the `.part` file and its identity sidecar are deliberately left in
+/// On failure the partial and its identity sidecar are deliberately left in
 /// place: together they form a self-validating resume point, so a later run can
 /// continue instead of starting over. Both are removed once the file is
 /// finalized.
 async fn download_file(
     client: &Client,
     file: &pikpak::FileInfo,
-    output_dir: &StdPath,
-    dest_name: &str,
+    dest: &StdPath,
+    part: &StdPath,
     show_progress: bool,
 ) -> Result<u64> {
+    let name = dest.file_name().unwrap_or_default().to_string_lossy();
     // ponytail: "already complete" means the listed size, not a hash — the
     // listing carries none. A size of 0 may mean "not reported", so an empty
     // file is always fetched again (it costs nothing).
-    let safe_dest_name = safe_component(dest_name)?;
-    let file_path = output_dir.join(&safe_dest_name);
-    if let Ok(meta) = tokio::fs::metadata(&file_path).await {
+    if let Ok(meta) = tokio::fs::metadata(dest).await {
         if meta.is_file() && file.size > 0 && meta.len() == file.size {
-            eprintln!("Skipped (already complete): {safe_dest_name}");
+            eprintln!("Skipped (already complete): {name}");
             return Ok(meta.len());
         }
     }
@@ -622,7 +562,7 @@ async fn download_file(
     if dl.web_content_link.is_empty() {
         return Err(crate::output::Coded {
             code: crate::output::EXIT_REFUSED,
-            message: format!("PikPak returned no download link for {dest_name}"),
+            message: format!("PikPak returned no download link for {name}"),
         }
         .into());
     }
@@ -632,89 +572,74 @@ async fn download_file(
     // why the response models it as an `Option`.
     let expected_size = dl.size.unwrap_or(file.size);
 
-    let mut part = file_path.clone().into_os_string();
-    part.push(".part");
-    let part_path = PathBuf::from(part);
-
     // Never resume bytes that might belong to a different version of the file.
-    prepare_part(&part_path, &PartIdentity::of(file, expected_size)).await?;
+    prepare_part(part, &PartIdentity::of(file, expected_size)).await?;
 
     eprintln!(
-        "Downloading: {} ({})",
-        safe_dest_name,
+        "Downloading: {name} ({})",
         format_size(expected_size, BINARY)
     );
 
     // The download link is time-limited; refresh it on each retry.
-    let mut link = dl.web_content_link.clone();
+    let mut link = dl.web_content_link;
     let mut budget = RetryBudget::new();
-    let mut last_size = part_size(&part_path).await;
+    let mut last_size = part_size(part).await;
     loop {
         let size_before = last_size;
-        match download_attempt(client, &link, expected_size, &part_path, show_progress).await {
+        let e = match download_attempt(client, &link, expected_size, part, show_progress).await {
             Ok(()) => break,
-            Err(err) => {
-                if !matches!(err, DlError::Retryable(_)) {
-                    return Err(err.into_inner())
-                        .with_context(|| format!("failed to download {}", safe_dest_name));
-                }
-                let e = err.into_inner();
-                last_size = part_size(&part_path).await;
-                let Some(base_delay) = budget.record_failure(last_size > size_before) else {
-                    return Err(e)
-                        .with_context(|| format!("failed to download {}", safe_dest_name));
-                };
-                // Spread the wait so workers that failed together do not retry
-                // together; the budget's own arithmetic stays deterministic.
-                let delay = jittered_backoff(base_delay);
-                eprintln!(
-                    "  {}: attempt {} failed ({e:#}); retrying in {:.1}s",
-                    safe_dest_name,
-                    budget.attempts,
-                    delay.as_secs_f64()
-                );
-                tokio::time::sleep(delay).await;
-                // The link is time-limited, so fetch a fresh one for the next try.
-                match client.get_download_url(&file.id).await {
-                    Ok(fresh) if !fresh.web_content_link.is_empty() => {
-                        link = fresh.web_content_link
-                    }
-                    // An empty link is no better than the one we have.
-                    Ok(_) => {}
-                    // A rejected account token cannot be repaired by retrying:
-                    // surface it now instead of spending the whole budget and then
-                    // blaming the CDN status that the stale link produced.
-                    Err(err @ (pikpak::Error::Auth(_) | pikpak::Error::TokenExpired)) => {
-                        return Err(err).with_context(|| {
-                            format!("failed to refresh the download link for {safe_dest_name}")
-                        })
-                    }
-                    // Anything else is a blip in the API call rather than the link
-                    // itself; keep the current link and let the next attempt decide.
-                    Err(err) => {
-                        tracing::debug!(error = %err, "could not refresh the download link")
-                    }
-                }
+            Err(DlError::Fatal(e)) => {
+                return Err(e).with_context(|| format!("failed to download {name}"))
             }
+            Err(DlError::Retryable(e)) => e,
+        };
+        last_size = part_size(part).await;
+        let Some(base_delay) = budget.record_failure(last_size > size_before) else {
+            return Err(e).with_context(|| format!("failed to download {name}"));
+        };
+        // Spread the wait so workers that failed together do not retry
+        // together; the budget's own arithmetic stays deterministic.
+        let delay = jittered_backoff(base_delay);
+        eprintln!(
+            "  {name}: attempt {} failed ({e:#}); retrying in {:.1}s",
+            budget.attempts,
+            delay.as_secs_f64()
+        );
+        tokio::time::sleep(delay).await;
+        // The link is time-limited, so fetch a fresh one for the next try.
+        match client.get_download_url(&file.id).await {
+            Ok(fresh) if !fresh.web_content_link.is_empty() => link = fresh.web_content_link,
+            // An empty link is no better than the one we have.
+            Ok(_) => {}
+            // A rejected account token cannot be repaired by retrying:
+            // surface it now instead of spending the whole budget and then
+            // blaming the CDN status that the stale link produced.
+            Err(err @ (pikpak::Error::Auth(_) | pikpak::Error::TokenExpired)) => {
+                return Err(err)
+                    .with_context(|| format!("failed to refresh the download link for {name}"))
+            }
+            // Anything else is a blip in the API call rather than the link
+            // itself; keep the current link and let the next attempt decide.
+            Err(err) => tracing::debug!(error = %err, "could not refresh the download link"),
         }
     }
 
     // Windows refuses to rename onto an existing path, so re-downloading a name
     // that already exists would fail there; clear the previous copy first.
     #[cfg(windows)]
-    if tokio::fs::try_exists(&file_path).await.unwrap_or(false) {
-        let _ = tokio::fs::remove_file(&file_path).await;
+    if tokio::fs::try_exists(dest).await.unwrap_or(false) {
+        let _ = tokio::fs::remove_file(dest).await;
     }
 
-    tokio::fs::rename(&part_path, &file_path)
+    tokio::fs::rename(part, dest)
         .await
         .context("failed to finalize output file")?;
-    let _ = tokio::fs::remove_file(identity_path(&part_path)).await;
-    eprintln!("Saved: {}", file_path.display());
+    let _ = tokio::fs::remove_file(identity_path(part)).await;
+    eprintln!("Saved: {}", dest.display());
 
     // Report what actually landed rather than what was advertised: a resumed or
     // already-complete file can differ from the size the API claimed.
-    Ok(tokio::fs::metadata(&file_path)
+    Ok(tokio::fs::metadata(dest)
         .await
         .map(|meta| meta.len())
         .unwrap_or(expected_size))
@@ -917,68 +842,6 @@ fn download_backoff(attempt: u32) -> Duration {
     exponential_backoff(Duration::from_millis(500), Duration::from_secs(15), attempt)
 }
 
-/// Walk a remote folder tree, creating local directories and collecting each
-/// file with its destination directory into `tasks`.
-///
-/// The walk is breadth-first over an explicit queue rather than recursive, so a
-/// deeply nested tree is bounded by memory instead of by the call stack. Note
-/// that the whole tree is still enumerated *before* any transfer starts, which
-/// keeps directory creation ahead of the concurrent downloads (they never race
-/// on `mkdir`) at the cost of delaying the first byte on very large trees.
-async fn collect_folder(
-    client: &Client,
-    folder: &pikpak::FileInfo,
-    output_dir: &StdPath,
-    tasks: &mut Vec<DownloadTask>,
-    claims: &mut NameClaims,
-) -> Result<()> {
-    let raw_name = if folder.name.trim().is_empty() {
-        &folder.id
-    } else {
-        &folder.name
-    };
-    let root_name = claims.claim(output_dir, raw_name, false)?;
-    let root_dir = output_dir.join(root_name);
-    let mut queue = VecDeque::from([FolderToWalk {
-        id: folder.id.clone(),
-        name: folder.name.clone(),
-        dir: root_dir,
-    }]);
-
-    while let Some(current) = queue.pop_front() {
-        tokio::fs::create_dir_all(&current.dir)
-            .await
-            .context("failed to create folder")?;
-
-        eprintln!("Scanning folder: {}", current.name);
-
-        for entry in client.list_folder(&current.id).await? {
-            match classify_entry(entry) {
-                Downloadable::Folder(child) => {
-                    let raw = if child.name.trim().is_empty() {
-                        &child.id
-                    } else {
-                        &child.name
-                    };
-                    let child_name = claims.claim(&current.dir, raw, false)?;
-                    queue.push_back(FolderToWalk {
-                        dir: current.dir.join(child_name),
-                        id: child.id,
-                        name: child.name,
-                    });
-                }
-                Downloadable::File(file) => {
-                    push_file(tasks, claims, file, &current.dir)?;
-                }
-                Downloadable::Unsupported(name) => bail!(
-                    "refusing to download {name:?}: unsupported entry kind reported by the server"
-                ),
-            }
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::download_backoff;
@@ -1096,73 +959,26 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_name_never_claims_another_files_temp_names() {
-        let dir = std::path::Path::new("/tmp/test");
-        // Either order: `x.part` must not become the partial of `x`, nor `y`'s
-        // sidecar be a remote file of its own.
-        for order in [["x", "x.part"], ["x.part", "x"]] {
-            let mut claims = super::NameClaims::with_case_folding(false);
-            let names: Vec<String> = order
-                .iter()
-                .map(|raw| claims.claim(dir, raw, true).unwrap())
-                .collect();
-            let (plain, part) = if order[0] == "x" {
-                (&names[0], &names[1])
-            } else {
-                (&names[1], &names[0])
-            };
-            assert_ne!(&format!("{plain}.part"), part, "{names:?}");
-        }
-
-        let mut claims = super::NameClaims::with_case_folding(false);
-        assert_eq!(claims.claim(dir, "y", true).unwrap(), "y");
-        assert_eq!(
-            claims.claim(dir, "y.part.meta", true).unwrap(),
-            "y.part (2).meta"
-        );
-    }
-
-    #[test]
-    fn an_earlier_entry_never_takes_a_partials_persisted_name() {
-        let dir =
-            std::env::temp_dir().join(format!("pikpak-claims-reserve-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // An interrupted download of "x" (id f2) left its partial behind.
-        let meta = super::PartIdentity {
-            id: "f2".to_string(),
-            size: 1024,
-            modified_time: None,
-        };
-        std::fs::write(dir.join("x.part.meta"), serde_json::to_vec(&meta).unwrap()).unwrap();
-
-        let mut claims = super::NameClaims::with_case_folding(false);
-        // Listed first this time, a remote `x.part` must not land on that partial,
-        // and neither may a folder of that name.
-        let fresh = claims.claim_file(&dir, "f1", "x.part").unwrap();
-        assert_ne!(fresh, "x.part");
-        assert_ne!(claims.claim(&dir, "x.part", false).unwrap(), "x.part");
-        // The partial's owner still resumes under its own name.
-        assert_eq!(claims.claim_file(&dir, "f2", "x").unwrap(), "x");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn a_colliding_name_with_a_huge_extension_still_fits() {
         let dir = std::path::Path::new("/tmp/test");
         let mut claims = super::NameClaims::with_case_folding(false);
         let name = format!("a.{}", "x".repeat(243));
         claims.claim(dir, &name, true).unwrap();
         let second = claims.claim(dir, &name, true).unwrap();
-        assert!(second.len() <= super::MAX_FILE_NAME_LEN, "{}", second.len());
+        assert!(second.len() <= super::MAX_COMPONENT_LEN, "{}", second.len());
     }
 
     #[test]
-    fn a_maximal_remote_name_leaves_room_for_its_sidecar() {
-        let dir = std::path::Path::new("/tmp/test");
-        let mut claims = super::NameClaims::with_case_folding(false);
-        let name = claims.claim(dir, &"a".repeat(255), true).unwrap();
-        assert!(name.len() + ".part.meta".len() <= 255, "{}", name.len());
+    fn a_remote_entry_never_takes_the_partials_directory() {
+        let out = std::path::Path::new("/tmp/test");
+        let mut plan = super::Plan::new(out);
+        let mut folder = file_info("p", super::PARTS_DIR, 0);
+        folder.kind = pikpak::FileKind::Folder;
+        plan.add(folder, out).unwrap();
+        assert_eq!(
+            plan.folders[0].dir,
+            out.join(format!("{} (2)", super::PARTS_DIR))
+        );
     }
 
     #[tokio::test]
@@ -1181,9 +997,15 @@ mod tests {
             serde_json::from_str(r#"{"id":"f1","name":"done.bin","size":"4","kind":"drive#file"}"#)
                 .unwrap();
 
-        let size = super::download_file(&client, &file, &dir, "done.bin", false)
-            .await
-            .expect("a complete file is skipped, not fetched");
+        let size = super::download_file(
+            &client,
+            &file,
+            &dir.join("done.bin"),
+            &dir.join("f1.part"),
+            false,
+        )
+        .await
+        .expect("a complete file is skipped, not fetched");
         assert_eq!(size, 4);
         assert_eq!(std::fs::read(dir.join("done.bin")).unwrap(), b"1234");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1194,12 +1016,11 @@ mod tests {
         let dir = std::path::Path::new("/tmp/test");
         let mut claims = super::NameClaims::with_case_folding(false);
 
-        // A 241-byte stem + ".txt" (4 bytes) = 245 bytes (MAX_FILE_NAME_LEN):
-        // room is left for the ".part.meta" sidecar written beside it.
-        let long_stem = "a".repeat(241);
+        // A 251-byte stem + ".txt" (4 bytes) = 255 bytes: exactly the limit.
+        let long_stem = "a".repeat(251);
         let name = format!("{long_stem}.txt");
         let first = claims.claim(dir, &name, true).unwrap();
-        assert_eq!(first.len(), 245);
+        assert_eq!(first.len(), 255);
         assert_eq!(first, name);
 
         // Second colliding file must truncate the stem to keep the total length <= 255 bytes.
@@ -1218,36 +1039,6 @@ mod tests {
         let cjk_second = claims.claim(dir, &cjk_name, true).unwrap();
         assert!(cjk_second.len() <= 255);
         assert!(cjk_second.ends_with(" (2).bin"));
-    }
-
-    #[test]
-    fn name_claims_rebinds_from_persisted_meta_sidecars() {
-        let dir = std::env::temp_dir().join(format!("pikpak-claims-rebind-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        // Simulate an interrupted download where file "d2" was previously assigned "dup (2).bin"
-        let meta = super::PartIdentity {
-            id: "d2".to_string(),
-            size: 1024,
-            modified_time: None,
-        };
-        std::fs::write(
-            dir.join("dup (2).bin.part.meta"),
-            serde_json::to_vec(&meta).unwrap(),
-        )
-        .unwrap();
-
-        let mut claims = super::NameClaims::with_case_folding(false);
-        // Even if file "d2" is claimed first in the next run, it recovers its previously assigned name.
-        let claimed = claims.claim_file(&dir, "d2", "dup.bin").unwrap();
-        assert_eq!(claimed, "dup (2).bin");
-
-        // Another file with the same remote name will not collide with the recovered name.
-        let claimed_other = claims.claim_file(&dir, "d1", "dup.bin").unwrap();
-        assert_eq!(claimed_other, "dup.bin");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     async fn spawn_range_server(full: Vec<u8>) -> std::net::SocketAddr {
@@ -1374,7 +1165,8 @@ mod tests {
             .await
             .unwrap_err();
 
-        let error = super::classify(err, "download request failed").into_inner();
+        let (super::DlError::Retryable(error) | super::DlError::Fatal(error)) =
+            super::classify(err, "download request failed");
         assert_eq!(
             crate::output::exit_code_for(&error),
             (crate::output::EXIT_NETWORK, "network"),
@@ -1927,16 +1719,22 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let file = file_info("f1", "big.bin", 224);
-        std::fs::write(dir.join("big.bin.part"), &content[..32]).unwrap();
+        std::fs::write(dir.join("f1.part"), &content[..32]).unwrap();
         std::fs::write(
-            dir.join("big.bin.part.meta"),
+            dir.join("f1.part.meta"),
             serde_json::to_vec(&super::PartIdentity::of(&file, 224)).unwrap(),
         )
         .unwrap();
 
-        super::download_file(&client, &file, &dir, &file.name, false)
-            .await
-            .expect("a matching partial must resume and finish");
+        super::download_file(
+            &client,
+            &file,
+            &dir.join("big.bin"),
+            &dir.join("f1.part"),
+            false,
+        )
+        .await
+        .expect("a matching partial must resume and finish");
 
         assert_eq!(std::fs::read(dir.join("big.bin")).unwrap(), content);
         assert_eq!(
@@ -1945,7 +1743,7 @@ mod tests {
             "resuming from 32/224 with 64-byte chunks must take three requests"
         );
         assert!(
-            !dir.join("big.bin.part.meta").exists(),
+            !dir.join("f1.part.meta").exists(),
             "the identity sidecar must be cleaned up on success"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1962,22 +1760,28 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pikpak-foreign-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
-        std::fs::write(dir.join("big.bin.part"), [0xAAu8; 32]).unwrap();
+        std::fs::write(dir.join("f1.part"), [0xAAu8; 32]).unwrap();
         let other = super::PartIdentity {
             id: "some-other-entry".to_string(),
             size: 999,
             modified_time: None,
         };
         std::fs::write(
-            dir.join("big.bin.part.meta"),
+            dir.join("f1.part.meta"),
             serde_json::to_vec(&other).unwrap(),
         )
         .unwrap();
 
         let file = file_info("f1", "big.bin", 224);
-        super::download_file(&client, &file, &dir, &file.name, false)
-            .await
-            .expect("a foreign partial must be discarded and the file re-fetched");
+        super::download_file(
+            &client,
+            &file,
+            &dir.join("big.bin"),
+            &dir.join("f1.part"),
+            false,
+        )
+        .await
+        .expect("a foreign partial must be discarded and the file re-fetched");
 
         assert_eq!(
             std::fs::read(dir.join("big.bin")).unwrap(),
@@ -2003,12 +1807,18 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pikpak-nometa-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
-        std::fs::write(dir.join("big.bin.part"), [0xAAu8; 32]).unwrap();
+        std::fs::write(dir.join("f1.part"), [0xAAu8; 32]).unwrap();
 
         let file = file_info("f1", "big.bin", 224);
-        super::download_file(&client, &file, &dir, &file.name, false)
-            .await
-            .expect("a partial without an identity must be refetched");
+        super::download_file(
+            &client,
+            &file,
+            &dir.join("big.bin"),
+            &dir.join("f1.part"),
+            false,
+        )
+        .await
+        .expect("a partial without an identity must be refetched");
 
         assert_eq!(std::fs::read(dir.join("big.bin")).unwrap(), content);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2029,9 +1839,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let file = file_info("f1", "big.bin", 224);
-        super::download_file(&client, &file, &dir, &file.name, false)
-            .await
-            .expect("a file that keeps advancing must finish");
+        super::download_file(
+            &client,
+            &file,
+            &dir.join("big.bin"),
+            &dir.join("f1.part"),
+            false,
+        )
+        .await
+        .expect("a file that keeps advancing must finish");
 
         assert_eq!(std::fs::read(dir.join("big.bin")).unwrap(), content);
         assert!(
@@ -2055,7 +1871,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let file = file_info("f1", "big.bin", 32);
-        let res = super::download_file(&client, &file, &dir, &file.name, false).await;
+        let res = super::download_file(
+            &client,
+            &file,
+            &dir.join("big.bin"),
+            &dir.join("f1.part"),
+            false,
+        )
+        .await;
         assert!(res.is_err(), "a server that never advances must fail");
         assert_eq!(
             hits.load(std::sync::atomic::Ordering::SeqCst),
@@ -2140,12 +1963,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pikpak-unknown-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        let mut folder = file_info("U", "weird-dir", 0);
-        folder.kind = pikpak::FileKind::Folder;
-
-        let mut tasks = Vec::new();
-        let mut claims = super::NameClaims::new();
-        let err = super::collect_folder(&client, &folder, &dir, &mut tasks, &mut claims)
+        let mut plan = super::Plan::new(&dir);
+        plan.folders.push_back(super::FolderToWalk {
+            id: "U".to_string(),
+            name: "weird-dir".to_string(),
+            dir: dir.join("weird-dir"),
+        });
+        let err = plan
+            .walk(&client)
             .await
             .expect_err("an unknown entry kind must be refused");
 
@@ -2302,9 +2127,15 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
 
             let file = file_info("f1", "big.bin", content.len() as u64);
-            super::download_file(&client, &file, &dir, &file.name, false)
-                .await
-                .unwrap_or_else(|e| panic!("{expired_status} must be retried: {e:#}"));
+            super::download_file(
+                &client,
+                &file,
+                &dir.join("big.bin"),
+                &dir.join("f1.part"),
+                false,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{expired_status} must be retried: {e:#}"));
 
             assert_eq!(std::fs::read(dir.join("big.bin")).unwrap(), content);
             assert!(
@@ -2331,9 +2162,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let file = file_info("f1", "big.bin", content.len() as u64);
-        let err = super::download_file(&client, &file, &dir, &file.name, false)
-            .await
-            .expect_err("a rejected token must fail the download");
+        let err = super::download_file(
+            &client,
+            &file,
+            &dir.join("big.bin"),
+            &dir.join("f1.part"),
+            false,
+        )
+        .await
+        .expect_err("a rejected token must fail the download");
 
         let text = format!("{err:#}");
         assert!(text.contains("invalid_grant"), "{text}");
@@ -2415,10 +2252,7 @@ mod tests {
             .unwrap()
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
-            .filter(|path| {
-                let name = path.file_name().unwrap().to_string_lossy();
-                path.is_file() && !name.ends_with(".part") && !name.ends_with(".meta")
-            })
+            .filter(|path| path.is_file())
             .map(|path| std::fs::read(path).unwrap())
             .collect();
         contents.sort();
@@ -2465,5 +2299,56 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&out);
         }
+    }
+
+    #[tokio::test]
+    async fn a_partial_resumes_whatever_name_its_file_is_given() {
+        // The partial of `d2` was left by a run that named it `dup (2).bin`.
+        // Listed first this time, `d2` is named `dup.bin` — its partial is
+        // still its own, found by id, and nothing else can claim it.
+        let one = vec![1u8; 32];
+        let two = vec![2u8; 48];
+        let addr = spawn_named_files_server(vec![
+            ("d2", "dup.bin", two.clone()),
+            ("d1", "dup.bin", one.clone()),
+        ])
+        .await;
+        let client = mock_client(addr);
+        let out = std::env::temp_dir().join(format!("pikpak-part-by-id-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        let parts = out.join(super::PARTS_DIR);
+        std::fs::create_dir_all(&parts).unwrap();
+        std::fs::write(parts.join("d2.part"), &two[..16]).unwrap();
+        let identity = super::PartIdentity {
+            id: "d2".to_string(),
+            size: 48,
+            modified_time: None,
+        };
+        std::fs::write(
+            parts.join("d2.part.meta"),
+            serde_json::to_vec(&identity).unwrap(),
+        )
+        .unwrap();
+
+        super::cmd_download(
+            &client,
+            crate::DownloadArgs {
+                path: "/dir".to_string(),
+                output: out.to_string_lossy().into_owned(),
+                jobs: 1,
+                detach: false,
+            },
+            crate::output::Output::new(false, false),
+        )
+        .await
+        .expect("both files must download");
+
+        assert_eq!(std::fs::read(out.join("dir").join("dup.bin")).unwrap(), two);
+        assert_eq!(
+            std::fs::read(out.join("dir").join("dup (2).bin")).unwrap(),
+            one
+        );
+        assert!(!parts.exists(), "an emptied partials directory is removed");
+        let _ = std::fs::remove_dir_all(&out);
     }
 }
