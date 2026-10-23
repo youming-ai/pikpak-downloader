@@ -9,15 +9,13 @@ pub mod auth;
 pub mod captcha;
 pub mod client;
 pub mod error;
+mod transfer;
 pub mod types;
 
 /// Primitives shared by this crate's hand-rolled HTTP mocks.
 #[cfg(test)]
 pub(crate) mod test_http;
 
-pub use client::{
-    device_id_from, exponential_backoff, is_drive_root, is_retryable_status, jittered_backoff,
-    Client, ClientBuilder, DownloadInfo,
-};
+pub use client::{device_id_from, is_drive_root, Client, ClientBuilder, DownloadInfo};
 pub use error::{Error, Result};
 pub use types::{FileInfo, FileKind, Quota};

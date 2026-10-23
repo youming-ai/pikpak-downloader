@@ -15,7 +15,6 @@
 use anyhow::Error as AnyError;
 use serde::Serialize;
 use serde_json::Value;
-use std::fmt::Display;
 
 /// The run succeeded.
 pub const EXIT_OK: u8 = 0;
@@ -49,10 +48,8 @@ pub struct Timeout(pub String);
 #[error("{0}")]
 pub struct Missing(pub String);
 
-/// A failure that already knows its exit code, where the generic mapping would
-/// guess wrong: a detached job read back from disk (so `jobs wait` reports what
-/// a synchronous run would have), or a CDN status, which carries none of the
-/// account-level meaning the same status has on the API.
+/// A failure that already knows its exit code: a detached job read back from
+/// disk, so `jobs wait` reports what a synchronous run would have.
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub struct Coded {
@@ -103,18 +100,12 @@ impl Output {
         !self.no_progress && jobs == 1
     }
 
-    /// Narration. Goes to stderr in both modes.
-    pub fn note(self, message: impl Display) {
-        eprintln!("{message}");
-    }
-
     /// The result document. Printed only in JSON mode — the human-readable data
     /// has already been written by the command itself.
-    pub fn ok<T: Serialize>(self, command: &str, result: &T) -> anyhow::Result<()> {
+    pub fn ok<T: Serialize>(self, command: &str, result: &T) {
         if self.json {
             self.print(result_document(command, result));
         }
-        Ok(())
     }
 
     /// The failure document, so a caller that parses stdout gets JSON even when
@@ -183,7 +174,17 @@ fn code_for(error: &AnyError) -> u8 {
         return match source {
             Error::Auth(_) | Error::TokenExpired | Error::NotConfigured(_) => EXIT_AUTH,
             Error::NotFound { .. } => EXIT_NOT_FOUND,
-            Error::Http(_) => EXIT_NETWORK,
+            Error::Http(_) | Error::Incomplete { .. } => EXIT_NETWORK,
+            Error::NoDownloadLink(_) => EXIT_REFUSED,
+            Error::Io { .. } => EXIT_IO,
+            // A CDN status carries none of the account-level meaning the same
+            // status has on the API: a 401/403 is the signed link refusing us,
+            // so a new token would not help.
+            Error::Transfer { status, .. } => match *status {
+                404 => EXIT_NOT_FOUND,
+                429 | 500.. => EXIT_NETWORK,
+                _ => EXIT_REFUSED,
+            },
             Error::Api { status, .. } => match *status {
                 401 | 403 => EXIT_AUTH,
                 404 => EXIT_NOT_FOUND,
@@ -284,6 +285,41 @@ mod tests {
         assert_eq!(
             code(Error::InvalidPath("empty")),
             (EXIT_UNEXPECTED, "unexpected")
+        );
+    }
+
+    #[test]
+    fn a_transfer_failure_maps_to_what_fixes_it_not_to_the_api_meaning() {
+        let transfer = |status| {
+            code(Error::Transfer {
+                status,
+                message: String::new(),
+            })
+        };
+        assert_eq!(transfer(503), (EXIT_NETWORK, "network"));
+        assert_eq!(transfer(429), (EXIT_NETWORK, "network"));
+        assert_eq!(transfer(404), (EXIT_NOT_FOUND, "not_found"));
+        // A stale signed link, not a rejected account token: no `auth`.
+        assert_eq!(transfer(403), (EXIT_REFUSED, "refused"));
+        assert_eq!(transfer(401), (EXIT_REFUSED, "refused"));
+        assert_eq!(
+            code(Error::NoDownloadLink("x".into())),
+            (EXIT_REFUSED, "refused")
+        );
+        assert_eq!(
+            code(Error::Incomplete {
+                received: 1,
+                expected: 2
+            }),
+            (EXIT_NETWORK, "network")
+        );
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        assert_eq!(
+            code(Error::Io {
+                context: "failed to write output file",
+                source: io
+            }),
+            (EXIT_IO, "io")
         );
     }
 

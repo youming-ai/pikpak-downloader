@@ -10,21 +10,21 @@
 //! endpoints when the current token has expired, at which point the
 //! client must re-init and retry.
 //!
-//! This implementation caches the token per-action (the captcha is bound
-//! to the request method + path it was issued for) and transparently
-//! re-inits when the cached one stops working.
+//! This implementation caches the token per action (the captcha is bound
+//! to the request method + path it was issued for) and re-inits when the
+//! cached one is stale or the caller reports it rejected.
 //!
 //! The MD5 chain algorithm and salt table come from the upstream
 //! `pikpakcli` project. See `cmd/pikpakcli/internal/pikpak/captcha_token.go`
 //! in that repo.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use md5::{Digest, Md5};
 use serde::Deserialize;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 
 use crate::auth::TokenManager;
 use crate::error::{Error, Result};
@@ -70,19 +70,18 @@ struct CaptchaManagerInner {
     client_id: String,
     device_id: String,
     tokens: TokenManager,
-    /// Cache of (action -> cached captcha).
-    cache: RwLock<HashMap<String, CachedCaptcha>>,
-    /// One lock per action.
+    /// One slot per action, holding that action's cached token.
     ///
-    /// Refreshes of the same action must collapse into a single init request,
-    /// but a refresh of one action must not stall another action's request for a
-    /// different token — and it must never block cache reads. Holding a lock per
-    /// action (rather than the cache lock itself) across the network call gives
-    /// exactly that; the map is bounded by the handful of actions in use.
-    action_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// A slot stays locked across its init request, so a burst of workers
+    /// needing the same action collapses into one request, while every other
+    /// action — reads and refreshes alike — proceeds in parallel. The map's own
+    /// lock is never held across an await; it is bounded by the handful of
+    /// actions in use.
+    slots: std::sync::Mutex<HashMap<String, Slot>>,
 }
 
-#[derive(Clone)]
+type Slot = Arc<Mutex<Option<CachedCaptcha>>>;
+
 struct CachedCaptcha {
     token: String,
     refresh_after: Instant,
@@ -103,46 +102,46 @@ impl CaptchaManager {
                 client_id: client_id.into(),
                 device_id: device_id.into(),
                 tokens,
-                cache: RwLock::new(HashMap::new()),
-                action_locks: Mutex::new(HashMap::new()),
+                slots: std::sync::Mutex::default(),
             }),
         }
     }
 
-    /// Return a captcha token for the given action (e.g. `"GET:/drive/v1/files"`).
-    pub(crate) async fn token_for(&self, action: &str) -> Result<String> {
-        if let Some(token) = self.cached_token(action, None).await {
-            return Ok(token);
+    /// A captcha token for `action` (e.g. `"GET:/drive/v1/files"`): the cached
+    /// one while it is fresh, else a new one.
+    ///
+    /// `rejected` names a token the server just refused; a cached token equal
+    /// to it is replaced rather than handed back, and the server is told which
+    /// token it supersedes.
+    pub(crate) async fn token(&self, action: &str, rejected: Option<&str>) -> Result<String> {
+        let slot = self.slot(action);
+        let mut cached = slot.lock().await;
+        if let Some(entry) = cached.as_ref() {
+            if Instant::now() < entry.refresh_after && rejected != Some(entry.token.as_str()) {
+                return Ok(entry.token.clone());
+            }
         }
-        self.refresh(action, None).await
+        let token = self.init(action, rejected).await?;
+        *cached = Some(CachedCaptcha {
+            token: token.clone(),
+            refresh_after: Instant::now() + PROACTIVE_REFRESH,
+        });
+        Ok(token)
     }
 
-    /// Force a fresh captcha token for the given action. Optionally pass the
-    /// previous token so the server can invalidate it. Returns the new token.
-    ///
-    /// Only refreshes of the *same* action wait for each other, so a burst of
-    /// workers still collapses into one init request. Different actions — and
-    /// every cache read — proceed in parallel: the network call is never made
-    /// while holding the shared cache lock.
-    pub(crate) async fn refresh(&self, action: &str, previous: Option<&str>) -> Result<String> {
-        let action_lock = self
-            .inner
-            .action_locks
+    /// The slot for `action`, created on first use.
+    fn slot(&self, action: &str) -> Slot {
+        self.inner
+            .slots
             .lock()
-            .await
+            .unwrap_or_else(PoisonError::into_inner)
             .entry(action.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
-        let _guard = action_lock.lock().await;
+            .or_default()
+            .clone()
+    }
 
-        // Re-check under the action lock: another task may have refreshed while
-        // we were waiting. If `previous` is supplied and the cached token is
-        // still the one that just failed, force a real refresh instead of
-        // handing back the known-bad token.
-        if let Some(token) = self.cached_token(action, previous).await {
-            return Ok(token);
-        }
-
+    /// Ask the server for a new token for `action`, superseding `previous`.
+    async fn init(&self, action: &str, previous: Option<&str>) -> Result<String> {
         let user_id = self.inner.tokens.user_id().await?;
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -196,32 +195,7 @@ impl CaptchaManager {
         }
 
         let parsed: CaptchaInitResponse = resp.json().await?;
-        let cached = CachedCaptcha {
-            token: parsed.captcha_token.clone(),
-            refresh_after: Instant::now() + PROACTIVE_REFRESH,
-        };
-        self.inner
-            .cache
-            .write()
-            .await
-            .insert(action.to_string(), cached);
         Ok(parsed.captcha_token)
-    }
-
-    /// Return a usable cached token for `action`, if there is one.
-    ///
-    /// When `previous` is supplied, a cached entry equal to it counts as
-    /// unusable: the caller is telling us that exact token just failed.
-    async fn cached_token(&self, action: &str, previous: Option<&str>) -> Option<String> {
-        let cache = self.inner.cache.read().await;
-        let entry = cache.get(action)?;
-        if Instant::now() >= entry.refresh_after {
-            return None;
-        }
-        if previous.is_some_and(|prev| prev == entry.token) {
-            return None;
-        }
-        Some(entry.token.clone())
     }
 }
 
@@ -373,6 +347,7 @@ mod tests {
             crate::auth::OAuthCredentials::default(),
             "device-1",
             "initial-token",
+            crate::auth::TokenHooks::default(),
         );
         CaptchaManager::new(
             http,
@@ -384,13 +359,10 @@ mod tests {
     }
 
     async fn cache_token(manager: &CaptchaManager, action: &str, token: &str) {
-        manager.inner.cache.write().await.insert(
-            action.to_string(),
-            CachedCaptcha {
-                token: token.to_string(),
-                refresh_after: Instant::now() + PROACTIVE_REFRESH,
-            },
-        );
+        *manager.slot(action).lock().await = Some(CachedCaptcha {
+            token: token.to_string(),
+            refresh_after: Instant::now() + PROACTIVE_REFRESH,
+        });
     }
 
     #[tokio::test]
@@ -401,7 +373,7 @@ mod tests {
 
         let slow = {
             let manager = manager.clone();
-            tokio::spawn(async move { manager.token_for(SLOW_ACTION).await })
+            tokio::spawn(async move { manager.token(SLOW_ACTION, None).await })
         };
         tokio::time::timeout(Duration::from_secs(5), server.slow_started.notified())
             .await
@@ -409,8 +381,11 @@ mod tests {
 
         // The refresh is provably in flight here; a cached read for a different
         // action must still complete without waiting for it.
-        let other =
-            tokio::time::timeout(Duration::from_millis(300), manager.token_for("GET:/other")).await;
+        let other = tokio::time::timeout(
+            Duration::from_millis(300),
+            manager.token("GET:/other", None),
+        )
+        .await;
         server.release_slow.notify_one();
 
         assert_eq!(
@@ -429,15 +404,18 @@ mod tests {
 
         let slow = {
             let manager = manager.clone();
-            tokio::spawn(async move { manager.token_for(SLOW_ACTION).await })
+            tokio::spawn(async move { manager.token(SLOW_ACTION, None).await })
         };
         tokio::time::timeout(Duration::from_secs(5), server.slow_started.notified())
             .await
             .expect("the slow refresh should reach the server");
 
         // A *miss* for a different action must also proceed in parallel.
-        let other =
-            tokio::time::timeout(Duration::from_millis(300), manager.token_for("GET:/other")).await;
+        let other = tokio::time::timeout(
+            Duration::from_millis(300),
+            manager.token("GET:/other", None),
+        )
+        .await;
         server.release_slow.notify_one();
 
         assert_eq!(
@@ -459,7 +437,7 @@ mod tests {
         for _ in 0..5 {
             let manager = manager.clone();
             tasks.push(tokio::spawn(async move {
-                manager.token_for("GET:/shared").await
+                manager.token("GET:/shared", None).await
             }));
         }
         for task in tasks {
@@ -481,10 +459,7 @@ mod tests {
 
         // `previous` names the cached token, so it must be replaced rather than
         // handed back from the cache.
-        let token = manager
-            .refresh("GET:/bad", Some("known-bad"))
-            .await
-            .unwrap();
+        let token = manager.token("GET:/bad", Some("known-bad")).await.unwrap();
         assert_eq!(token, "token-GET:/bad");
         assert_eq!(
             server

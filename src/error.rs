@@ -48,6 +48,41 @@ pub enum Error {
     #[error("invalid path: {0}")]
     InvalidPath(&'static str),
 
+    /// The drive API listed the file but handed out no link to fetch it.
+    #[error("PikPak returned no download link for {0}")]
+    NoDownloadLink(String),
+
+    /// The content server refused a transfer, and fresh links did not help.
+    ///
+    /// Not [`Error::Api`]: a 401/403 here is the signed link refusing us — the
+    /// account token was checked when the link was refreshed.
+    #[error("download failed with status {status}: {message}")]
+    Transfer {
+        /// HTTP status code from the content server.
+        status: u16,
+        /// Response body.
+        message: String,
+    },
+
+    /// The content stream ended short of the reported size.
+    #[error("incomplete transfer: received {received} of {expected} bytes")]
+    Incomplete {
+        /// Bytes written to the partial file.
+        received: u64,
+        /// Bytes the API reported.
+        expected: u64,
+    },
+
+    /// A local filesystem operation failed.
+    #[error("{context}")]
+    Io {
+        /// What was being done.
+        context: &'static str,
+        /// The underlying failure.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// The service answered in a way that breaks its own protocol (a listing
     /// that repeats a page, say), so the result cannot be trusted.
     #[error("unexpected response: {0}")]

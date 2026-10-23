@@ -19,6 +19,8 @@ pub(crate) const TOKEN_JSON: &str =
 pub(crate) struct Request {
     /// Request target: path plus query.
     pub target: String,
+    /// Request line and headers, as received.
+    pub head: String,
     /// Body, lossily decoded as UTF-8 (empty for the GETs the drive API uses).
     pub body: String,
 }
@@ -56,17 +58,42 @@ pub(crate) async fn read_request(sock: &mut TcpStream) -> Request {
     }
     let text = String::from_utf8_lossy(&raw).into_owned();
     let target = text.split_whitespace().nth(1).unwrap_or("/").to_string();
-    let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
-    Request { target, body }
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    Request {
+        target,
+        head: head.to_string(),
+        body: body.to_string(),
+    }
 }
 
 /// Write a JSON response with `Content-Length`, closing the connection.
 pub(crate) async fn respond_json(sock: &mut TcpStream, status: u16, reason: &str, body: &str) {
-    let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
+    let headers = [
+        ("Content-Type", "application/json".to_string()),
+        ("Content-Length", body.len().to_string()),
+    ];
+    respond(
+        sock,
+        &format!("{status} {reason}"),
+        &headers,
+        body.as_bytes(),
+    )
+    .await;
+}
+
+/// Write a raw response — `status` is the line's `200 OK` part — and close.
+pub(crate) async fn respond(
+    sock: &mut TcpStream,
+    status: &str,
+    headers: &[(&str, String)],
+    body: &[u8],
+) {
+    let mut head = format!("HTTP/1.1 {status}\r\n");
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("Connection: close\r\n\r\n");
     let _ = sock.write_all(head.as_bytes()).await;
-    let _ = sock.write_all(body.as_bytes()).await;
+    let _ = sock.write_all(body).await;
     let _ = sock.flush().await;
 }

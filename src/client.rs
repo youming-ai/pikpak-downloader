@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use md5::{Digest, Md5};
 use serde::Deserialize;
 
-use crate::auth::{OAuthCredentials, TokenManager};
+use crate::auth::{OAuthCredentials, TokenHooks, TokenManager};
 use crate::captcha::CaptchaManager;
 use crate::error::{Error, Result};
 use crate::types::{deserialize_lenient_u64, deserialize_optional_lenient_u64, FileInfo, Quota};
@@ -31,12 +31,6 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// User-Agent string baked into the upstream pikpakcli project (Android build).
 const DEFAULT_USER_AGENT: &str = "ANDROID-com.pikcloud.pikpak/1.21.0";
-
-/// Shared callback invoked with each newly rotated refresh token.
-type RefreshTokenHook = Arc<dyn Fn(&str) + Send + Sync>;
-
-/// Shared callback returning the refresh token the caller has persisted.
-type RefreshTokenSource = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
 /// Public API surface: every PikPak operation goes through this struct.
 ///
@@ -61,8 +55,7 @@ pub struct ClientBuilder {
     timeout: Duration,
     user_agent: String,
     proxy: Option<String>,
-    on_refresh_token: Option<RefreshTokenHook>,
-    refresh_token_source: Option<RefreshTokenSource>,
+    hooks: TokenHooks,
 }
 
 impl Default for ClientBuilder {
@@ -76,8 +69,7 @@ impl Default for ClientBuilder {
             timeout: DEFAULT_TIMEOUT,
             user_agent: DEFAULT_USER_AGENT.into(),
             proxy: None,
-            on_refresh_token: None,
-            refresh_token_source: None,
+            hooks: TokenHooks::default(),
         }
     }
 }
@@ -151,7 +143,7 @@ impl ClientBuilder {
     where
         F: Fn(&str) + Send + Sync + 'static,
     {
-        self.on_refresh_token = Some(Arc::new(f));
+        self.hooks.rotation = Some(Arc::new(f));
         self
     }
 
@@ -168,7 +160,7 @@ impl ClientBuilder {
     where
         F: Fn() -> Option<String> + Send + Sync + 'static,
     {
-        self.refresh_token_source = Some(Arc::new(source));
+        self.hooks.source = Some(Arc::new(source));
         self
     }
 
@@ -218,13 +210,8 @@ impl ClientBuilder {
             self.credentials.clone(),
             &device_id,
             refresh_token,
+            self.hooks,
         );
-        if let Some(hook) = self.on_refresh_token {
-            tokens.set_rotation_hook(move |token| hook(token));
-        }
-        if let Some(source) = self.refresh_token_source {
-            tokens.set_token_source(move || source());
-        }
 
         let captcha = CaptchaManager::new(
             http.clone(),
@@ -251,14 +238,6 @@ pub fn is_drive_root(path: &str) -> bool {
     path.trim_matches('/').is_empty()
 }
 
-/// Where a resolved path ended up.
-enum Resolved {
-    /// The virtual root, which has no [`FileInfo`] of its own.
-    Root,
-    /// The entry named by the final path segment.
-    Entry(FileInfo),
-}
-
 impl Client {
     /// Convenience for [`ClientBuilder::new`].
     pub fn builder() -> ClientBuilder {
@@ -270,25 +249,11 @@ impl Client {
         &self.device_id
     }
 
-    /// Return the [`TokenManager`] so callers can read the rotated
-    /// refresh token and persist it.
-    pub fn tokens(&self) -> &TokenManager {
-        &self.tokens
-    }
-
-    /// Return the HTTP client used for API calls.
+    /// The HTTP client used for file **content** transfers.
     ///
-    /// It carries the configured total request deadline. For file content use
-    /// [`download_client`](Self::download_client) instead.
-    pub fn http_client(&self) -> &reqwest::Client {
-        &self.http
-    }
-
-    /// Return the HTTP client used for file **content** transfers.
-    ///
-    /// Unlike [`http_client`](Self::http_client) it has no total deadline, only
-    /// a per-read stall timeout, so a large file is never cut off mid-transfer.
-    pub fn download_client(&self) -> &reqwest::Client {
+    /// Unlike the API client it has no total deadline, only a per-read stall
+    /// timeout, so a large file is never cut off mid-transfer.
+    pub(crate) fn download_client(&self) -> &reqwest::Client {
         &self.download_http
     }
 
@@ -359,12 +324,17 @@ impl Client {
         // 401 and captcha-expiry each get one targeted retry; transient
         // network failures and 5xx/429 get bounded exponential-backoff retries.
         let mut auth_retried = false;
-        let mut captcha_retried = false;
+        // The captcha the server reported expired, once it has; asking with it
+        // gets a fresh one.
+        let mut expired_captcha: Option<String> = None;
         let mut net_retries: u32 = 0;
 
         loop {
             let access = self.tokens.access_token().await?;
-            let captcha = self.captcha.token_for(action).await?;
+            let captcha = self
+                .captcha
+                .token(action, expired_captcha.as_deref())
+                .await?;
 
             let send = self
                 .http
@@ -415,21 +385,12 @@ impl Client {
                 continue;
             }
 
-            if !captcha_retried {
-                if let Ok(err) = serde_json::from_str::<ApiError>(&text) {
-                    if err.error_code == 9 {
-                        tracing::debug!(
-                            action = %action,
-                            "captcha expired, refreshing and retrying"
-                        );
-                        captcha_retried = true;
-                        let prev = captcha.clone();
-                        // The refreshed token is re-read from the cache on the
-                        // next iteration; only the side effect matters here.
-                        self.captcha.refresh(action, Some(&prev)).await?;
-                        continue;
-                    }
-                }
+            if expired_captcha.is_none()
+                && serde_json::from_str::<ApiError>(&text).is_ok_and(|err| err.error_code == 9)
+            {
+                tracing::debug!(action = %action, "captcha expired, refreshing and retrying");
+                expired_captcha = Some(captcha);
+                continue;
             }
 
             // Server-side transient failures (5xx, 429) are worth a backoff retry.
@@ -458,79 +419,50 @@ impl Client {
         }
     }
 
-    /// Resolve a Unix-style path (e.g. `"/My Pack/videos"`) to the
-    /// corresponding folder id by walking each path segment.
+    /// Resolve a Unix-style path (e.g. `"/My Pack/video.mp4"`) to its entry,
+    /// listing each level once.
     ///
-    /// Returns `Ok(id)` on success. An empty path or `"/"` resolves to the
-    /// root (empty string, matching PikPak convention).
-    pub async fn resolve_path(&self, path: &str) -> Result<String> {
-        match self.walk_path(path, false).await? {
-            Resolved::Root => Ok(String::new()),
-            Resolved::Entry(info) => Ok(info.id),
-        }
-    }
-
-    /// Resolve a path to a [`FileInfo`]. If the path points to a file
-    /// (i.e. the last segment is a file, not a folder), returns that file's
-    /// info; otherwise returns the folder's info.
+    /// Middle segments must be folders; the last may be a file. At every
+    /// segment a folder wins over a same-named file, so a name collision never
+    /// resolves according to listing order.
     ///
     /// An empty path or `"/"` refers to the virtual root, which has no entry of
     /// its own, and is therefore rejected.
     pub async fn resolve_path_info(&self, path: &str) -> Result<FileInfo> {
-        match self.walk_path(path, true).await? {
-            Resolved::Root => Err(Error::InvalidPath(
+        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let Some((last, folders)) = segments.split_last() else {
+            return Err(Error::InvalidPath(
                 "the drive root has no entry of its own; name a file or folder",
-            )),
-            Resolved::Entry(info) => Ok(info),
+            ));
+        };
+        let mut parent_id = String::new();
+        for segment in folders {
+            parent_id = self.child(&parent_id, segment, path, false).await?.id;
         }
+        self.child(&parent_id, last, path, true).await
     }
 
-    /// Walk `path` one segment at a time, listing each level exactly once.
-    ///
-    /// `allow_file_last` decides whether the final segment may be a file (as
-    /// [`resolve_path_info`](Self::resolve_path_info) needs) or must be a folder
-    /// (as [`resolve_path`](Self::resolve_path) needs). Middle segments are
-    /// always folders, and a folder also wins over a same-named file at the final
-    /// segment — a name collision must not resolve according to listing order.
-    async fn walk_path(&self, path: &str, allow_file_last: bool) -> Result<Resolved> {
-        if is_drive_root(path) {
-            return Ok(Resolved::Root);
-        }
-        let normalized = path.trim_matches('/');
-
-        let segments: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
-        let mut parent_id = String::new();
-
-        for (index, segment) in segments.iter().enumerate() {
-            let is_last = index == segments.len() - 1;
-            let children = self.list_folder(&parent_id).await?;
-            // A folder wins over a same-named file, at the final segment too:
-            // which of the two a listing happens to return first is not something
-            // a caller should depend on, and only folders can be walked into.
-            let folder = children
-                .iter()
-                .find(|f| f.name == *segment && f.kind.is_folder());
-            let found = match folder {
-                Some(folder) => Some(folder),
-                None if is_last && allow_file_last => children.iter().find(|f| f.name == *segment),
-                None => None,
-            }
-            .cloned();
-
-            match found {
-                Some(info) if is_last => return Ok(Resolved::Entry(info)),
-                Some(info) => parent_id = info.id,
-                None => {
-                    return Err(Error::NotFound {
-                        path: path.to_string(),
-                        segment: (*segment).to_string(),
-                    });
-                }
-            }
-        }
-
-        // Unreachable: a non-empty segment list returns from inside the loop.
-        Ok(Resolved::Root)
+    /// The entry `name` inside `parent_id` — a folder, or failing that a file
+    /// when `file_ok` — while resolving `path`.
+    async fn child(
+        &self,
+        parent_id: &str,
+        name: &str,
+        path: &str,
+        file_ok: bool,
+    ) -> Result<FileInfo> {
+        let children = self.list_folder(parent_id).await?;
+        let named = |f: &&FileInfo| f.name == name;
+        children
+            .iter()
+            .filter(named)
+            .find(|f| f.kind.is_folder())
+            .or_else(|| children.iter().filter(named).find(|_| file_ok))
+            .cloned()
+            .ok_or_else(|| Error::NotFound {
+                path: path.to_string(),
+                segment: name.to_string(),
+            })
     }
 
     /// Get a download URL for a file by its id.
@@ -584,9 +516,9 @@ const MAX_NET_RETRIES: u32 = 4;
 /// Exponential backoff for a retry attempt (0-based): `base`, then doubling,
 /// capped at `cap`.
 ///
-/// Shared by the API retries here and the CLI's download retries, which differ
-/// only in their base and cap.
-pub fn exponential_backoff(base: Duration, cap: Duration, attempt: u32) -> Duration {
+/// Shared by the API retries here and the content transfers, which differ only
+/// in their base and cap.
+pub(crate) fn exponential_backoff(base: Duration, cap: Duration, attempt: u32) -> Duration {
     let ms = (base.as_millis() as u64).saturating_mul(1u64 << attempt.min(5));
     Duration::from_millis(ms.min(cap.as_millis() as u64))
 }
@@ -601,7 +533,7 @@ fn backoff_delay(attempt: u32) -> Duration {
 ///
 /// 5xx responses and 429 (Too Many Requests) both mean "try again later";
 /// repeating any other client error unchanged cannot succeed.
-pub fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+pub(crate) fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
 }
 
@@ -611,11 +543,7 @@ pub fn is_retryable_status(status: reqwest::StatusCode) -> bool {
 /// jittered downwards by up to half. The entropy is the clock's sub-second
 /// component: not a quality random source, but sufficient to decorrelate
 /// concurrent retries without taking on a `rand` dependency.
-///
-/// This is public because both the API retries here and the CLI's download
-/// retries use it; the underlying backoff remains deterministic and separately
-/// tested.
-pub fn jittered_backoff(base: Duration) -> Duration {
+pub(crate) fn jittered_backoff(base: Duration) -> Duration {
     let base_ms = base.as_millis() as u64;
     let span = base_ms / 2;
     if span == 0 {
@@ -645,7 +573,7 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Duration {
 }
 
 /// Whether a reqwest error is a transient network condition worth retrying.
-fn is_transient(err: &reqwest::Error) -> bool {
+pub(crate) fn is_transient(err: &reqwest::Error) -> bool {
     err.is_timeout() || err.is_connect() || err.is_request() || err.is_body()
 }
 
@@ -688,543 +616,4 @@ struct FileDetailResponse {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::VecDeque;
-    use std::net::SocketAddr;
-    use std::sync::{Arc, Mutex};
-
-    /// Build a listing body; `next` adds a pagination token.
-    fn page_json(entries: &[(&str, &str, &str)], next: Option<&str>) -> String {
-        let items: Vec<String> = entries
-            .iter()
-            .map(|(id, name, kind)| format!(r#"{{"id":"{id}","name":"{name}","kind":"{kind}"}}"#))
-            .collect();
-        match next {
-            Some(token) => format!(
-                r#"{{"files":[{}],"next_page_token":"{token}"}}"#,
-                items.join(",")
-            ),
-            None => format!(r#"{{"files":[{}]}}"#, items.join(",")),
-        }
-    }
-
-    #[derive(Default)]
-    struct MockState {
-        /// Scripted drive responses, consumed in order; the last one repeats.
-        drive: VecDeque<(u16, String)>,
-        /// Every request target (path + query), in order.
-        targets: Vec<String>,
-        auth_calls: usize,
-        captcha_calls: usize,
-    }
-
-    /// Scripted stand-in for the PikPak stack: auth, captcha init and drive.
-    struct Mock {
-        addr: SocketAddr,
-        state: Arc<Mutex<MockState>>,
-    }
-
-    impl Mock {
-        async fn start(drive: Vec<(u16, String)>) -> Self {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let state = Arc::new(Mutex::new(MockState {
-                drive: drive.into_iter().collect(),
-                ..MockState::default()
-            }));
-            tokio::spawn({
-                let state = state.clone();
-                async move {
-                    loop {
-                        let Ok((mut sock, _)) = listener.accept().await else {
-                            return;
-                        };
-                        let state = state.clone();
-                        tokio::spawn(async move {
-                            let request = crate::test_http::read_request(&mut sock).await;
-
-                            // The std mutex is released before any await.
-                            let (status, payload) = {
-                                let mut st = state.lock().unwrap();
-                                st.targets.push(request.target.clone());
-                                if request.target.starts_with("/v1/auth/token") {
-                                    st.auth_calls += 1;
-                                    (200, crate::test_http::TOKEN_JSON.to_string())
-                                } else if request.target.starts_with("/v1/shield/captcha/init") {
-                                    st.captcha_calls += 1;
-                                    let token = format!("captcha-{}", st.captcha_calls);
-                                    (200, format!(r#"{{"captcha_token":"{token}"}}"#))
-                                } else {
-                                    match st.drive.len() {
-                                        0 => (200, "{}".to_string()),
-                                        1 => st.drive[0].clone(),
-                                        _ => st.drive.pop_front().unwrap(),
-                                    }
-                                }
-                            };
-
-                            let reason = if status == 200 { "OK" } else { "Error" };
-                            crate::test_http::respond_json(&mut sock, status, reason, &payload)
-                                .await;
-                        });
-                    }
-                }
-            });
-            Self { addr, state }
-        }
-
-        fn client(&self) -> Client {
-            Client::builder()
-                .refresh_token("initial-token")
-                .auth_base_url(format!("http://{}", self.addr))
-                .api_base_url(format!("http://{}", self.addr))
-                .build()
-                .unwrap()
-        }
-
-        fn targets(&self) -> Vec<String> {
-            self.state.lock().unwrap().targets.clone()
-        }
-
-        fn drive_targets(&self) -> Vec<String> {
-            self.targets()
-                .into_iter()
-                .filter(|t| t.starts_with("/drive/"))
-                .collect()
-        }
-
-        fn auth_calls(&self) -> usize {
-            self.state.lock().unwrap().auth_calls
-        }
-
-        fn captcha_calls(&self) -> usize {
-            self.state.lock().unwrap().captcha_calls
-        }
-    }
-
-    #[tokio::test]
-    async fn a_rejected_access_token_is_refreshed_and_retried_once() {
-        let mock = Mock::start(vec![
-            (401, r#"{"error":"token expired"}"#.to_string()),
-            (200, page_json(&[], None)),
-        ])
-        .await;
-
-        let files = mock.client().list_folder("").await.unwrap();
-
-        assert!(files.is_empty());
-        assert_eq!(
-            mock.auth_calls(),
-            2,
-            "the 401 must invalidate the cached token so the retry authenticates again"
-        );
-        assert_eq!(
-            mock.drive_targets().len(),
-            2,
-            "the request must be retried once"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_second_consecutive_401_surfaces_as_an_error() {
-        // The auth path gets exactly one retry. If the fresh token is also
-        // rejected the request must fail instead of looping. The trailing 500
-        // keeps a regression that retried forever from hanging the suite: it
-        // would fail out through the 5xx budget with a different status.
-        let mock = Mock::start(vec![
-            (401, r#"{"error":"token expired"}"#.to_string()),
-            (401, r#"{"error":"still expired"}"#.to_string()),
-            (500, "unavailable".to_string()),
-        ])
-        .await;
-
-        match mock.client().list_folder("").await {
-            Err(Error::Api { status, .. }) => assert_eq!(status, 401),
-            other => panic!("expected an Api error, got {other:?}"),
-        }
-        assert_eq!(
-            mock.drive_targets().len(),
-            2,
-            "exactly one auth retry, then an error"
-        );
-        assert_eq!(
-            mock.auth_calls(),
-            2,
-            "the second 401 must not trigger a third authentication"
-        );
-    }
-
-    #[tokio::test]
-    async fn captcha_error_code_9_refreshes_the_captcha_and_retries() {
-        let mock = Mock::start(vec![
-            (
-                400,
-                r#"{"error_code":9,"error":"captcha token expired"}"#.to_string(),
-            ),
-            (200, page_json(&[], None)),
-        ])
-        .await;
-
-        mock.client().list_folder("").await.unwrap();
-
-        assert_eq!(
-            mock.captcha_calls(),
-            2,
-            "error_code 9 must force a new captcha token"
-        );
-        assert_eq!(
-            mock.auth_calls(),
-            1,
-            "the access token was still valid and must not be refreshed"
-        );
-        assert_eq!(mock.drive_targets().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn a_server_error_is_retried_with_backoff() {
-        let mock = Mock::start(vec![
-            (503, "temporarily unavailable".to_string()),
-            (200, page_json(&[], None)),
-        ])
-        .await;
-
-        mock.client().list_folder("").await.unwrap();
-
-        assert_eq!(mock.drive_targets().len(), 2, "5xx must be retried");
-    }
-
-    #[tokio::test]
-    async fn a_non_retryable_status_surfaces_as_an_api_error() {
-        let mock = Mock::start(vec![(404, r#"{"error":"not found"}"#.to_string())]).await;
-
-        match mock.client().get_download_url("missing").await {
-            Err(Error::Api { status, .. }) => assert_eq!(status, 404),
-            other => panic!("expected an Api error, got {other:?}"),
-        }
-        assert_eq!(mock.drive_targets().len(), 1, "404 must not be retried");
-    }
-
-    #[tokio::test]
-    async fn listing_follows_next_page_tokens() {
-        let mock = Mock::start(vec![
-            (200, page_json(&[("1", "a.bin", "drive#file")], Some("t1"))),
-            (200, page_json(&[("2", "b.bin", "drive#file")], None)),
-        ])
-        .await;
-
-        let files = mock.client().list_folder("").await.unwrap();
-
-        assert_eq!(
-            files.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
-            vec!["a.bin", "b.bin"]
-        );
-        let drive = mock.drive_targets();
-        assert_eq!(drive.len(), 2);
-        assert!(
-            drive[1].contains("page_token=t1"),
-            "the second page must carry the token: {}",
-            drive[1]
-        );
-    }
-
-    #[tokio::test]
-    async fn a_null_file_list_is_an_empty_folder() {
-        let mock = Mock::start(vec![(200, r#"{"files":null}"#.to_string())]).await;
-        assert!(mock.client().list_folder("").await.unwrap().is_empty());
-    }
-
-    #[test]
-    fn retry_after_is_read_in_seconds_and_capped() {
-        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
-        let with = |value: &str| {
-            let mut headers = HeaderMap::new();
-            headers.insert(RETRY_AFTER, HeaderValue::from_str(value).unwrap());
-            super::retry_after(&headers)
-        };
-        assert_eq!(with("3"), Duration::from_secs(3));
-        assert_eq!(with("86400"), super::MAX_RETRY_AFTER);
-        // The date form is not parsed: fall back to our own backoff.
-        assert_eq!(with("Wed, 21 Oct 2026 07:28:00 GMT"), Duration::ZERO);
-        assert_eq!(super::retry_after(&HeaderMap::new()), Duration::ZERO);
-    }
-
-    #[tokio::test]
-    async fn listing_terminates_when_the_server_repeats_a_page_token() {
-        // A server that keeps returning the same token must not spin forever.
-        // The final scripted 500 keeps a regression from hanging the suite: the
-        // loop would then fail out through the normal retry budget.
-        let repeated = page_json(&[], Some("same"));
-        let mock = Mock::start(vec![
-            (200, repeated.clone()),
-            (200, repeated.clone()),
-            (200, repeated),
-            (500, "still paginating".to_string()),
-        ])
-        .await;
-
-        // Ended, and as a failure: a quiet stop would pass a partial listing
-        // off as the whole folder.
-        let err = mock.client().list_folder("").await.unwrap_err();
-        assert!(matches!(err, Error::Protocol(_)), "{err:?}");
-
-        assert_eq!(
-            mock.drive_targets().len(),
-            2,
-            "a repeated page token must end the loop after the second request"
-        );
-    }
-
-    #[tokio::test]
-    async fn listing_terminates_on_a_two_token_cycle() {
-        // A -> B -> A: comparing only with the previous token would ping-pong
-        // forever. The trailing 500 keeps a regression failing rather than
-        // hanging the suite.
-        let mock = Mock::start(vec![
-            (200, page_json(&[], Some("A"))),
-            (200, page_json(&[], Some("B"))),
-            (200, page_json(&[], Some("A"))),
-            (500, "still paginating".to_string()),
-        ])
-        .await;
-
-        let err = mock.client().list_folder("").await.unwrap_err();
-        assert!(matches!(err, Error::Protocol(_)), "{err:?}");
-
-        let drive = mock.drive_targets();
-        assert_eq!(
-            drive.len(),
-            3,
-            "the cycle must end once A has been followed already: {drive:?}"
-        );
-        assert!(drive[1].contains("page_token=A"), "{}", drive[1]);
-        assert!(drive[2].contains("page_token=B"), "{}", drive[2]);
-    }
-
-    #[tokio::test]
-    async fn resolve_path_walks_segments_and_names_the_missing_one() {
-        let mock = Mock::start(vec![
-            (200, page_json(&[("A", "A", "drive#folder")], None)),
-            (200, page_json(&[("B", "B", "drive#folder")], None)),
-            (200, page_json(&[("A", "A", "drive#folder")], None)),
-            (200, page_json(&[], None)),
-        ])
-        .await;
-        let client = mock.client();
-
-        assert_eq!(client.resolve_path("/A/B").await.unwrap(), "B");
-
-        match client.resolve_path("/A/Nope").await {
-            Err(Error::NotFound { segment, .. }) => assert_eq!(segment, "Nope"),
-            other => panic!("expected NotFound, got {other:?}"),
-        }
-
-        let drive = mock.drive_targets();
-        assert!(
-            drive[1].contains("parent_id=A"),
-            "the second hop must list inside A: {}",
-            drive[1]
-        );
-        assert!(
-            drive[3].contains("parent_id=A"),
-            "the failing lookup must be inside A: {}",
-            drive[3]
-        );
-    }
-
-    #[tokio::test]
-    async fn resolve_path_info_prefers_a_folder_for_middle_segments() {
-        // The parent holds both a file and a folder named "X": a middle segment
-        // must resolve to the folder, not the same-named file.
-        let mock = Mock::start(vec![
-            (
-                200,
-                page_json(
-                    &[
-                        ("file-X", "X", "drive#file"),
-                        ("folder-X", "X", "drive#folder"),
-                    ],
-                    None,
-                ),
-            ),
-            (200, page_json(&[("f1", "movie.mp4", "drive#file")], None)),
-        ])
-        .await;
-
-        let info = mock
-            .client()
-            .resolve_path_info("/X/movie.mp4")
-            .await
-            .unwrap();
-
-        assert_eq!(info.id, "f1");
-        assert_eq!(info.name, "movie.mp4");
-        assert!(
-            mock.drive_targets()[1].contains("parent_id=folder-X"),
-            "middle segment must resolve to the folder"
-        );
-    }
-
-    #[tokio::test]
-    async fn resolve_path_info_prefers_a_folder_for_the_last_segment_too() {
-        // The same collision at the final segment: the folder wins there as well,
-        // so the order a listing happens to arrive in cannot change what a path
-        // resolves to (which is what `ls` and `download` both key off).
-        let mock = Mock::start(vec![(
-            200,
-            page_json(
-                &[
-                    ("file-X", "X", "drive#file"),
-                    ("folder-X", "X", "drive#folder"),
-                ],
-                None,
-            ),
-        )])
-        .await;
-
-        let info = mock.client().resolve_path_info("X").await.unwrap();
-
-        assert_eq!(info.id, "folder-X");
-        assert!(info.kind.is_folder());
-    }
-
-    #[tokio::test]
-    async fn resolve_path_info_still_resolves_a_lone_file() {
-        let mock = Mock::start(vec![(
-            200,
-            page_json(&[("f1", "movie.mp4", "drive#file")], None),
-        )])
-        .await;
-
-        let info = mock.client().resolve_path_info("movie.mp4").await.unwrap();
-
-        assert_eq!(info.id, "f1");
-        assert!(info.kind.is_file());
-    }
-
-    #[tokio::test]
-    async fn a_rejected_token_from_a_drive_call_explains_itself() {
-        // The token exchange is not the only place a dead token surfaces: a drive
-        // call sees the same rejection, and must give the same actionable message
-        // rather than relaying the server's raw body.
-        let body = r#"{"error":"invalid_grant","error_code":4126}"#;
-        let mock = Mock::start(vec![(400, body.to_string())]).await;
-
-        let err = mock.client().list_folder("").await.unwrap_err();
-
-        assert!(matches!(err, Error::Auth(_)), "{err:?}");
-        let text = err.to_string();
-        assert!(text.contains("single-use"), "{text}");
-        assert!(text.contains(".env"), "{text}");
-    }
-
-    #[test]
-    fn an_absent_size_stays_absent_while_an_explicit_zero_is_a_size() {
-        // The download path substitutes the directory listing's size only when the
-        // detail response left the field out. A file the API reports as zero bytes
-        // must not be mistaken for one it said nothing about, or a genuinely empty
-        // file is judged against a stale listing size and never completes.
-        let absent: super::FileDetailResponse =
-            serde_json::from_str(r#"{"web_content_link":"http://x"}"#).unwrap();
-        assert_eq!(absent.size, None);
-
-        let blank: super::FileDetailResponse =
-            serde_json::from_str(r#"{"size":"","web_content_link":"http://x"}"#).unwrap();
-        assert_eq!(blank.size, None);
-
-        let empty: super::FileDetailResponse =
-            serde_json::from_str(r#"{"size":"0","web_content_link":"http://x"}"#).unwrap();
-        assert_eq!(empty.size, Some(0));
-
-        let numbered: super::FileDetailResponse =
-            serde_json::from_str(r#"{"size":64,"web_content_link":"http://x"}"#).unwrap();
-        assert_eq!(numbered.size, Some(64));
-    }
-
-    #[tokio::test]
-    async fn resolve_path_info_rejects_an_empty_path() {
-        let mock = Mock::start(vec![]).await;
-
-        match mock.client().resolve_path_info("/").await {
-            Err(Error::InvalidPath(_)) => {}
-            other => panic!("expected InvalidPath, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn quota_reads_the_about_endpoint() {
-        let mock = Mock::start(vec![(
-            200,
-            r#"{"quota":{"limit":"1000","usage":"250"}}"#.to_string(),
-        )])
-        .await;
-
-        let quota = mock.client().quota().await.unwrap();
-
-        assert_eq!(quota.total, 1000);
-        assert_eq!(quota.used, 250);
-        assert_eq!(quota.free(), 750);
-    }
-
-    #[test]
-    fn retryable_statuses_are_server_errors_and_429() {
-        assert!(is_retryable_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
-        assert!(is_retryable_status(
-            reqwest::StatusCode::INTERNAL_SERVER_ERROR
-        ));
-        assert!(is_retryable_status(reqwest::StatusCode::BAD_GATEWAY));
-        assert!(!is_retryable_status(reqwest::StatusCode::NOT_FOUND));
-        assert!(!is_retryable_status(reqwest::StatusCode::UNAUTHORIZED));
-        assert!(!is_retryable_status(reqwest::StatusCode::BAD_REQUEST));
-    }
-
-    #[test]
-    fn drive_root_paths() {
-        assert!(is_drive_root(""));
-        assert!(is_drive_root("/"));
-        assert!(is_drive_root("///"));
-        assert!(!is_drive_root("/a"));
-        assert!(!is_drive_root("a"));
-    }
-
-    #[test]
-    fn exponential_backoff_grows_from_its_base_and_caps() {
-        let base = Duration::from_millis(500);
-        let cap = Duration::from_secs(15);
-        assert_eq!(exponential_backoff(base, cap, 0), base);
-        assert_eq!(exponential_backoff(base, cap, 1), Duration::from_secs(1));
-        assert_eq!(
-            exponential_backoff(base, cap, 30),
-            cap,
-            "the cap applies far past the doubling range"
-        );
-    }
-
-    #[test]
-    fn jittered_backoff_stays_in_bounds_and_varies() {
-        for ms in [1u64, 2, 10, 500, 1000, 15_000] {
-            let base = Duration::from_millis(ms);
-            for _ in 0..50 {
-                let jittered = jittered_backoff(base);
-                assert!(
-                    jittered >= base / 2 && jittered <= base,
-                    "{jittered:?} outside [{:?}, {base:?}]",
-                    base / 2
-                );
-            }
-        }
-        // A zero base has no span to spread; it must stay zero.
-        assert_eq!(jittered_backoff(Duration::ZERO), Duration::ZERO);
-
-        // It must actually spread: a constant delay would leave workers that
-        // failed together retrying together, which is the whole point.
-        let base = Duration::from_millis(1000);
-        let distinct: HashSet<u128> = (0..100)
-            .map(|_| jittered_backoff(base).as_nanos())
-            .collect();
-        assert!(
-            distinct.len() > 1,
-            "jitter produced no variation: {distinct:?}"
-        );
-    }
-}
+mod tests;

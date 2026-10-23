@@ -1,16 +1,17 @@
-use std::path::{Path as StdPath, PathBuf};
+use std::io::IsTerminal;
+use std::path::Path as StdPath;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use humansize::{format_size, BINARY};
 use tracing_subscriber::EnvFilter;
 
+use env_file::TokenHome;
 use pikpak::auth::OAuthCredentials;
 use pikpak::{Client, FileKind};
 use serde::Serialize;
+use serde_json::Value;
 
 mod download;
 mod env_file;
@@ -39,17 +40,6 @@ struct Cli {
     #[arg(long, global = true)]
     no_progress: bool,
 
-    /// Internal: the detached job this process is the worker for.
-    ///
-    /// Set by `download --detach` when it re-executes this binary. Not part of
-    /// the interface.
-    #[arg(long, hide = true, global = true)]
-    internal_job: Option<String>,
-
-    /// Internal: state directory the worker keeps its record in.
-    #[arg(long, hide = true, global = true)]
-    internal_state: Option<PathBuf>,
-
     #[command(subcommand)]
     command: Command,
 }
@@ -62,6 +52,7 @@ impl Command {
             Command::Download(_) => "download",
             Command::Quota(_) => "quota",
             Command::Jobs(args) => args.command.name(),
+            Command::Worker(_) => "worker",
         }
     }
 }
@@ -76,6 +67,9 @@ enum Command {
     Quota(QuotaArgs),
     /// Inspect or control detached downloads.
     Jobs(jobs::JobsArgs),
+    /// Internal: run a detached job, as started by `download --detach`.
+    #[command(name = "__worker", hide = true)]
+    Worker(jobs::WorkerArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -119,22 +113,18 @@ struct QuotaArgs {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    // Record whether the token came from the real environment *before* dotenvy
-    // can supply it from a file: only the file-loaded case can be written back.
-    // dotenvy never overrides variables already present, so a token taken from
-    // the environment must not be persisted into an unrelated `.env`.
+    // Read before dotenvy can supply the token from a file; see `locate`.
     let token_from_env = std::env::var_os("PIKPAK_REFRESH_TOKEN").is_some();
     let loaded_env = dotenvy::dotenv().ok();
-    let env_path = if token_from_env {
-        None
-    } else {
-        env_file::env_file_for_persistence(loaded_env.as_deref(), StdPath::new(".env"))
-    };
+    let home = TokenHome::locate(token_from_env, loaded_env.as_deref(), StdPath::new(".env"));
 
     let state = jobs::state_dir(loaded_env.as_deref());
 
     let cli = Cli::parse();
-    let output = output::Output::new(cli.json, cli.no_progress);
+    // Progress redraws one line in place: on anything but a terminal (a
+    // worker's log, an agent's captured stderr) it is only noise.
+    let no_progress = cli.no_progress || !std::io::stderr().is_terminal();
+    let output = output::Output::new(cli.json, no_progress);
     let command = cli.command.name();
 
     // A panic is a bug, but still a failure the caller must be able to parse:
@@ -167,8 +157,11 @@ async fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
 
-    match run(cli, env_path, &state, output).await {
-        Ok(()) => ExitCode::from(output::EXIT_OK),
+    match run(cli, home, &state, output).await {
+        Ok(result) => {
+            output.ok(command, &result);
+            ExitCode::from(output::EXIT_OK)
+        }
         Err(e) => {
             // The human line always goes to stderr; the JSON document is what a
             // caller parses, and carries the same code the process exits with.
@@ -179,63 +172,41 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(
-    cli: Cli,
-    env_path: Option<PathBuf>,
-    state: &StdPath,
-    output: output::Output,
-) -> Result<()> {
-    // Set by the rotation hook when a rotation happened that could not be
-    // written anywhere, so the run can end with a nudge about it.
-    let rotated_unpersisted = Arc::new(AtomicBool::new(false));
+async fn run(cli: Cli, home: TokenHome, state: &StdPath, output: output::Output) -> Result<Value> {
     // Built per command rather than up front: `jobs` needs no credentials, and
     // asking what is already running should not fail because the token has since
     // been rotated away.
-    let client = || build_client(env_path.as_deref(), rotated_unpersisted.clone());
-    let result = match cli.command {
-        Command::Ls(args) => cmd_ls(&client()?, args, output).await,
-        Command::Download(args) => match (&cli.internal_job, args.detach) {
-            // This process *is* the worker for a detached job.
-            (Some(id), _) => jobs::run_worker_download(
-                &client()?,
-                args,
-                output,
-                id.clone(),
-                // The worker's parent always passes its own state directory.
-                cli.internal_state.as_deref().unwrap_or(state),
-            )
-            .await
-            .map(|_| ()),
+    let client = || build_client(&home);
+    let verbose = cli.verbose;
+    // Every command hands back its result; `main` alone turns it into the one
+    // document stdout carries.
+    let result = async {
+        match cli.command {
+            Command::Ls(args) => document(cmd_ls(&client()?, args, output).await?),
             // Fail here rather than start a job that cannot authenticate.
-            (None, true) => {
+            Command::Download(args) if args.detach => {
                 validate_refresh_token(std::env::var("PIKPAK_REFRESH_TOKEN").ok())?;
-                jobs::start_detached(&args, output, env_path.is_some(), state).map(|_| ())
+                let detached = jobs::start_detached(&args, output, home.is_file(), verbose, state)?;
+                document(detached)
             }
-            (None, false) => download::cmd_download(&client()?, args, output)
-                .await
-                .map(|_| ()),
-        },
-        Command::Quota(args) => cmd_quota(&client()?, args, output).await,
-        Command::Jobs(args) => jobs::cmd_jobs(args.command, output, state).await,
-    };
-    if let Some(note) = rotation_reminder(rotated_unpersisted.load(Ordering::SeqCst)) {
+            Command::Download(args) => {
+                document(download::cmd_download(&client()?, args, output).await?)
+            }
+            Command::Quota(args) => document(cmd_quota(&client()?, args, output).await?),
+            Command::Jobs(args) => jobs::cmd_jobs(args.command, output, state).await,
+            Command::Worker(args) => document(jobs::run_worker(client(), &args).await?),
+        }
+    }
+    .await;
+    if let Some(note) = home.reminder() {
         eprintln!("{note}");
     }
     result
 }
 
-/// The end-of-run nudge for a rotation that could not be persisted anywhere.
-///
-/// The rotation hook already printed the replacement token when it happened;
-/// this is the last line for a user whose terminal has scrolled past it. Only
-/// the environment-sourced case needs it — with a `.env`, the rotation is
-/// persisted as it happens.
-fn rotation_reminder(unpersisted_rotation: bool) -> Option<&'static str> {
-    unpersisted_rotation.then_some(
-        "PIKPAK_REFRESH_TOKEN came from your environment, so the rotated replacement printed \
-         above could not be saved automatically. Update your environment with it — or put the \
-         token in a .env file, where every rotation is persisted for you.",
-    )
+/// A command's result as the JSON value `main` reports.
+fn document(result: impl Serialize) -> Result<Value> {
+    Ok(serde_json::to_value(result)?)
 }
 
 /// Validate the configured refresh token.
@@ -256,29 +227,20 @@ fn validate_refresh_token(value: Option<String>) -> Result<String> {
     }
 }
 
-fn build_client(
-    env_path: Option<&StdPath>,
-    rotated_unpersisted: Arc<AtomicBool>,
-) -> Result<Client> {
+fn build_client(home: &TokenHome) -> Result<Client> {
     let refresh_token = validate_refresh_token(std::env::var("PIKPAK_REFRESH_TOKEN").ok())?;
 
-    let device_id = env_file::device_id(env_path, &refresh_token);
-    let env_path = env_path.map(StdPath::to_path_buf);
-    let source_path = env_path.clone();
+    let device_id = home.device_id(&refresh_token);
+    let (rotations, source) = (home.clone(), home.clone());
     let mut builder = Client::builder()
         .refresh_token(refresh_token)
         // Persist the moment the server rotates, not when the command ends: a
         // long download can be interrupted at any point, and by then the
         // previous refresh token is already invalid server-side.
-        .on_refresh_token(move |token| {
-            if env_path.is_none() {
-                rotated_unpersisted.store(true, Ordering::SeqCst);
-            }
-            env_file::persist_rotated_token(env_path.as_deref(), token);
-        })
+        .on_refresh_token(move |token| rotations.persist(token))
         // If another process rotated the token first, the replacement it saved is
         // the one that still works — pick it up rather than failing the run.
-        .refresh_token_source(move || env_file::read_env_token(source_path.as_deref()));
+        .refresh_token_source(move || source.reload());
 
     if let Some(id) = device_id {
         builder = builder.device_id(id);
@@ -304,23 +266,23 @@ fn build_client(
 
 /// One entry as it appears in `--json` output.
 #[derive(Debug, Serialize)]
-struct LsEntry<'a> {
-    id: &'a str,
-    name: &'a str,
+struct LsEntry {
+    id: String,
+    name: String,
     /// `"file"`, `"folder"` or `"unknown"` — the server's own notion of kind.
     kind: &'static str,
     size: u64,
-    modified_time: Option<&'a str>,
-    mime_type: Option<&'a str>,
+    modified_time: Option<String>,
+    mime_type: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
-struct LsResult<'a> {
-    path: &'a str,
-    entries: Vec<LsEntry<'a>>,
+struct LsResult {
+    path: String,
+    entries: Vec<LsEntry>,
 }
 
-async fn cmd_ls(client: &Client, args: LsArgs, output: output::Output) -> Result<()> {
+async fn cmd_ls(client: &Client, args: LsArgs, output: output::Output) -> Result<LsResult> {
     let files: Vec<pikpak::FileInfo> = if pikpak::is_drive_root(&args.path) {
         client.list_folder("").await.context("list_folder failed")?
     } else {
@@ -359,23 +321,20 @@ async fn cmd_ls(client: &Client, args: LsArgs, output: output::Output) -> Result
     }
 
     let entries = files
-        .iter()
+        .into_iter()
         .map(|f| LsEntry {
-            id: &f.id,
-            name: &f.name,
             kind: f.kind.label(),
+            id: f.id,
+            name: f.name,
             size: f.size,
-            modified_time: f.modified_time.as_deref(),
-            mime_type: f.mime_type.as_deref(),
+            modified_time: f.modified_time,
+            mime_type: f.mime_type,
         })
         .collect();
-    output.ok(
-        "ls",
-        &LsResult {
-            path: &args.path,
-            entries,
-        },
-    )
+    Ok(LsResult {
+        path: args.path,
+        entries,
+    })
 }
 
 /// The quota as it appears in `--json` output. Always bytes: `--raw` and the
@@ -388,7 +347,11 @@ struct QuotaResult {
     usage_percent: Option<f64>,
 }
 
-async fn cmd_quota(client: &Client, args: QuotaArgs, output: output::Output) -> Result<()> {
+async fn cmd_quota(
+    client: &Client,
+    args: QuotaArgs,
+    output: output::Output,
+) -> Result<QuotaResult> {
     let q: pikpak::Quota = client.quota().await.context("quota failed")?;
 
     if !output.json() {
@@ -408,15 +371,12 @@ async fn cmd_quota(client: &Client, args: QuotaArgs, output: output::Output) -> 
         }
     }
 
-    output.ok(
-        "quota",
-        &QuotaResult {
-            total: q.total,
-            used: q.used,
-            free: q.free(),
-            usage_percent: q.ratio().map(|r| r * 100.0),
-        },
-    )
+    Ok(QuotaResult {
+        total: q.total,
+        used: q.used,
+        free: q.free(),
+        usage_percent: q.ratio().map(|r| r * 100.0),
+    })
 }
 
 #[cfg(test)]
@@ -428,13 +388,13 @@ mod tests {
     #[test]
     fn the_json_shapes_keep_their_field_names() {
         let ls = serde_json::to_value(LsResult {
-            path: "/My Pack",
+            path: "/My Pack".into(),
             entries: vec![LsEntry {
-                id: "f1",
-                name: "video.mp4",
+                id: "f1".into(),
+                name: "video.mp4".into(),
                 kind: "file",
                 size: 123,
-                modified_time: Some("2026-01-02T03:04:05Z"),
+                modified_time: Some("2026-01-02T03:04:05Z".into()),
                 mime_type: None,
             }],
         })
@@ -495,17 +455,6 @@ mod tests {
                 (crate::output::EXIT_AUTH, "auth")
             );
         }
-    }
-
-    #[test]
-    fn rotation_reminder_only_fires_when_nothing_was_persisted() {
-        let note = super::rotation_reminder(true).expect("must remind");
-        assert!(note.contains("could not be saved automatically"), "{note}");
-        assert!(note.contains(".env"), "{note}");
-        assert!(
-            super::rotation_reminder(false).is_none(),
-            "a persisted rotation (the .env case) must not nag"
-        );
     }
 
     #[test]

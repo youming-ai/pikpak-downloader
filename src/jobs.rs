@@ -20,7 +20,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
+use crate::download::DownloadSummary;
 use crate::output::Output;
 use crate::DownloadArgs;
 
@@ -366,8 +368,9 @@ pub(crate) fn start_detached(
     args: &DownloadArgs,
     ui: Output,
     token_from_file: bool,
+    verbose: bool,
     state: &StdPath,
-) -> Result<()> {
+) -> Result<DetachedJob> {
     let store = JobStore::open(state)?;
     let id = new_id();
     let mut record = JobRecord {
@@ -387,7 +390,7 @@ pub(crate) fn start_detached(
     };
     store.create(&record)?;
 
-    let child = spawn_worker(&id, &store, token_from_file).inspect_err(|_| {
+    let child = spawn_worker(&id, &store, token_from_file, verbose).inspect_err(|_| {
         // Nothing is running, so leave nothing behind that claims otherwise.
         let _ = std::fs::remove_file(store.record_path(&id));
     })?;
@@ -399,34 +402,35 @@ pub(crate) fn start_detached(
     let log = store.log_path(&id);
     if !ui.json() {
         println!("{}", record.id);
-        ui.note(format!("job {} started; log: {}", record.id, log.display()));
+        eprintln!("job {} started; log: {}", record.id, log.display());
     }
-    ui.ok(
-        "download",
-        &DetachedJob {
-            path: record.path.clone(),
-            output: record.output.clone(),
-            started_at: record.created_at,
-            log: log.display().to_string(),
-            job: record,
-        },
-    )
+    Ok(DetachedJob {
+        path: record.path.clone(),
+        output: record.output.clone(),
+        started_at: record.created_at,
+        log: log.display().to_string(),
+        job: record,
+    })
 }
 
-/// The worker's command line: this invocation again, plus the job it serves.
+/// The worker's command line: the job and where its record lives. Everything
+/// else it needs is in the record.
 fn worker_command(
     exe: PathBuf,
     id: &str,
     state_root: &StdPath,
     token_from_file: bool,
+    verbose: bool,
 ) -> std::process::Command {
     let mut command = std::process::Command::new(exe);
+    if verbose {
+        command.arg("--verbose");
+    }
     command
-        .args(std::env::args_os().skip(1))
-        .arg("--internal-job")
-        .arg(id)
-        .arg("--internal-state")
-        .arg(state_root);
+        .arg("__worker")
+        .arg("--state")
+        .arg(state_root)
+        .arg(id);
     // dotenvy copied the file's token into this environment. Inherited, it
     // would look to the worker like a token from the real environment — one it
     // must not write back — and every rotation would be lost with the worker.
@@ -438,7 +442,12 @@ fn worker_command(
 
 /// Start a copy of this binary to run the job, detached from this process and
 /// with its output collected in the job's log.
-fn spawn_worker(id: &str, store: &JobStore, token_from_file: bool) -> Result<std::process::Child> {
+fn spawn_worker(
+    id: &str,
+    store: &JobStore,
+    token_from_file: bool,
+    verbose: bool,
+) -> Result<std::process::Child> {
     use std::process::Stdio;
 
     let exe = std::env::current_exe().context("cannot locate this executable to detach")?;
@@ -458,7 +467,7 @@ fn spawn_worker(id: &str, store: &JobStore, token_from_file: bool) -> Result<std
         .try_clone()
         .context("failed to duplicate the log handle")?;
 
-    let mut command = worker_command(exe, id, store.root(), token_from_file);
+    let mut command = worker_command(exe, id, store.root(), token_from_file, verbose);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
@@ -526,11 +535,20 @@ impl JobsCommand {
     }
 }
 
+/// Arguments of the hidden worker command.
+#[derive(Debug, clap::Args)]
+pub(crate) struct WorkerArgs {
+    /// State directory the job's record lives in.
+    #[arg(long)]
+    pub state: PathBuf,
+    /// The job this process runs.
+    pub id: String,
+}
+
 /// `pikpak jobs …`.
-pub(crate) async fn cmd_jobs(command: JobsCommand, ui: Output, state: &StdPath) -> Result<()> {
+pub(crate) async fn cmd_jobs(command: JobsCommand, ui: Output, state: &StdPath) -> Result<Value> {
     // A job that exists has its directory; one that does not is `not_found`.
     let store = JobStore::at(state);
-    let name = command.name();
 
     match command {
         JobsCommand::List => {
@@ -550,49 +568,40 @@ pub(crate) async fn cmd_jobs(command: JobsCommand, ui: Output, state: &StdPath) 
                     );
                 }
             }
-            ui.ok(name, &serde_json::json!({ "jobs": jobs }))
+            Ok(json!({ "jobs": jobs }))
         }
         JobsCommand::Status { id } => {
             let job = store.get(&id)?;
             if !ui.json() {
                 println!("{}", serde_json::to_string_pretty(&job)?);
             }
-            ui.ok(name, &serde_json::json!({ "job": job }))
+            Ok(json!({ "job": job }))
         }
         JobsCommand::Cancel { id } => {
             let (job, cancelled) = store.request_cancel(&id)?;
             if cancelled {
-                ui.note(format!(
+                eprintln!(
                     "cancel requested for {}; the worker stops within a few seconds",
                     job.id
-                ));
+                );
             } else {
-                ui.note(format!(
+                eprintln!(
                     "job {} already {}; nothing to cancel",
                     job.id,
                     state_label(job.state)
-                ));
+                );
             }
-            ui.ok(
-                name,
-                &serde_json::json!({ "cancelled": cancelled, "job": job }),
-            )
+            Ok(json!({ "cancelled": cancelled, "job": job }))
         }
         JobsCommand::Wait {
             id,
             timeout_seconds,
-        } => wait_for(&store, &id, timeout_seconds, name, ui).await,
+        } => wait_for(&store, &id, timeout_seconds, ui).await,
     }
 }
 
 /// Poll a job until it is no longer running.
-async fn wait_for(
-    store: &JobStore,
-    id: &str,
-    timeout_seconds: u64,
-    name: &str,
-    ui: Output,
-) -> Result<()> {
+async fn wait_for(store: &JobStore, id: &str, timeout_seconds: u64, ui: Output) -> Result<Value> {
     let started = now_secs();
     loop {
         let job = store.get(id)?;
@@ -600,17 +609,10 @@ async fn wait_for(
             if !ui.json() {
                 println!("{}", serde_json::to_string_pretty(&job)?);
             }
-            // One document per run: the success envelope only ever comes from the
-            // Succeeded arm, because every other arm returns an error and the
-            // failure envelope is emitted once, by `main`.
-            //
             // Report the code the worker's own failure produced, so the caller
             // branches exactly as it would on a synchronous run.
             return match job.state {
-                JobState::Succeeded => {
-                    ui.ok(name, &serde_json::json!({ "job": job }))?;
-                    Ok(())
-                }
+                JobState::Succeeded => Ok(json!({ "job": job })),
                 JobState::Cancelled => Err(crate::output::Coded {
                     code: crate::output::EXIT_CANCELLED,
                     message: format!("job {id} was cancelled"),
@@ -653,19 +655,29 @@ fn state_label(state: JobState) -> &'static str {
 }
 
 /// Run the download for a detached job, keeping its record current.
-pub(crate) async fn run_worker_download(
-    client: &pikpak::Client,
-    args: DownloadArgs,
-    ui: Output,
-    id: String,
-    state_root: &StdPath,
-) -> Result<()> {
-    let store = JobStore::open(state_root)?;
+///
+/// The arguments come from the record `download --detach` wrote. `client` is
+/// taken unbuilt, so a client that cannot be built — a bad proxy, a token gone
+/// from the `.env` — is recorded as the job's failure rather than leaving it
+/// to be found lost.
+pub(crate) async fn run_worker(
+    client: Result<pikpak::Client>,
+    worker: &WorkerArgs,
+) -> Result<DownloadSummary> {
+    let store = JobStore::open(&worker.state)?;
+    let id = worker.id.clone();
+    let record = store.read(&id)?;
+    let args = DownloadArgs {
+        path: record.path,
+        output: record.output,
+        jobs: record.jobs,
+        detach: false,
+    };
 
     // The watcher is the worker's only tie to the outside world: it beats so
     // `jobs list` can tell a live worker from a dead one, and it honours a
     // cancel request. A cancel ends the process at the next check, which leaves
-    // the `.part` file in place — the resume machinery already treats a torn
+    // the partial in place — the resume machinery already treats a torn
     // partial as a valid resume point.
     let watcher = {
         let store_id = id.clone();
@@ -692,7 +704,12 @@ pub(crate) async fn run_worker_download(
         })
     };
 
-    let outcome = crate::download::cmd_download(client, args, ui).await;
+    // A log is no terminal: narration only, no progress redraws.
+    let ui = Output::new(false, true);
+    let outcome = match client {
+        Ok(client) => crate::download::cmd_download(&client, args, ui).await,
+        Err(error) => Err(error),
+    };
     // Abort only takes effect at the watcher's next await; wait for it, so no
     // beat or cancel of its is still in flight when the outcome is written.
     watcher.abort();
@@ -710,7 +727,7 @@ pub(crate) async fn run_worker_download(
             record.error = None;
             record.exit_code = Some(crate::output::EXIT_OK);
             store.save(&mut record)?;
-            Ok(())
+            Ok(summary)
         }
         Err(error) => {
             record.state = JobState::Failed;
@@ -723,317 +740,4 @@ pub(crate) async fn run_worker_download(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn temp_state(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("pikpak-jobs-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
-    }
-
-    fn record(id: &str, state: JobState, updated_at: u64) -> JobRecord {
-        JobRecord {
-            id: id.to_string(),
-            state,
-            path: "/My Pack".to_string(),
-            output: "./downloads".to_string(),
-            jobs: 2,
-            pid: Some(4242),
-            created_at: updated_at,
-            updated_at,
-            downloaded: 1,
-            failed: 0,
-            bytes: 10,
-            error: None,
-            exit_code: None,
-        }
-    }
-
-    #[test]
-    fn ids_sort_in_creation_order() {
-        let first = new_id();
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let second = new_id();
-        assert!(second > first, "{second} should sort after {first}");
-    }
-
-    #[test]
-    fn a_record_round_trips_through_the_store() {
-        let root = temp_state("roundtrip");
-        let store = JobStore::open(&root).unwrap();
-
-        store
-            .create(&record("1-000001", JobState::Running, now_secs()))
-            .unwrap();
-
-        let read = store.get("1-000001").unwrap();
-        assert_eq!(read.path, "/My Pack");
-        assert_eq!(read.jobs, 2);
-        assert_eq!(read.state, JobState::Running);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn creating_a_job_twice_is_refused() {
-        let root = temp_state("duplicate");
-        let store = JobStore::open(&root).unwrap();
-        store
-            .create(&record("1-000001", JobState::Running, now_secs()))
-            .unwrap();
-
-        assert!(store
-            .create(&record("1-000001", JobState::Running, now_secs()))
-            .is_err());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn an_unknown_job_is_a_not_found_failure() {
-        let root = temp_state("missing");
-        let store = JobStore::open(&root).unwrap();
-
-        let error = store.get("nope").unwrap_err();
-        let missing = error
-            .downcast_ref::<crate::output::Missing>()
-            .expect("an unknown job reports itself as missing");
-        assert!(missing.0.contains("nope"), "{missing}");
-        assert_eq!(
-            crate::output::exit_code_for(&error),
-            (crate::output::EXIT_NOT_FOUND, "not_found")
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn a_running_job_that_stopped_beating_is_reported_lost() {
-        let root = temp_state("stale");
-        let store = JobStore::open(&root).unwrap();
-
-        // Fresh beat: still running.
-        let id = "1-000001";
-        store
-            .create(&record(id, JobState::Running, now_secs()))
-            .unwrap();
-        assert_eq!(store.get(id).unwrap().state, JobState::Running);
-
-        // Silent for longer than the stale window: reported lost, with a reason.
-        let old = now_secs() - STALE_AFTER_SECS - 1;
-        store
-            .create(&record("2-000002", JobState::Running, old))
-            .unwrap();
-        let lost = store.get("2-000002").unwrap();
-        assert_eq!(lost.state, JobState::Lost);
-        assert!(lost.error.unwrap().contains("stopped reporting"));
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn a_terminal_job_is_never_reported_lost() {
-        let root = temp_state("terminal");
-        let store = JobStore::open(&root).unwrap();
-        let old = now_secs() - STALE_AFTER_SECS - 1;
-
-        store
-            .create(&record("1-000001", JobState::Succeeded, old))
-            .unwrap();
-        store
-            .create(&record("2-000002", JobState::Failed, old))
-            .unwrap();
-        store
-            .create(&record("3-000003", JobState::Cancelled, old))
-            .unwrap();
-
-        assert_eq!(store.get("1-000001").unwrap().state, JobState::Succeeded);
-        assert_eq!(store.get("2-000002").unwrap().state, JobState::Failed);
-        assert_eq!(store.get("3-000003").unwrap().state, JobState::Cancelled);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn cancel_requests_are_recorded_and_noticed() {
-        let root = temp_state("cancel");
-        let store = JobStore::open(&root).unwrap();
-        store
-            .create(&record("1-000001", JobState::Running, now_secs()))
-            .unwrap();
-
-        assert!(!store.cancel_requested("1-000001"));
-        store.request_cancel("1-000001").unwrap();
-        assert!(store.cancel_requested("1-000001"));
-        // Asking to cancel an unknown job is a not-found, not a silent success.
-        assert!(store.request_cancel("nope").is_err());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn the_state_directory_is_private() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = temp_state("private");
-        JobStore::open(&root).unwrap();
-
-        for dir in [&root, &root.join("jobs"), &root.join("logs")] {
-            let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o700, "{}", dir.display());
-        }
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn an_older_world_readable_store_is_tightened() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = temp_state("tighten");
-        for dir in ["jobs", "logs"] {
-            std::fs::create_dir_all(root.join(dir)).unwrap();
-            std::fs::set_permissions(root.join(dir), std::fs::Permissions::from_mode(0o755))
-                .unwrap();
-        }
-        let store = JobStore::open(&root).unwrap();
-        store
-            .create(&record("1-000001", JobState::Running, now_secs()))
-            .unwrap();
-
-        let mode = |path: PathBuf| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(root.join("jobs")), 0o700);
-        assert_eq!(mode(root.join("logs")), 0o700);
-        assert_eq!(mode(root.join("jobs").join("1-000001.json")), 0o600);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_symlinked_logs_directory_is_not_tightened() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = temp_state("symlinked");
-        let elsewhere = temp_state("symlinked-target");
-        std::fs::create_dir_all(&elsewhere).unwrap();
-        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::create_dir_all(&root).unwrap();
-        std::os::unix::fs::symlink(&elsewhere, root.join("logs")).unwrap();
-
-        JobStore::open(&root).unwrap();
-
-        let mode = std::fs::metadata(&elsewhere).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o755, "the link's target is not ours to lock down");
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&elsewhere);
-    }
-
-    #[test]
-    fn a_file_where_the_jobs_directory_belongs_is_an_error() {
-        let root = temp_state("not-a-dir");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("jobs"), b"").unwrap();
-        assert!(JobStore::open(&root).is_err());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn ancestors_of_the_state_directory_keep_their_usual_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-        let base = temp_state("ancestors");
-        let mode = |dir: &StdPath| std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
-
-        JobStore::open(&base.join("a").join("state")).unwrap();
-        // What a plain mkdir gives under this umask, for comparison.
-        std::fs::create_dir_all(base.join("plain")).unwrap();
-
-        assert_eq!(mode(&base.join("a")), mode(&base.join("plain")));
-        assert_eq!(mode(&base.join("a").join("state")), 0o700);
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn a_heartbeat_keeps_a_stalled_worker_running_and_never_undoes_an_outcome() {
-        let root = temp_state("beat");
-        let store = JobStore::open(&root).unwrap();
-        let old = now_secs() - STALE_AFTER_SECS - 1;
-
-        // The worker stalled past the window (the machine slept) but is alive:
-        // its next beat revives the record instead of writing `lost` back.
-        store
-            .create(&record("1-000001", JobState::Running, old))
-            .unwrap();
-        store.beat("1-000001").unwrap();
-        let revived = store.get("1-000001").unwrap();
-        assert_eq!(revived.state, JobState::Running);
-        assert_eq!(revived.pid, Some(std::process::id()));
-
-        // A beat after the outcome was written leaves the outcome alone.
-        store
-            .create(&record("2-000002", JobState::Succeeded, old))
-            .unwrap();
-        store.beat("2-000002").unwrap();
-        let done = store.get("2-000002").unwrap();
-        assert_eq!(done.state, JobState::Succeeded);
-        assert_eq!(done.updated_at, old);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn cancelling_a_finished_job_leaves_no_marker() {
-        let root = temp_state("cancel-done");
-        let store = JobStore::open(&root).unwrap();
-        store
-            .create(&record("1-000001", JobState::Succeeded, now_secs()))
-            .unwrap();
-
-        let (job, requested) = store.request_cancel("1-000001").unwrap();
-        assert_eq!(job.state, JobState::Succeeded);
-        assert!(!requested);
-        assert!(!store.cancel_requested("1-000001"));
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn a_stalled_worker_can_still_be_cancelled() {
-        let root = temp_state("cancel-stalled");
-        let store = JobStore::open(&root).unwrap();
-        let old = now_secs() - STALE_AFTER_SECS - 1;
-        store
-            .create(&record("1-000001", JobState::Running, old))
-            .unwrap();
-
-        // Reported lost, but the marker is written for when the worker wakes.
-        let (job, requested) = store.request_cancel("1-000001").unwrap();
-        assert_eq!(job.state, JobState::Lost);
-        assert!(requested);
-        assert!(store.cancel_requested("1-000001"));
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn a_worker_reloads_a_file_token_so_it_can_persist_rotations() {
-        let removed = |command: &std::process::Command| {
-            command
-                .get_envs()
-                .any(|(key, value)| key == "PIKPAK_REFRESH_TOKEN" && value.is_none())
-        };
-        let root = StdPath::new(".pikpak");
-
-        assert!(removed(&worker_command("pikpak".into(), "1", root, true)));
-        // A token from the real environment is the only copy; it must be passed on.
-        assert!(!removed(&worker_command("pikpak".into(), "1", root, false)));
-    }
-
-    #[test]
-    fn listing_skips_unreadable_records_and_sorts_the_rest() {
-        let root = temp_state("list");
-        let store = JobStore::open(&root).unwrap();
-        store
-            .create(&record("2-000002", JobState::Succeeded, now_secs()))
-            .unwrap();
-        store
-            .create(&record("1-000001", JobState::Running, now_secs()))
-            .unwrap();
-        std::fs::write(root.join("jobs").join("3-000003.json"), b"{ not json").unwrap();
-
-        let jobs = store.list().unwrap();
-        let ids: Vec<&str> = jobs.iter().map(|job| job.id.as_str()).collect();
-        assert_eq!(ids, vec!["1-000001", "2-000002"]);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-}
+mod tests;

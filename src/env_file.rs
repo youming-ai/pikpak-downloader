@@ -1,58 +1,141 @@
-//! Persisting the rotated refresh token — and the device id that goes with it —
-//! back into the `.env` file it came from.
+//! Where the refresh token lives — a `.env` file or the environment — and
+//! persisting its rotations, and the device id that goes with them, back there.
 
 use std::path::{Path as StdPath, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-/// Pick the `.env` file a rotated token should be written back to.
-///
-/// `loaded` is the file dotenvy actually read — it searches the working
-/// directory *and its parents* — so preferring it keeps reads and writes on the
-/// same file. Only when no file was loaded do we fall back to a `.env` in the
-/// working directory, and only if one already exists: we never create one.
-pub(crate) fn env_file_for_persistence(
-    loaded: Option<&StdPath>,
-    local: &StdPath,
-) -> Option<PathBuf> {
-    match loaded {
-        Some(path) => Some(path.to_path_buf()),
-        None => local.exists().then(|| local.to_path_buf()),
+/// Where the refresh token came from, and so where its rotations can go.
+#[derive(Debug, Clone)]
+pub(crate) enum TokenHome {
+    /// A `.env` file: each rotation is written back the moment it happens.
+    File(PathBuf),
+    /// The process environment: a rotation can only be printed, and the run
+    /// ends with a reminder once one was.
+    Environment { rotated: Arc<AtomicBool> },
+}
+
+impl TokenHome {
+    /// Decide where the token lives.
+    ///
+    /// `token_from_env` must be read before dotenvy loads anything: dotenvy
+    /// never overrides a variable already present, so a token in the real
+    /// environment is the one in use — and must not be persisted into an
+    /// unrelated `.env`. Otherwise it is `loaded`, the file dotenvy read (it
+    /// searches the working directory *and its parents*), so reads and writes
+    /// stay on one file; failing that an existing `local` `.env`. One is never
+    /// created.
+    pub(crate) fn locate(token_from_env: bool, loaded: Option<&StdPath>, local: &StdPath) -> Self {
+        let file = match loaded {
+            _ if token_from_env => None,
+            Some(path) => Some(path.to_path_buf()),
+            None => local.exists().then(|| local.to_path_buf()),
+        };
+        file.map_or_else(
+            || TokenHome::Environment {
+                rotated: Arc::default(),
+            },
+            TokenHome::File,
+        )
     }
-}
 
-/// Read the refresh token currently stored in `env_path`, if it has one.
-///
-/// Used to recover when another process rotated the token first: the value it
-/// saved is the one that still works. `None` also covers "the token came from
-/// the environment", where there is no file to re-read.
-///
-/// The file is parsed by dotenvy rather than by hand so that a value our own
-/// writer quoted (see [`env_quote`]) reads back exactly as written.
-pub(crate) fn read_env_token(env_path: Option<&StdPath>) -> Option<String> {
-    let content = std::fs::read_to_string(env_path?).ok()?;
-    dotenvy::from_read_iter(std::io::Cursor::new(content))
-        .filter_map(std::result::Result::ok)
-        .find(|(key, _)| key == "PIKPAK_REFRESH_TOKEN")
-        .map(|(_, value)| value)
-}
+    /// Whether rotations land in a file — one a detached worker can reload.
+    pub(crate) fn is_file(&self) -> bool {
+        matches!(self, TokenHome::File(_))
+    }
 
-/// Persist a rotated refresh token and report the outcome.
-///
-/// Runs from the client's rotation hook, so it executes as soon as the server
-/// issues a new token; `None` means there is nowhere to write.
-pub(crate) fn persist_rotated_token(env_path: Option<&StdPath>, token: &str) {
-    let Some(path) = env_path else {
-        eprintln!("note: refresh token rotated; set PIKPAK_REFRESH_TOKEN to:\n  {token}");
-        return;
-    };
-    match update_env_token(path, token) {
-        Ok(true) => eprintln!("note: refresh token rotated; updated {}", path.display()),
-        Ok(false) => {
-            eprintln!("note: refresh token rotated; set PIKPAK_REFRESH_TOKEN to:\n  {token}")
+    /// The refresh token currently stored, if the token lives in a file.
+    ///
+    /// Used to recover when another process rotated the token first: the value
+    /// it saved is the one that still works. The file is parsed by dotenvy
+    /// rather than by hand so that a value our own writer quoted (see
+    /// [`env_quote`]) reads back exactly as written.
+    pub(crate) fn reload(&self) -> Option<String> {
+        let TokenHome::File(path) = self else {
+            return None;
+        };
+        let content = std::fs::read_to_string(path).ok()?;
+        dotenvy::from_read_iter(std::io::Cursor::new(content))
+            .filter_map(std::result::Result::ok)
+            .find(|(key, _)| key == TOKEN_KEY)
+            .map(|(_, value)| value)
+    }
+
+    /// Persist a rotated refresh token and report the outcome.
+    ///
+    /// Runs from the client's rotation hook, so it executes as soon as the
+    /// server issues a new token.
+    pub(crate) fn persist(&self, token: &str) {
+        let path = match self {
+            TokenHome::File(path) => path,
+            TokenHome::Environment { rotated } => {
+                rotated.store(true, Ordering::SeqCst);
+                eprintln!("note: refresh token rotated; set PIKPAK_REFRESH_TOKEN to:\n  {token}");
+                return;
+            }
+        };
+        match update_env_token(path, token) {
+            Ok(true) => eprintln!("note: refresh token rotated; updated {}", path.display()),
+            Ok(false) => {
+                eprintln!("note: refresh token rotated; set PIKPAK_REFRESH_TOKEN to:\n  {token}")
+            }
+            Err(e) => eprintln!(
+                "warning: refresh token rotated but {} could not be updated ({e}); new token:\n  {token}",
+                path.display()
+            ),
         }
-        Err(e) => eprintln!(
-            "warning: refresh token rotated but {} could not be updated ({e}); new token:\n  {token}",
-            path.display()
-        ),
+    }
+
+    /// The end-of-run nudge for a rotation that could not be persisted.
+    ///
+    /// [`persist`](Self::persist) already printed the replacement when it
+    /// happened; this is the last line for a user whose terminal has scrolled
+    /// past it. A file needs none — its rotations are written as they happen.
+    pub(crate) fn reminder(&self) -> Option<&'static str> {
+        match self {
+            TokenHome::Environment { rotated } if rotated.load(Ordering::SeqCst) => Some(
+                "PIKPAK_REFRESH_TOKEN came from your environment, so the rotated replacement \
+                 printed above could not be saved automatically. Update your environment with \
+                 it — or put the token in a .env file, where every rotation is persisted for you.",
+            ),
+            _ => None,
+        }
+    }
+
+    /// The device id to send: `PIKPAK_DEVICE_ID` if set, else one fixed now and
+    /// saved to the token's file, so every later run sends the same one.
+    ///
+    /// The library's default derives it from the refresh token, which rotates on
+    /// every run, so each run would otherwise announce itself as a new device.
+    /// The saved id is that same derivation, so the first run sends what it
+    /// always did. `None` — nowhere to save it — leaves the library's default in
+    /// place.
+    pub(crate) fn device_id(&self, refresh_token: &str) -> Option<String> {
+        if let Ok(id) = std::env::var(DEVICE_KEY) {
+            if !id.trim().is_empty() {
+                return Some(id);
+            }
+        }
+        let TokenHome::File(path) = self else {
+            return None;
+        };
+        let id = pikpak::device_id_from(refresh_token);
+        // ponytail: no file lock — a token rotation written back in the same
+        // millisecond could be lost to this write, once per `.env`. Lock the file if
+        // that ever shows up.
+        let failure = match set_env_var(path, DEVICE_KEY, &id, true) {
+            Ok(true) => None,
+            // The file vanished after it was loaded.
+            Ok(false) => Some("it no longer exists".to_string()),
+            Err(e) => Some(e.to_string()),
+        };
+        if let Some(why) = failure {
+            eprintln!(
+                "warning: could not save {DEVICE_KEY} to {} ({why}); this run uses {id}",
+                path.display()
+            );
+        }
+        Some(id)
     }
 }
 
@@ -64,39 +147,6 @@ const DEVICE_KEY: &str = "PIKPAK_DEVICE_ID";
 /// `Ok(false)` if the file is absent or has no such key.
 fn update_env_token(env_path: &StdPath, new_token: &str) -> std::io::Result<bool> {
     set_env_var(env_path, TOKEN_KEY, new_token, false)
-}
-
-/// The device id to send: `PIKPAK_DEVICE_ID` if set, else one fixed now and
-/// saved to `env_path`, so every later run sends the same one.
-///
-/// The library's default derives it from the refresh token, which rotates on
-/// every run, so each run would otherwise announce itself as a new device. The
-/// saved id is that same derivation, so the first run sends what it always
-/// did. `None` — nowhere to save it — leaves the library's default in place.
-pub(crate) fn device_id(env_path: Option<&StdPath>, refresh_token: &str) -> Option<String> {
-    if let Ok(id) = std::env::var(DEVICE_KEY) {
-        if !id.trim().is_empty() {
-            return Some(id);
-        }
-    }
-    let path = env_path?;
-    let id = pikpak::device_id_from(refresh_token);
-    // ponytail: no file lock — a token rotation written back in the same
-    // millisecond could be lost to this write, once per `.env`. Lock the file if
-    // that ever shows up.
-    let failure = match set_env_var(path, DEVICE_KEY, &id, true) {
-        Ok(true) => None,
-        // The file vanished after it was loaded.
-        Ok(false) => Some("it no longer exists".to_string()),
-        Err(e) => Some(e.to_string()),
-    };
-    if let Some(why) = failure {
-        eprintln!(
-            "warning: could not save {DEVICE_KEY} to {} ({why}); this run uses {id}",
-            path.display()
-        );
-    }
-    Some(id)
 }
 
 /// Rewrite every `key=` line in `env_path`, preserving every other line; when
@@ -256,7 +306,7 @@ fn write_atomically(path: &StdPath, bytes: &[u8]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::update_env_token;
+    use super::{update_env_token, TokenHome};
 
     fn token_key_offset(line: &str) -> Option<usize> {
         super::key_offset(line, super::TOKEN_KEY)
@@ -538,36 +588,40 @@ mod tests {
     }
 
     #[test]
-    fn env_file_for_persistence_prefers_the_loaded_path() {
+    fn the_token_lives_in_the_loaded_file_unless_it_came_from_the_environment() {
         let dir = std::env::temp_dir().join(format!("pikpak-envpath-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let local = dir.join(".env");
         let parent = dir.join("parent.env");
         std::fs::write(&local, "X=1\n").unwrap();
         std::fs::write(&parent, "X=1\n").unwrap();
+        let file = |home: TokenHome| match home {
+            TokenHome::File(path) => Some(path),
+            TokenHome::Environment { .. } => None,
+        };
 
         // dotenvy may have loaded a file in a parent directory; that file is the
         // one being read, so it must also be the one written.
         assert_eq!(
-            super::env_file_for_persistence(Some(&parent), &local).unwrap(),
-            parent
+            file(TokenHome::locate(false, Some(&parent), &local)),
+            Some(parent.clone())
         );
-
         // With no loaded file, an existing local `.env` is used...
         assert_eq!(
-            super::env_file_for_persistence(None, &local).unwrap(),
-            local
+            file(TokenHome::locate(false, None, &local)),
+            Some(local.clone())
         );
-
         // ...and a missing one is never created.
         let missing = dir.join("absent.env");
-        assert_eq!(super::env_file_for_persistence(None, &missing), None);
+        assert_eq!(file(TokenHome::locate(false, None, &missing)), None);
+        // A token from the real environment is never written into a file.
+        assert_eq!(file(TokenHome::locate(true, Some(&parent), &local)), None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn persist_rotated_token_rewrites_the_loaded_file() {
+    fn persisting_rewrites_the_loaded_file() {
         let dir = std::env::temp_dir().join(format!("pikpak-persist-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let env_path = dir.join(".env");
@@ -577,12 +631,27 @@ mod tests {
         )
         .unwrap();
 
-        super::persist_rotated_token(Some(&env_path), "rotated");
+        let home = TokenHome::File(env_path.clone());
+        home.persist("rotated");
 
         let content = std::fs::read_to_string(&env_path).unwrap();
         assert!(content.contains("PIKPAK_REFRESH_TOKEN=rotated"));
         assert!(content.contains("PIKPAK_PROXY=http://x"));
+        assert!(
+            home.reminder().is_none(),
+            "a persisted rotation must not nag"
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_environment_token_reminds_only_once_it_rotated() {
+        let home = TokenHome::locate(true, None, std::path::Path::new(".env"));
+        assert!(home.reminder().is_none(), "nothing rotated, nothing to say");
+        home.persist("rotated");
+        let note = home.reminder().expect("must remind");
+        assert!(note.contains("could not be saved automatically"), "{note}");
+        assert!(note.contains(".env"), "{note}");
     }
 
     #[cfg(unix)]
@@ -618,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn read_env_token_returns_the_stored_value() {
+    fn reload_returns_the_stored_value() {
         let dir = std::env::temp_dir().join(format!("pikpak-read-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let env_path = dir.join(".env");
@@ -629,30 +698,31 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            super::read_env_token(Some(&env_path)).as_deref(),
+            TokenHome::File(env_path.clone()).reload().as_deref(),
             Some("stored-token")
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn read_env_token_is_none_without_a_file_or_a_key() {
+    fn reload_is_none_without_a_file_or_a_key() {
         let dir = std::env::temp_dir().join(format!("pikpak-read2-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
-        // No path at all (the token came from the environment), and no file.
-        assert_eq!(super::read_env_token(None), None);
-        assert_eq!(super::read_env_token(Some(&dir.join("absent.env"))), None);
+        // No file at all (the token came from the environment), and no file.
+        let environment = TokenHome::locate(true, None, &dir.join(".env"));
+        assert_eq!(environment.reload(), None);
+        assert_eq!(TokenHome::File(dir.join("absent.env")).reload(), None);
 
         // A file without the key.
         let other = dir.join("other.env");
         std::fs::write(&other, "PIKPAK_PROXY=http://x\n").unwrap();
-        assert_eq!(super::read_env_token(Some(&other)), None);
+        assert_eq!(TokenHome::File(other).reload(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn read_env_token_round_trips_what_the_writer_stored() {
+    fn reload_round_trips_what_the_writer_stored() {
         // A reload hands the client whatever this returns, so the writer and the
         // reader must agree byte-for-byte — including values `env_quote` had to
         // quote or escape.
@@ -671,7 +741,7 @@ mod tests {
         ] {
             assert!(super::update_env_token(&env_path, token).unwrap());
             assert_eq!(
-                super::read_env_token(Some(&env_path)).as_deref(),
+                TokenHome::File(env_path.clone()).reload().as_deref(),
                 Some(token),
                 "reload must return {token:?} unchanged"
             );
