@@ -15,7 +15,6 @@
 use anyhow::Error as AnyError;
 use serde::Serialize;
 use serde_json::Value;
-use std::fmt::Display;
 
 /// The run succeeded.
 pub const EXIT_OK: u8 = 0;
@@ -101,18 +100,12 @@ impl Output {
         !self.no_progress && jobs == 1
     }
 
-    /// Narration. Goes to stderr in both modes.
-    pub fn note(self, message: impl Display) {
-        eprintln!("{message}");
-    }
-
     /// The result document. Printed only in JSON mode — the human-readable data
     /// has already been written by the command itself.
-    pub fn ok<T: Serialize>(self, command: &str, result: &T) -> anyhow::Result<()> {
+    pub fn ok<T: Serialize>(self, command: &str, result: &T) {
         if self.json {
             self.print(result_document(command, result));
         }
-        Ok(())
     }
 
     /// The failure document, so a caller that parses stdout gets JSON even when

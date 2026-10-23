@@ -246,17 +246,15 @@ pub(crate) async fn cmd_download(
     plan.walk(client).await?;
     let tasks = plan.tasks;
 
-    let empty = DownloadSummary {
-        output: args.output.clone(),
-        files: 0,
-        downloaded: 0,
-        failed: 0,
-        bytes: 0,
-    };
     if tasks.is_empty() {
-        ui.note("(nothing to download)");
-        ui.ok("download", &empty)?;
-        return Ok(empty);
+        eprintln!("(nothing to download)");
+        return Ok(DownloadSummary {
+            output: args.output,
+            files: 0,
+            downloaded: 0,
+            failed: 0,
+            bytes: 0,
+        });
     }
 
     let parts = output.join(PARTS_DIR);
@@ -308,7 +306,7 @@ pub(crate) async fn cmd_download(
             }
             Err(e) => {
                 failed += 1;
-                ui.note(format!("error: {e:#}"));
+                eprintln!("error: {e:#}");
                 if first_err.as_ref().is_none_or(|(first, _)| index < *first) {
                     first_err = Some((index, e));
                 }
@@ -317,29 +315,18 @@ pub(crate) async fn cmd_download(
     }
     // Gone once nothing is left to resume; kept, with its partials, otherwise.
     let _ = tokio::fs::remove_dir(&parts).await;
-    let first_err = first_err.map(|(_, e)| e);
-
-    let summary = DownloadSummary {
-        output: args.output.clone(),
-        files: planned,
-        downloaded,
-        failed,
-        bytes,
-    };
-    // A failed run emits exactly one document — the failure — so the counts go
-    // into its message rather than a second document on stdout. The summary is
-    // reported only when nothing failed.
+    // A failed run reports only its failure, so the counts travel in its message.
     match first_err {
-        Some(e) => Err(e).with_context(|| {
-            format!(
-                "{failed} of {planned} files failed ({} downloaded, {} bytes)",
-                summary.downloaded, summary.bytes
-            )
+        Some((_, e)) => Err(e).context(format!(
+            "{failed} of {planned} files failed ({downloaded} downloaded, {bytes} bytes)"
+        )),
+        None => Ok(DownloadSummary {
+            output: args.output,
+            files: planned,
+            downloaded,
+            failed,
+            bytes,
         }),
-        None => {
-            ui.ok("download", &summary)?;
-            Ok(summary)
-        }
     }
 }
 

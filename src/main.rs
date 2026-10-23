@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::path::{Path as StdPath, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,6 +12,7 @@ use tracing_subscriber::EnvFilter;
 use pikpak::auth::OAuthCredentials;
 use pikpak::{Client, FileKind};
 use serde::Serialize;
+use serde_json::Value;
 
 mod download;
 mod env_file;
@@ -39,17 +41,6 @@ struct Cli {
     #[arg(long, global = true)]
     no_progress: bool,
 
-    /// Internal: the detached job this process is the worker for.
-    ///
-    /// Set by `download --detach` when it re-executes this binary. Not part of
-    /// the interface.
-    #[arg(long, hide = true, global = true)]
-    internal_job: Option<String>,
-
-    /// Internal: state directory the worker keeps its record in.
-    #[arg(long, hide = true, global = true)]
-    internal_state: Option<PathBuf>,
-
     #[command(subcommand)]
     command: Command,
 }
@@ -62,6 +53,7 @@ impl Command {
             Command::Download(_) => "download",
             Command::Quota(_) => "quota",
             Command::Jobs(args) => args.command.name(),
+            Command::Worker(_) => "worker",
         }
     }
 }
@@ -76,6 +68,9 @@ enum Command {
     Quota(QuotaArgs),
     /// Inspect or control detached downloads.
     Jobs(jobs::JobsArgs),
+    /// Internal: run a detached job, as started by `download --detach`.
+    #[command(name = "__worker", hide = true)]
+    Worker(jobs::WorkerArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -134,7 +129,10 @@ async fn main() -> ExitCode {
     let state = jobs::state_dir(loaded_env.as_deref());
 
     let cli = Cli::parse();
-    let output = output::Output::new(cli.json, cli.no_progress);
+    // Progress redraws one line in place: on anything but a terminal (a
+    // worker's log, an agent's captured stderr) it is only noise.
+    let no_progress = cli.no_progress || !std::io::stderr().is_terminal();
+    let output = output::Output::new(cli.json, no_progress);
     let command = cli.command.name();
 
     // A panic is a bug, but still a failure the caller must be able to parse:
@@ -168,7 +166,10 @@ async fn main() -> ExitCode {
         .init();
 
     match run(cli, env_path, &state, output).await {
-        Ok(()) => ExitCode::from(output::EXIT_OK),
+        Ok(result) => {
+            output.ok(command, &result);
+            ExitCode::from(output::EXIT_OK)
+        }
         Err(e) => {
             // The human line always goes to stderr; the JSON document is what a
             // caller parses, and carries the same code the process exits with.
@@ -184,7 +185,7 @@ async fn run(
     env_path: Option<PathBuf>,
     state: &StdPath,
     output: output::Output,
-) -> Result<()> {
+) -> Result<Value> {
     // Set by the rotation hook when a rotation happened that could not be
     // written anywhere, so the run can end with a nudge about it.
     let rotated_unpersisted = Arc::new(AtomicBool::new(false));
@@ -192,36 +193,42 @@ async fn run(
     // asking what is already running should not fail because the token has since
     // been rotated away.
     let client = || build_client(env_path.as_deref(), rotated_unpersisted.clone());
-    let result = match cli.command {
-        Command::Ls(args) => cmd_ls(&client()?, args, output).await,
-        Command::Download(args) => match (&cli.internal_job, args.detach) {
-            // This process *is* the worker for a detached job.
-            (Some(id), _) => jobs::run_worker_download(
-                &client()?,
-                args,
-                output,
-                id.clone(),
-                // The worker's parent always passes its own state directory.
-                cli.internal_state.as_deref().unwrap_or(state),
-            )
-            .await
-            .map(|_| ()),
+    let verbose = cli.verbose;
+    // Every command hands back its result; `main` alone turns it into the one
+    // document stdout carries.
+    let result = async {
+        match cli.command {
+            Command::Ls(args) => document(cmd_ls(&client()?, args, output).await?),
             // Fail here rather than start a job that cannot authenticate.
-            (None, true) => {
+            Command::Download(args) if args.detach => {
                 validate_refresh_token(std::env::var("PIKPAK_REFRESH_TOKEN").ok())?;
-                jobs::start_detached(&args, output, env_path.is_some(), state).map(|_| ())
+                let token_from_file = env_path.is_some();
+                document(jobs::start_detached(
+                    &args,
+                    output,
+                    token_from_file,
+                    verbose,
+                    state,
+                )?)
             }
-            (None, false) => download::cmd_download(&client()?, args, output)
-                .await
-                .map(|_| ()),
-        },
-        Command::Quota(args) => cmd_quota(&client()?, args, output).await,
-        Command::Jobs(args) => jobs::cmd_jobs(args.command, output, state).await,
-    };
+            Command::Download(args) => {
+                document(download::cmd_download(&client()?, args, output).await?)
+            }
+            Command::Quota(args) => document(cmd_quota(&client()?, args, output).await?),
+            Command::Jobs(args) => jobs::cmd_jobs(args.command, output, state).await,
+            Command::Worker(args) => document(jobs::run_worker(client(), &args).await?),
+        }
+    }
+    .await;
     if let Some(note) = rotation_reminder(rotated_unpersisted.load(Ordering::SeqCst)) {
         eprintln!("{note}");
     }
     result
+}
+
+/// A command's result as the JSON value `main` reports.
+fn document(result: impl Serialize) -> Result<Value> {
+    Ok(serde_json::to_value(result)?)
 }
 
 /// The end-of-run nudge for a rotation that could not be persisted anywhere.
@@ -304,23 +311,23 @@ fn build_client(
 
 /// One entry as it appears in `--json` output.
 #[derive(Debug, Serialize)]
-struct LsEntry<'a> {
-    id: &'a str,
-    name: &'a str,
+struct LsEntry {
+    id: String,
+    name: String,
     /// `"file"`, `"folder"` or `"unknown"` — the server's own notion of kind.
     kind: &'static str,
     size: u64,
-    modified_time: Option<&'a str>,
-    mime_type: Option<&'a str>,
+    modified_time: Option<String>,
+    mime_type: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
-struct LsResult<'a> {
-    path: &'a str,
-    entries: Vec<LsEntry<'a>>,
+struct LsResult {
+    path: String,
+    entries: Vec<LsEntry>,
 }
 
-async fn cmd_ls(client: &Client, args: LsArgs, output: output::Output) -> Result<()> {
+async fn cmd_ls(client: &Client, args: LsArgs, output: output::Output) -> Result<LsResult> {
     let files: Vec<pikpak::FileInfo> = if pikpak::is_drive_root(&args.path) {
         client.list_folder("").await.context("list_folder failed")?
     } else {
@@ -359,23 +366,20 @@ async fn cmd_ls(client: &Client, args: LsArgs, output: output::Output) -> Result
     }
 
     let entries = files
-        .iter()
+        .into_iter()
         .map(|f| LsEntry {
-            id: &f.id,
-            name: &f.name,
             kind: f.kind.label(),
+            id: f.id,
+            name: f.name,
             size: f.size,
-            modified_time: f.modified_time.as_deref(),
-            mime_type: f.mime_type.as_deref(),
+            modified_time: f.modified_time,
+            mime_type: f.mime_type,
         })
         .collect();
-    output.ok(
-        "ls",
-        &LsResult {
-            path: &args.path,
-            entries,
-        },
-    )
+    Ok(LsResult {
+        path: args.path,
+        entries,
+    })
 }
 
 /// The quota as it appears in `--json` output. Always bytes: `--raw` and the
@@ -388,7 +392,11 @@ struct QuotaResult {
     usage_percent: Option<f64>,
 }
 
-async fn cmd_quota(client: &Client, args: QuotaArgs, output: output::Output) -> Result<()> {
+async fn cmd_quota(
+    client: &Client,
+    args: QuotaArgs,
+    output: output::Output,
+) -> Result<QuotaResult> {
     let q: pikpak::Quota = client.quota().await.context("quota failed")?;
 
     if !output.json() {
@@ -408,15 +416,12 @@ async fn cmd_quota(client: &Client, args: QuotaArgs, output: output::Output) -> 
         }
     }
 
-    output.ok(
-        "quota",
-        &QuotaResult {
-            total: q.total,
-            used: q.used,
-            free: q.free(),
-            usage_percent: q.ratio().map(|r| r * 100.0),
-        },
-    )
+    Ok(QuotaResult {
+        total: q.total,
+        used: q.used,
+        free: q.free(),
+        usage_percent: q.ratio().map(|r| r * 100.0),
+    })
 }
 
 #[cfg(test)]
@@ -428,13 +433,13 @@ mod tests {
     #[test]
     fn the_json_shapes_keep_their_field_names() {
         let ls = serde_json::to_value(LsResult {
-            path: "/My Pack",
+            path: "/My Pack".into(),
             entries: vec![LsEntry {
-                id: "f1",
-                name: "video.mp4",
+                id: "f1".into(),
+                name: "video.mp4".into(),
                 kind: "file",
                 size: 123,
-                modified_time: Some("2026-01-02T03:04:05Z"),
+                modified_time: Some("2026-01-02T03:04:05Z".into()),
                 mime_type: None,
             }],
         })

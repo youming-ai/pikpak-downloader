@@ -20,7 +20,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
+use crate::download::DownloadSummary;
 use crate::output::Output;
 use crate::DownloadArgs;
 
@@ -366,8 +368,9 @@ pub(crate) fn start_detached(
     args: &DownloadArgs,
     ui: Output,
     token_from_file: bool,
+    verbose: bool,
     state: &StdPath,
-) -> Result<()> {
+) -> Result<DetachedJob> {
     let store = JobStore::open(state)?;
     let id = new_id();
     let mut record = JobRecord {
@@ -387,7 +390,7 @@ pub(crate) fn start_detached(
     };
     store.create(&record)?;
 
-    let child = spawn_worker(&id, &store, token_from_file).inspect_err(|_| {
+    let child = spawn_worker(&id, &store, token_from_file, verbose).inspect_err(|_| {
         // Nothing is running, so leave nothing behind that claims otherwise.
         let _ = std::fs::remove_file(store.record_path(&id));
     })?;
@@ -399,34 +402,35 @@ pub(crate) fn start_detached(
     let log = store.log_path(&id);
     if !ui.json() {
         println!("{}", record.id);
-        ui.note(format!("job {} started; log: {}", record.id, log.display()));
+        eprintln!("job {} started; log: {}", record.id, log.display());
     }
-    ui.ok(
-        "download",
-        &DetachedJob {
-            path: record.path.clone(),
-            output: record.output.clone(),
-            started_at: record.created_at,
-            log: log.display().to_string(),
-            job: record,
-        },
-    )
+    Ok(DetachedJob {
+        path: record.path.clone(),
+        output: record.output.clone(),
+        started_at: record.created_at,
+        log: log.display().to_string(),
+        job: record,
+    })
 }
 
-/// The worker's command line: this invocation again, plus the job it serves.
+/// The worker's command line: the job and where its record lives. Everything
+/// else it needs is in the record.
 fn worker_command(
     exe: PathBuf,
     id: &str,
     state_root: &StdPath,
     token_from_file: bool,
+    verbose: bool,
 ) -> std::process::Command {
     let mut command = std::process::Command::new(exe);
+    if verbose {
+        command.arg("--verbose");
+    }
     command
-        .args(std::env::args_os().skip(1))
-        .arg("--internal-job")
-        .arg(id)
-        .arg("--internal-state")
-        .arg(state_root);
+        .arg("__worker")
+        .arg("--state")
+        .arg(state_root)
+        .arg(id);
     // dotenvy copied the file's token into this environment. Inherited, it
     // would look to the worker like a token from the real environment — one it
     // must not write back — and every rotation would be lost with the worker.
@@ -438,7 +442,12 @@ fn worker_command(
 
 /// Start a copy of this binary to run the job, detached from this process and
 /// with its output collected in the job's log.
-fn spawn_worker(id: &str, store: &JobStore, token_from_file: bool) -> Result<std::process::Child> {
+fn spawn_worker(
+    id: &str,
+    store: &JobStore,
+    token_from_file: bool,
+    verbose: bool,
+) -> Result<std::process::Child> {
     use std::process::Stdio;
 
     let exe = std::env::current_exe().context("cannot locate this executable to detach")?;
@@ -458,7 +467,7 @@ fn spawn_worker(id: &str, store: &JobStore, token_from_file: bool) -> Result<std
         .try_clone()
         .context("failed to duplicate the log handle")?;
 
-    let mut command = worker_command(exe, id, store.root(), token_from_file);
+    let mut command = worker_command(exe, id, store.root(), token_from_file, verbose);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
@@ -526,11 +535,20 @@ impl JobsCommand {
     }
 }
 
+/// Arguments of the hidden worker command.
+#[derive(Debug, clap::Args)]
+pub(crate) struct WorkerArgs {
+    /// State directory the job's record lives in.
+    #[arg(long)]
+    pub state: PathBuf,
+    /// The job this process runs.
+    pub id: String,
+}
+
 /// `pikpak jobs …`.
-pub(crate) async fn cmd_jobs(command: JobsCommand, ui: Output, state: &StdPath) -> Result<()> {
+pub(crate) async fn cmd_jobs(command: JobsCommand, ui: Output, state: &StdPath) -> Result<Value> {
     // A job that exists has its directory; one that does not is `not_found`.
     let store = JobStore::at(state);
-    let name = command.name();
 
     match command {
         JobsCommand::List => {
@@ -550,49 +568,40 @@ pub(crate) async fn cmd_jobs(command: JobsCommand, ui: Output, state: &StdPath) 
                     );
                 }
             }
-            ui.ok(name, &serde_json::json!({ "jobs": jobs }))
+            Ok(json!({ "jobs": jobs }))
         }
         JobsCommand::Status { id } => {
             let job = store.get(&id)?;
             if !ui.json() {
                 println!("{}", serde_json::to_string_pretty(&job)?);
             }
-            ui.ok(name, &serde_json::json!({ "job": job }))
+            Ok(json!({ "job": job }))
         }
         JobsCommand::Cancel { id } => {
             let (job, cancelled) = store.request_cancel(&id)?;
             if cancelled {
-                ui.note(format!(
+                eprintln!(
                     "cancel requested for {}; the worker stops within a few seconds",
                     job.id
-                ));
+                );
             } else {
-                ui.note(format!(
+                eprintln!(
                     "job {} already {}; nothing to cancel",
                     job.id,
                     state_label(job.state)
-                ));
+                );
             }
-            ui.ok(
-                name,
-                &serde_json::json!({ "cancelled": cancelled, "job": job }),
-            )
+            Ok(json!({ "cancelled": cancelled, "job": job }))
         }
         JobsCommand::Wait {
             id,
             timeout_seconds,
-        } => wait_for(&store, &id, timeout_seconds, name, ui).await,
+        } => wait_for(&store, &id, timeout_seconds, ui).await,
     }
 }
 
 /// Poll a job until it is no longer running.
-async fn wait_for(
-    store: &JobStore,
-    id: &str,
-    timeout_seconds: u64,
-    name: &str,
-    ui: Output,
-) -> Result<()> {
+async fn wait_for(store: &JobStore, id: &str, timeout_seconds: u64, ui: Output) -> Result<Value> {
     let started = now_secs();
     loop {
         let job = store.get(id)?;
@@ -600,17 +609,10 @@ async fn wait_for(
             if !ui.json() {
                 println!("{}", serde_json::to_string_pretty(&job)?);
             }
-            // One document per run: the success envelope only ever comes from the
-            // Succeeded arm, because every other arm returns an error and the
-            // failure envelope is emitted once, by `main`.
-            //
             // Report the code the worker's own failure produced, so the caller
             // branches exactly as it would on a synchronous run.
             return match job.state {
-                JobState::Succeeded => {
-                    ui.ok(name, &serde_json::json!({ "job": job }))?;
-                    Ok(())
-                }
+                JobState::Succeeded => Ok(json!({ "job": job })),
                 JobState::Cancelled => Err(crate::output::Coded {
                     code: crate::output::EXIT_CANCELLED,
                     message: format!("job {id} was cancelled"),
@@ -653,19 +655,29 @@ fn state_label(state: JobState) -> &'static str {
 }
 
 /// Run the download for a detached job, keeping its record current.
-pub(crate) async fn run_worker_download(
-    client: &pikpak::Client,
-    args: DownloadArgs,
-    ui: Output,
-    id: String,
-    state_root: &StdPath,
-) -> Result<()> {
-    let store = JobStore::open(state_root)?;
+///
+/// The arguments come from the record `download --detach` wrote. `client` is
+/// taken unbuilt, so a client that cannot be built — a bad proxy, a token gone
+/// from the `.env` — is recorded as the job's failure rather than leaving it
+/// to be found lost.
+pub(crate) async fn run_worker(
+    client: Result<pikpak::Client>,
+    worker: &WorkerArgs,
+) -> Result<DownloadSummary> {
+    let store = JobStore::open(&worker.state)?;
+    let id = worker.id.clone();
+    let record = store.read(&id)?;
+    let args = DownloadArgs {
+        path: record.path,
+        output: record.output,
+        jobs: record.jobs,
+        detach: false,
+    };
 
     // The watcher is the worker's only tie to the outside world: it beats so
     // `jobs list` can tell a live worker from a dead one, and it honours a
     // cancel request. A cancel ends the process at the next check, which leaves
-    // the `.part` file in place — the resume machinery already treats a torn
+    // the partial in place — the resume machinery already treats a torn
     // partial as a valid resume point.
     let watcher = {
         let store_id = id.clone();
@@ -692,7 +704,12 @@ pub(crate) async fn run_worker_download(
         })
     };
 
-    let outcome = crate::download::cmd_download(client, args, ui).await;
+    // A log is no terminal: narration only, no progress redraws.
+    let ui = Output::new(false, true);
+    let outcome = match client {
+        Ok(client) => crate::download::cmd_download(&client, args, ui).await,
+        Err(error) => Err(error),
+    };
     // Abort only takes effect at the watcher's next await; wait for it, so no
     // beat or cancel of its is still in flight when the outcome is written.
     watcher.abort();
@@ -710,7 +727,7 @@ pub(crate) async fn run_worker_download(
             record.error = None;
             record.exit_code = Some(crate::output::EXIT_OK);
             store.save(&mut record)?;
-            Ok(())
+            Ok(summary)
         }
         Err(error) => {
             record.state = JobState::Failed;
@@ -1005,6 +1022,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[tokio::test]
+    async fn a_worker_whose_client_cannot_be_built_records_the_failure() {
+        let root = temp_state("unbuildable");
+        let store = JobStore::open(&root).unwrap();
+        store
+            .create(&record("1", JobState::Running, now_secs()))
+            .unwrap();
+
+        let worker = WorkerArgs {
+            state: root.clone(),
+            id: "1".to_string(),
+        };
+        let missing = Err(pikpak::Error::NotConfigured("PIKPAK_REFRESH_TOKEN").into());
+        run_worker(missing, &worker)
+            .await
+            .expect_err("no client, no download");
+
+        // Failed with the code a synchronous run would exit with — not left
+        // `running` to be found lost.
+        let job = store.get("1").unwrap();
+        assert_eq!(job.state, JobState::Failed);
+        assert_eq!(job.exit_code, Some(crate::output::EXIT_AUTH));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_worker_is_told_only_its_job_not_the_original_arguments() {
+        let command = worker_command("pikpak".into(), "1", StdPath::new("/s"), false, true);
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, ["--verbose", "__worker", "--state", "/s", "1"]);
+    }
+
     #[test]
     fn a_worker_reloads_a_file_token_so_it_can_persist_rotations() {
         let removed = |command: &std::process::Command| {
@@ -1014,9 +1063,21 @@ mod tests {
         };
         let root = StdPath::new(".pikpak");
 
-        assert!(removed(&worker_command("pikpak".into(), "1", root, true)));
+        assert!(removed(&worker_command(
+            "pikpak".into(),
+            "1",
+            root,
+            true,
+            false
+        )));
         // A token from the real environment is the only copy; it must be passed on.
-        assert!(!removed(&worker_command("pikpak".into(), "1", root, false)));
+        assert!(!removed(&worker_command(
+            "pikpak".into(),
+            "1",
+            root,
+            false,
+            false
+        )));
     }
 
     #[test]

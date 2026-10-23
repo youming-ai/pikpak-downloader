@@ -27,7 +27,7 @@ pikpak [--json] [--no-progress] [--verbose] <command> [options]
 | flag | effect |
 | --- | --- |
 | `--json` | Emit the JSON document on stdout. Global: it may precede or follow the subcommand. |
-| `--no-progress` | Never draw byte-level progress (it is stderr-only either way). |
+| `--no-progress` | Never draw byte-level progress. It is drawn only when stderr is a terminal, and only there. |
 | `--verbose` | Debug logging on stderr. |
 
 ## Exit codes
