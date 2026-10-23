@@ -373,6 +373,7 @@ mod tests {
             crate::auth::OAuthCredentials::default(),
             "device-1",
             "initial-token",
+            crate::auth::TokenHooks::default(),
         );
         CaptchaManager::new(
             http,

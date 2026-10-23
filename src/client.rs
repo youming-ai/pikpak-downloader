@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use md5::{Digest, Md5};
 use serde::Deserialize;
 
-use crate::auth::{OAuthCredentials, TokenManager};
+use crate::auth::{OAuthCredentials, TokenHooks, TokenManager};
 use crate::captcha::CaptchaManager;
 use crate::error::{Error, Result};
 use crate::types::{deserialize_lenient_u64, deserialize_optional_lenient_u64, FileInfo, Quota};
@@ -31,12 +31,6 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// User-Agent string baked into the upstream pikpakcli project (Android build).
 const DEFAULT_USER_AGENT: &str = "ANDROID-com.pikcloud.pikpak/1.21.0";
-
-/// Shared callback invoked with each newly rotated refresh token.
-type RefreshTokenHook = Arc<dyn Fn(&str) + Send + Sync>;
-
-/// Shared callback returning the refresh token the caller has persisted.
-type RefreshTokenSource = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
 /// Public API surface: every PikPak operation goes through this struct.
 ///
@@ -61,8 +55,7 @@ pub struct ClientBuilder {
     timeout: Duration,
     user_agent: String,
     proxy: Option<String>,
-    on_refresh_token: Option<RefreshTokenHook>,
-    refresh_token_source: Option<RefreshTokenSource>,
+    hooks: TokenHooks,
 }
 
 impl Default for ClientBuilder {
@@ -76,8 +69,7 @@ impl Default for ClientBuilder {
             timeout: DEFAULT_TIMEOUT,
             user_agent: DEFAULT_USER_AGENT.into(),
             proxy: None,
-            on_refresh_token: None,
-            refresh_token_source: None,
+            hooks: TokenHooks::default(),
         }
     }
 }
@@ -151,7 +143,7 @@ impl ClientBuilder {
     where
         F: Fn(&str) + Send + Sync + 'static,
     {
-        self.on_refresh_token = Some(Arc::new(f));
+        self.hooks.rotation = Some(Arc::new(f));
         self
     }
 
@@ -168,7 +160,7 @@ impl ClientBuilder {
     where
         F: Fn() -> Option<String> + Send + Sync + 'static,
     {
-        self.refresh_token_source = Some(Arc::new(source));
+        self.hooks.source = Some(Arc::new(source));
         self
     }
 
@@ -218,13 +210,8 @@ impl ClientBuilder {
             self.credentials.clone(),
             &device_id,
             refresh_token,
+            self.hooks,
         );
-        if let Some(hook) = self.on_refresh_token {
-            tokens.set_rotation_hook(move |token| hook(token));
-        }
-        if let Some(source) = self.refresh_token_source {
-            tokens.set_token_source(move || source());
-        }
 
         let captcha = CaptchaManager::new(
             http.clone(),
@@ -251,14 +238,6 @@ pub fn is_drive_root(path: &str) -> bool {
     path.trim_matches('/').is_empty()
 }
 
-/// Where a resolved path ended up.
-enum Resolved {
-    /// The virtual root, which has no [`FileInfo`] of its own.
-    Root,
-    /// The entry named by the final path segment.
-    Entry(FileInfo),
-}
-
 impl Client {
     /// Convenience for [`ClientBuilder::new`].
     pub fn builder() -> ClientBuilder {
@@ -268,12 +247,6 @@ impl Client {
     /// Return the device id currently associated with this client.
     pub fn device_id(&self) -> &str {
         &self.device_id
-    }
-
-    /// Return the [`TokenManager`] so callers can read the rotated
-    /// refresh token and persist it.
-    pub fn tokens(&self) -> &TokenManager {
-        &self.tokens
     }
 
     /// The HTTP client used for file **content** transfers.
@@ -450,79 +423,50 @@ impl Client {
         }
     }
 
-    /// Resolve a Unix-style path (e.g. `"/My Pack/videos"`) to the
-    /// corresponding folder id by walking each path segment.
+    /// Resolve a Unix-style path (e.g. `"/My Pack/video.mp4"`) to its entry,
+    /// listing each level once.
     ///
-    /// Returns `Ok(id)` on success. An empty path or `"/"` resolves to the
-    /// root (empty string, matching PikPak convention).
-    pub async fn resolve_path(&self, path: &str) -> Result<String> {
-        match self.walk_path(path, false).await? {
-            Resolved::Root => Ok(String::new()),
-            Resolved::Entry(info) => Ok(info.id),
-        }
-    }
-
-    /// Resolve a path to a [`FileInfo`]. If the path points to a file
-    /// (i.e. the last segment is a file, not a folder), returns that file's
-    /// info; otherwise returns the folder's info.
+    /// Middle segments must be folders; the last may be a file. At every
+    /// segment a folder wins over a same-named file, so a name collision never
+    /// resolves according to listing order.
     ///
     /// An empty path or `"/"` refers to the virtual root, which has no entry of
     /// its own, and is therefore rejected.
     pub async fn resolve_path_info(&self, path: &str) -> Result<FileInfo> {
-        match self.walk_path(path, true).await? {
-            Resolved::Root => Err(Error::InvalidPath(
+        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let Some((last, folders)) = segments.split_last() else {
+            return Err(Error::InvalidPath(
                 "the drive root has no entry of its own; name a file or folder",
-            )),
-            Resolved::Entry(info) => Ok(info),
+            ));
+        };
+        let mut parent_id = String::new();
+        for segment in folders {
+            parent_id = self.child(&parent_id, segment, path, false).await?.id;
         }
+        self.child(&parent_id, last, path, true).await
     }
 
-    /// Walk `path` one segment at a time, listing each level exactly once.
-    ///
-    /// `allow_file_last` decides whether the final segment may be a file (as
-    /// [`resolve_path_info`](Self::resolve_path_info) needs) or must be a folder
-    /// (as [`resolve_path`](Self::resolve_path) needs). Middle segments are
-    /// always folders, and a folder also wins over a same-named file at the final
-    /// segment — a name collision must not resolve according to listing order.
-    async fn walk_path(&self, path: &str, allow_file_last: bool) -> Result<Resolved> {
-        if is_drive_root(path) {
-            return Ok(Resolved::Root);
-        }
-        let normalized = path.trim_matches('/');
-
-        let segments: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
-        let mut parent_id = String::new();
-
-        for (index, segment) in segments.iter().enumerate() {
-            let is_last = index == segments.len() - 1;
-            let children = self.list_folder(&parent_id).await?;
-            // A folder wins over a same-named file, at the final segment too:
-            // which of the two a listing happens to return first is not something
-            // a caller should depend on, and only folders can be walked into.
-            let folder = children
-                .iter()
-                .find(|f| f.name == *segment && f.kind.is_folder());
-            let found = match folder {
-                Some(folder) => Some(folder),
-                None if is_last && allow_file_last => children.iter().find(|f| f.name == *segment),
-                None => None,
-            }
-            .cloned();
-
-            match found {
-                Some(info) if is_last => return Ok(Resolved::Entry(info)),
-                Some(info) => parent_id = info.id,
-                None => {
-                    return Err(Error::NotFound {
-                        path: path.to_string(),
-                        segment: (*segment).to_string(),
-                    });
-                }
-            }
-        }
-
-        // Unreachable: a non-empty segment list returns from inside the loop.
-        Ok(Resolved::Root)
+    /// The entry `name` inside `parent_id` — a folder, or failing that a file
+    /// when `file_ok` — while resolving `path`.
+    async fn child(
+        &self,
+        parent_id: &str,
+        name: &str,
+        path: &str,
+        file_ok: bool,
+    ) -> Result<FileInfo> {
+        let children = self.list_folder(parent_id).await?;
+        let named = |f: &&FileInfo| f.name == name;
+        children
+            .iter()
+            .filter(named)
+            .find(|f| f.kind.is_folder())
+            .or_else(|| children.iter().filter(named).find(|_| file_ok))
+            .cloned()
+            .ok_or_else(|| Error::NotFound {
+                path: path.to_string(),
+                segment: name.to_string(),
+            })
     }
 
     /// Get a download URL for a file by its id.
@@ -894,6 +838,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_builder_wires_the_rotation_hook() {
+        let mock = Mock::start(vec![]).await;
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = calls.clone();
+        let client = Client::builder()
+            .refresh_token("initial-token")
+            .auth_base_url(format!("http://{}", mock.addr))
+            .on_refresh_token(move |token| recorder.lock().unwrap().push(token.to_string()))
+            .build()
+            .unwrap();
+
+        client.tokens.access_token().await.unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec!["rotated"]);
+    }
+
+    #[tokio::test]
     async fn listing_follows_next_page_tokens() {
         let mock = Mock::start(vec![
             (200, page_json(&[("1", "a.bin", "drive#file")], Some("t1"))),
@@ -1000,9 +960,9 @@ mod tests {
         .await;
         let client = mock.client();
 
-        assert_eq!(client.resolve_path("/A/B").await.unwrap(), "B");
+        assert_eq!(client.resolve_path_info("/A/B").await.unwrap().id, "B");
 
-        match client.resolve_path("/A/Nope").await {
+        match client.resolve_path_info("/A/Nope").await {
             Err(Error::NotFound { segment, .. }) => assert_eq!(segment, "Nope"),
             other => panic!("expected NotFound, got {other:?}"),
         }

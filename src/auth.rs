@@ -21,11 +21,10 @@
 //!
 //! PikPak *rotates* the refresh token on each exchange. We keep the latest one
 //! in memory and never touch the disk ourselves; an embedder that must persist
-//! it can either register [`TokenManager::set_rotation_hook`] — called the
-//! moment the server issues a new token — or read
-//! [`TokenManager::current_refresh_token`] later.
+//! it registers [`ClientBuilder::on_refresh_token`](crate::ClientBuilder::on_refresh_token),
+//! called the moment the server issues a new token.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -86,25 +85,23 @@ struct CachedToken {
     refresh_at: Instant,
 }
 
-/// A callback invoked with each newly rotated refresh token.
-#[derive(Clone)]
-struct RotationHook(Arc<dyn Fn(&str) + Send + Sync>);
-
-impl std::fmt::Debug for RotationHook {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("RotationHook")
-    }
+/// The embedder's callbacks around token rotation; see
+/// [`ClientBuilder::on_refresh_token`](crate::ClientBuilder::on_refresh_token)
+/// and [`ClientBuilder::refresh_token_source`](crate::ClientBuilder::refresh_token_source).
+///
+/// Both run while the access-token cache is locked for the refresh, so they
+/// must be fast and must not call back into the client.
+#[derive(Clone, Default)]
+pub(crate) struct TokenHooks {
+    /// Called with every newly issued refresh token, once it is stored.
+    pub rotation: Option<RotationHook>,
+    /// Returns the token the embedder has persisted, tried once when the
+    /// current one is rejected and the persisted one differs.
+    pub source: Option<TokenSource>,
 }
 
-/// A callback returning the refresh token the embedder has persisted, if any.
-#[derive(Clone)]
-struct TokenSource(Arc<dyn Fn() -> Option<String> + Send + Sync>);
-
-impl std::fmt::Debug for TokenSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("TokenSource")
-    }
-}
+pub(crate) type RotationHook = Arc<dyn Fn(&str) + Send + Sync>;
+pub(crate) type TokenSource = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
 // Hand-written so `{:?}` never prints a live token: the cached access token and
 // the refresh token both stay out of it.
@@ -122,7 +119,7 @@ impl std::fmt::Debug for TokenManagerInner {
 /// Cheap to clone — internally shares state behind an `Arc<RwLock<_>>` so
 /// concurrent requests share a single refresh call.
 #[derive(Debug, Clone)]
-pub struct TokenManager {
+pub(crate) struct TokenManager {
     inner: Arc<TokenManagerInner>,
 }
 
@@ -140,24 +137,19 @@ struct TokenManagerInner {
     /// must not discard the rotated refresh token, because PikPak invalidates
     /// the previous one — falling back to it would break authentication.
     refresh_token: RwLock<String>,
-    /// Optional callback fired with every newly issued refresh token, the moment
-    /// the server returns it.
-    rotation_hook: OnceLock<RotationHook>,
-    /// Optional callback returning the token the embedder has persisted, used to
-    /// recover when someone else rotated it first.
-    token_source: OnceLock<TokenSource>,
+    hooks: TokenHooks,
 }
 
 impl TokenManager {
     /// Create a new token manager. Does not contact the network.
-    pub fn new(
+    pub(crate) fn new(
         http: reqwest::Client,
         auth_endpoint: impl Into<String>,
         credentials: OAuthCredentials,
         device_id: impl Into<String>,
         refresh_token: impl Into<String>,
+        hooks: TokenHooks,
     ) -> Self {
-        let refresh_token = refresh_token.into();
         Self {
             inner: Arc::new(TokenManagerInner {
                 http,
@@ -165,43 +157,10 @@ impl TokenManager {
                 credentials,
                 device_id: device_id.into(),
                 cached: RwLock::new(None),
-                refresh_token: RwLock::new(refresh_token),
-                rotation_hook: OnceLock::new(),
-                token_source: OnceLock::new(),
+                refresh_token: RwLock::new(refresh_token.into()),
+                hooks,
             }),
         }
-    }
-
-    /// Register a callback invoked with every newly rotated refresh token.
-    ///
-    /// PikPak invalidates the previous refresh token on each exchange, so a
-    /// process that exits before persisting the new value can lose access to the
-    /// account. Firing the hook the moment the server issues the token shrinks
-    /// that window from "whenever the command finishes" to the rotation itself.
-    ///
-    /// The hook runs after the new value has been stored and without the
-    /// refresh-token lock held, but it does run while the access-token cache is
-    /// locked for this refresh — so keep it fast and do not call back into this
-    /// manager. Registering twice is a no-op.
-    pub fn set_rotation_hook(&self, hook: impl Fn(&str) + Send + Sync + 'static) {
-        let _ = self.inner.rotation_hook.set(RotationHook(Arc::new(hook)));
-    }
-
-    /// Register a callback returning the refresh token the embedder has
-    /// persisted (from a `.env` file, a keyring, …), or `None` if there is none.
-    ///
-    /// PikPak invalidates the previous refresh token on every exchange, so a
-    /// token read a moment ago can already be superseded — typically when a
-    /// second copy of the CLI, or the web client, refreshed in the meantime. When
-    /// an exchange is rejected as an invalid grant, the source is consulted and a
-    /// *different* token it returns is retried once, so concurrent runs recover
-    /// instead of failing while the working replacement sits on disk.
-    ///
-    /// The callback runs while the access-token cache is locked for this refresh,
-    /// so keep it fast and do not call back into this manager. Registering twice
-    /// is a no-op.
-    pub fn set_token_source(&self, source: impl Fn() -> Option<String> + Send + Sync + 'static) {
-        let _ = self.inner.token_source.set(TokenSource(Arc::new(source)));
     }
 
     /// A fresh cached token, refreshing first when the current one is stale.
@@ -237,31 +196,20 @@ impl TokenManager {
     }
 
     /// Return a currently-valid access token, refreshing if needed.
-    pub async fn access_token(&self) -> Result<String> {
+    pub(crate) async fn access_token(&self) -> Result<String> {
         self.cached_token_after_refresh(|t| t.access_token.clone())
             .await
     }
 
-    /// Drop the cached access token so the next [`access_token`] call
-    /// forces a fresh refresh. Used when the server rejects a token we
-    /// still believed valid (HTTP 401).
+    /// Drop the cached access token `rejected` — the server refused it (HTTP
+    /// 401) — so the next [`access_token`](Self::access_token) call refreshes.
     ///
-    /// The rotated refresh token is deliberately retained: the next refresh
-    /// must use the newest one, since the server invalidates the previous.
-    ///
-    /// [`access_token`]: Self::access_token
-    pub async fn invalidate(&self) {
-        let mut guard = self.inner.cached.write().await;
-        *guard = None;
-    }
-
-    /// Like [`invalidate`], but only while `rejected` is still the cached
-    /// token. Concurrent requests rejected together would otherwise each wipe
-    /// the token the first of them just refreshed, and each rotation costs a
-    /// single-use refresh token.
-    ///
-    /// [`invalidate`]: Self::invalidate
-    pub async fn invalidate_if_current(&self, rejected: &str) {
+    /// Only while it is still the cached token: concurrent requests rejected
+    /// together would otherwise each wipe the token the first of them just
+    /// refreshed, and each rotation costs a single-use refresh token. The
+    /// rotated refresh token is kept either way, since the server has already
+    /// invalidated the previous one.
+    pub(crate) async fn invalidate_if_current(&self, rejected: &str) {
         let mut guard = self.inner.cached.write().await;
         if guard
             .as_ref()
@@ -273,13 +221,14 @@ impl TokenManager {
 
     /// Return the `sub` (user id) claim from the current token, refreshing
     /// if necessary. Used by the captcha flow to bind requests to a user.
-    pub async fn user_id(&self) -> Result<String> {
+    pub(crate) async fn user_id(&self) -> Result<String> {
         self.cached_token_after_refresh(|t| t.user_id.clone()).await
     }
 
     /// Return the most recently issued refresh token (rotated on each
     /// exchange), or the initial one if we haven't refreshed yet.
-    pub async fn current_refresh_token(&self) -> String {
+    #[cfg(test)]
+    pub(crate) async fn current_refresh_token(&self) -> String {
         self.inner.refresh_token.read().await.clone()
     }
 
@@ -287,7 +236,7 @@ impl TokenManager {
     async fn refresh_now(
         &self,
         guard: &mut tokio::sync::RwLockWriteGuard<'_, Option<CachedToken>>,
-    ) -> Result<String> {
+    ) -> Result<()> {
         // Copy the latest rotated token out before the await; no lock guard may
         // be held across it.
         let current_refresh = self.inner.refresh_token.read().await.clone();
@@ -325,15 +274,15 @@ impl TokenManager {
         };
 
         // Store the rotated refresh token before publishing the access token, so
-        // an invalidate() racing with this can never resurrect the previous
+        // an invalidation racing with this can never resurrect the previous
         // (server-invalidated) refresh token.
         {
             *self.inner.refresh_token.write().await = refresh_token.clone();
         }
         // Notify the embedder only once the new value is safe to persist, and
         // without holding the lock across the callback.
-        if let Some(hook) = self.inner.rotation_hook.get() {
-            (hook.0)(&refresh_token);
+        if let Some(hook) = &self.inner.hooks.rotation {
+            hook(&refresh_token);
         }
 
         let AccessGrant {
@@ -347,11 +296,11 @@ impl TokenManager {
         let refresh_at = Instant::now() + Duration::from_secs(effective_ttl);
 
         **guard = Some(CachedToken {
-            access_token: access_token.clone(),
+            access_token,
             user_id: sub,
             refresh_at,
         });
-        Ok(access_token)
+        Ok(())
     }
 
     /// Exchange `refresh_token` for an access token.
@@ -398,8 +347,7 @@ impl TokenManager {
     /// Returns `None` when there is no source, nothing stored, or the stored
     /// value is the very token that was just rejected.
     fn reloaded_token(&self, rejected: &str) -> Option<String> {
-        let source = self.inner.token_source.get()?;
-        let candidate = (source.0)()?;
+        let candidate = (self.inner.hooks.source.as_ref()?)()?;
         if candidate.is_empty() || candidate == rejected {
             return None;
         }
@@ -548,6 +496,7 @@ mod tests {
             OAuthCredentials::default(),
             "device-1",
             "initial-token",
+            TokenHooks::default(),
         );
 
         assert_eq!(tokens.access_token().await.unwrap(), "access-1");
@@ -557,7 +506,7 @@ mod tests {
         // again. The refresh must reuse the rotated token; falling back to the
         // initial one would fail against the real server, which invalidates the
         // previous refresh token on every rotation.
-        tokens.invalidate().await;
+        tokens.invalidate_if_current("access-1").await;
         assert_eq!(tokens.access_token().await.unwrap(), "access-2");
 
         let sent = seen.lock().unwrap().clone();
@@ -577,12 +526,13 @@ mod tests {
             OAuthCredentials::default(),
             "device-1",
             "initial-token",
+            TokenHooks::default(),
         );
 
         // A freshly built manager reports the caller-supplied token and reads
         // it back unchanged when no refresh has happened yet.
         assert_eq!(tokens.current_refresh_token().await, "initial-token");
-        tokens.invalidate().await;
+        tokens.invalidate_if_current("access-1").await;
         assert_eq!(tokens.current_refresh_token().await, "initial-token");
         assert_eq!(
             seen.lock().unwrap().len(),
@@ -604,8 +554,8 @@ mod tests {
             OAuthCredentials::default(),
             "device-1",
             "initial-token",
+            rotation(move |token| recorder.lock().unwrap().push(token.to_string())),
         );
-        tokens.set_rotation_hook(move |token| recorder.lock().unwrap().push(token.to_string()));
 
         // The caller-supplied token is not a rotation, so it must not be
         // reported: only values the server actually issues are.
@@ -614,31 +564,13 @@ mod tests {
         tokens.access_token().await.unwrap();
         assert_eq!(hook_calls.lock().unwrap().clone(), vec!["rotated-1"]);
 
-        tokens.invalidate().await;
+        tokens.invalidate_if_current("access-1").await;
         tokens.access_token().await.unwrap();
         assert_eq!(
             hook_calls.lock().unwrap().clone(),
             vec!["rotated-1", "rotated-2"],
             "every rotation must be reported, not just the first"
         );
-    }
-
-    #[tokio::test]
-    async fn client_builder_wires_the_rotation_hook() {
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let addr = spawn_auth_server(seen).await;
-        let hook_calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let recorder = hook_calls.clone();
-
-        let client = crate::client::Client::builder()
-            .refresh_token("initial-token")
-            .auth_base_url(format!("http://{addr}"))
-            .on_refresh_token(move |token| recorder.lock().unwrap().push(token.to_string()))
-            .build()
-            .unwrap();
-
-        client.tokens().access_token().await.unwrap();
-        assert_eq!(hook_calls.lock().unwrap().clone(), vec!["rotated-1"]);
     }
 
     /// Serve one canned HTTP response, then close.
@@ -702,13 +634,32 @@ mod tests {
     }
 
     fn manager_for(addr: std::net::SocketAddr, token: &str) -> TokenManager {
+        manager_with(addr, token, TokenHooks::default())
+    }
+
+    fn manager_with(addr: std::net::SocketAddr, token: &str, hooks: TokenHooks) -> TokenManager {
         TokenManager::new(
             reqwest::Client::new(),
             format!("http://{addr}/v1/auth/token"),
             OAuthCredentials::default(),
             "device-1",
             token,
+            hooks,
         )
+    }
+
+    fn rotation(hook: impl Fn(&str) + Send + Sync + 'static) -> TokenHooks {
+        TokenHooks {
+            rotation: Some(Arc::new(hook)),
+            source: None,
+        }
+    }
+
+    fn source(source: impl Fn() -> Option<String> + Send + Sync + 'static) -> TokenHooks {
+        TokenHooks {
+            rotation: None,
+            source: Some(Arc::new(source)),
+        }
     }
 
     #[tokio::test]
@@ -759,6 +710,7 @@ mod tests {
             OAuthCredentials::default(),
             "device-1",
             "secret-refresh-token",
+            TokenHooks::default(),
         );
         let shown = format!("{tokens:?}");
         assert!(!shown.contains("secret-refresh-token"), "{shown}");
@@ -775,8 +727,11 @@ mod tests {
         // while a working one sits on disk.
         let (addr, seen) =
             scripted_auth_server(vec![(400, GRANT_REJECTION), (200, ROTATED_OK)]).await;
-        let tokens = manager_for(addr, "stale-token");
-        tokens.set_token_source(|| Some("fresh-token".to_string()));
+        let tokens = manager_with(
+            addr,
+            "stale-token",
+            source(|| Some("fresh-token".to_string())),
+        );
 
         assert_eq!(tokens.access_token().await.unwrap(), "access-2");
         assert_eq!(
@@ -794,10 +749,13 @@ mod tests {
     #[tokio::test]
     async fn a_rejected_grant_is_not_retried_with_the_same_token() {
         let (addr, seen) = scripted_auth_server(vec![(400, GRANT_REJECTION)]).await;
-        let tokens = manager_for(addr, "stale-token");
+        let tokens = manager_with(
+            addr,
+            "stale-token",
+            source(|| Some("stale-token".to_string())),
+        );
         // The source still holds the token that was just rejected: sending it
         // again would fail identically, so it must not be sent again.
-        tokens.set_token_source(|| Some("stale-token".to_string()));
 
         assert!(tokens.access_token().await.is_err());
         assert_eq!(*seen.lock().unwrap(), vec!["stale-token".to_string()]);
@@ -807,8 +765,11 @@ mod tests {
     async fn a_transient_auth_failure_is_not_retried_with_another_token() {
         // 503 says nothing about the token, so the source must not be consulted.
         let (addr, seen) = scripted_auth_server(vec![(503, "backend gone")]).await;
-        let tokens = manager_for(addr, "stale-token");
-        tokens.set_token_source(|| Some("fresh-token".to_string()));
+        let tokens = manager_with(
+            addr,
+            "stale-token",
+            source(|| Some("fresh-token".to_string())),
+        );
 
         assert!(tokens.access_token().await.is_err());
         assert_eq!(*seen.lock().unwrap(), vec!["stale-token".to_string()]);
@@ -821,15 +782,18 @@ mod tests {
         // requests proves there is one retry and no loop.
         let (addr, seen) =
             scripted_auth_server(vec![(400, GRANT_REJECTION), (400, GRANT_REJECTION)]).await;
-        let tokens = manager_for(addr, "stale-token");
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = attempts.clone();
-        tokens.set_token_source(move || {
-            Some(format!(
-                "reloaded-{}",
-                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            ))
-        });
+        let tokens = manager_with(
+            addr,
+            "stale-token",
+            source(move || {
+                Some(format!(
+                    "reloaded-{}",
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                ))
+            }),
+        );
 
         assert!(tokens.access_token().await.is_err());
         assert_eq!(
@@ -852,6 +816,7 @@ mod tests {
             OAuthCredentials::default(),
             "device-1",
             "superseded-token",
+            TokenHooks::default(),
         );
 
         let err = tokens
@@ -887,6 +852,7 @@ mod tests {
             OAuthCredentials::default(),
             "device-1",
             "some-token",
+            TokenHooks::default(),
         );
 
         let err = tokens
@@ -922,10 +888,13 @@ mod tests {
         // out the access token. The run fails, but the replacement must still
         // reach the store and the hook, or the account is locked out.
         let (addr, _) = scripted_auth_server(vec![(200, r#"{"refresh_token":"rotated-2"}"#)]).await;
-        let tokens = manager_for(addr, "old-token");
         let persisted = Arc::new(std::sync::Mutex::new(None));
         let sink = persisted.clone();
-        tokens.set_rotation_hook(move |token| *sink.lock().unwrap() = Some(token.to_string()));
+        let tokens = manager_with(
+            addr,
+            "old-token",
+            rotation(move |token| *sink.lock().unwrap() = Some(token.to_string())),
+        );
 
         assert!(tokens.access_token().await.is_err());
         assert_eq!(tokens.current_refresh_token().await, "rotated-2");
