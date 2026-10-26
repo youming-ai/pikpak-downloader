@@ -1,209 +1,110 @@
-[![License](https://img.shields.io/github/license/youming-ai/pikpak-downloader)](LICENSE)
-![rustc 1.86+](https://img.shields.io/badge/rustc-1.86%2B-blue)
+# pikpak
 
-PikPak from the terminal. Listing, quota and downloading, as a CLI or a Rust
-library. Captcha signing and refresh-token rotation are handled for you.
-
-- **Resumable + concurrent.** Partials kept by file id in `<output>/.pikpak-parts`,
-  resumed with `Range` only while they still match the remote file
-  (id/size/mtime); jittered backoff, `-j N` trees, and a transfer is never
-  finalized short of the reported size.
-- **Defensive.** Server names are sanitized (traversal, `..`, Windows `CON`/`NUL`)
-  and each file is renamed into place only once it is complete.
-- **Automatic.** Captcha and token rotation; rotated tokens are written back to
-  your `.env`, and one another process already rotated is recovered.
+A PikPak CLI and Rust library for listing files, checking storage, and downloading
+files or folders. Supports concurrent downloads, automatic retries, resumable
+transfers, and background jobs.
 
 ## Install
 
-Prebuilt for Linux (x86_64, aarch64; static) and macOS (Apple silicon, Intel):
+Download a binary for Linux or macOS from
+[Releases](https://github.com/youming-ai/pikpak-downloader/releases).
+Each release includes `SHA256SUMS` for verification.
 
-```bash
-curl -fsSL "https://github.com/youming-ai/pikpak-downloader/releases/latest/download/pikpak-$(uname -m | sed s/arm64/aarch64/)-$(case $(uname -s) in Darwin) echo apple-darwin;; *) echo unknown-linux-musl;; esac).tar.gz" | sudo tar -xzC /usr/local/bin pikpak
-pikpak --help
-```
-
-Checksums are in each release's `SHA256SUMS`. Or build from source, with Rust
-1.86 or newer (`rust-version` in `Cargo.toml`, pinned by the CI MSRV job):
+Or install from source with Rust 1.86+:
 
 ```bash
 cargo install --locked --git https://github.com/youming-ai/pikpak-downloader
-# or, in a clone: cargo install --locked --path .
 ```
 
-## Get started
+## Setup
 
-**1. Copy your refresh token.** Log in at [mypikpak.com](https://mypikpak.com),
-open DevTools (F12), go to **Application** → **Local Storage** →
-`https://mypikpak.com`, and copy `refresh_token` from the `credentials` entry.
-Then close the tab — but do not log out, which may revoke the token you just
-copied. Do steps 2 and 3 straight away: an open web app refreshes the token in
-the background, and whichever side refreshes first leaves the other's copy dead.
-
-**2. Put it in a `.env`** in the directory you will work from. This prompts for
-the token without echoing it, keeps it out of your shell history, and makes the
-file readable by you alone (the CLI keeps those permissions when it rewrites
-the file):
+1. Sign in at [mypikpak.com](https://mypikpak.com). In browser DevTools, open
+   **Application → Local Storage → https://mypikpak.com** and copy
+   `refresh_token` from `credentials`.
+2. Close the tab without logging out. The web app can rotate the token while open.
+3. Save the token in a private `.env` in your working directory:
 
 ```bash
-mkdir -p ~/pikpak && cd ~/pikpak
-printf 'refresh token: '; read -rs token; echo
+# For a new .env; prompts without echoing the token (bash/zsh).
+printf 'Refresh token: '; read -rs token; echo
 (umask 077; printf 'PIKPAK_REFRESH_TOKEN=%s\n' "$token" > .env); unset token
+pikpak quota
 ```
 
-(In a clone of this repository, `cp .env.example .env` gives you a template
-with every setting.)
+The CLI loads the first `.env` in the current directory or its parents.
+Tokens are single-use: authentication rotates them, and the CLI saves replacements
+to that file. Keep the token in `.env`; environment-only tokens cannot be saved.
+Use one client at a time. If authentication fails with `invalid_grant`, obtain a
+fresh token. This tool uses the Android client, which can reject web-issued tokens.
 
-**3. Check that it works:**
+Optional settings: `PIKPAK_PROXY`, `PIKPAK_DEVICE_ID`, `PIKPAK_CLIENT_ID`,
+`PIKPAK_CLIENT_SECRET`, and `PIKPAK_STATE_DIR`. A device ID is saved automatically
+when using a `.env`. See `.env.example` for a template.
 
-```console
-$ pikpak quota
-total: 10.00 TiB
-used:  4.23 TiB
-free:  5.77 TiB
-usage: 42.3%
-```
-
-Run `pikpak` from that directory or any directory below it: it reads the first
-`.env` it finds there or in a parent.
-
-### What to know about the token
-
-- **It is single-use.** Every time the CLI authenticates with PikPak the token
-  rotates, and the CLI writes the replacement back into the `.env` it loaded.
-  (`jobs` commands never authenticate, so they never rotate it.) Keep it in `.env`, not in your
-  shell environment — from there the CLI can only *print* the replacement, and
-  missing it leaves you with a dead token.
-- **One client at a time.** The web app, or a second copy of this tool on the
-  same account, rotates the token too. If another process got there first, the
-  CLI re-reads `.env` and retries once.
-- **Exit code 3 is an `auth` failure.** With `invalid_grant` in the message the
-  token is dead: copy a fresh one into `.env` as in step 1, and keep the web app
-  closed while the CLI runs. Otherwise the token is missing or blank. The web
-  app issues platform-bound tokens, so even a fresh copy can occasionally be
-  refused by this Android-client tool.
-
-### Other settings
-
-All optional, in `.env` or the environment:
-
-| variable | meaning |
-| --- | --- |
-| `PIKPAK_PROXY` | HTTP(S) proxy URL, e.g. `http://127.0.0.1:7890` |
-| `PIKPAK_DEVICE_ID` | device id; filled in on the first run, so every run reports the same device |
-| `PIKPAK_CLIENT_ID`, `PIKPAK_CLIENT_SECRET` | override the OAuth client |
-| `PIKPAK_STATE_DIR` | where background jobs are kept (default `.pikpak` beside your `.env`) |
-
-## CLI
+## Usage
 
 ```bash
-pikpak quota                                  # totals; --raw for byte counts
-pikpak ls                                     # root
-pikpak ls --path "/My Pack" -l                # long listing; --human for sizes
-pikpak download --path "/My Pack/Movies" -j 4
-pikpak download --path "/My Pack/video.mp4" --output /data
-pikpak download --path /                      # drive root, expanded into its children
-pikpak --verbose download --path "/My Pack/video.mp4"
+pikpak quota
+pikpak ls --path "/My Pack" -l --human
+pikpak download --path "/My Pack/video.mp4" --output ./downloads
+pikpak download --path "/My Pack/Movies" --output ./downloads -j 4
 ```
 
-Re-running an interrupted download resumes it, and non-empty files already
-complete on disk are skipped, so the same command can simply be run again.
-(Empty files are fetched again: a listed size of 0 may mean "not reported".)
+Output defaults to `./downloads`; `--path /` downloads the drive root.
+Run the same command again to resume an interrupted transfer. Non-empty local
+files matching the listed size are skipped; empty files are fetched again.
+Partials stay in `<output>/.pikpak-parts/` and resume only when their remote
+identity still matches. Names are sanitized and completed files are renamed
+into place after transfer.
 
-| flag | meaning |
-| --- | --- |
-| `--path <p>` | remote path, `/` = drive root |
-| `--output <d>` | local directory (default `./downloads`) |
-| `-j, --jobs <n>` | files fetched in parallel (folders only) |
-| `-l, --long` | long listing (`ls`) |
-| `--human` | human-readable sizes (`ls`; long flag only — `-h` is `--help`) |
-| `--raw` | byte counts instead of sizes (`quota`) |
-| `--verbose` | debug logs, before or after the subcommand |
-| `--json` | one JSON document on stdout: the result, or the failure |
-| `--no-progress` | never draw byte-level progress |
-| `--detach` | `download`: return a job id instead of waiting |
-
-### Machine-readable output
-
-`--json` writes exactly one JSON document to stdout — the result, or the failure —
-and keeps every narration line (progress, retries, `Saved:`) on stderr, so a
-script or an agent can parse stdout without scraping prose. Exit codes separate
-the cases worth branching on: `3` auth, `4` not found, `5` network, `6` refused,
-`7` local I/O. The full contract — document shapes, codes, recipes — is in
-[AGENTS.md](AGENTS.md).
-
-```console
-$ pikpak --json quota
-{"command":"quota","ok":true,"result":{"free":6345116277760,"total":10995116277760,"usage_percent":42.3,"used":4650000000000}}
-```
-
-### Long downloads
-
-`download --detach` returns a job id straight away and keeps transferring in the
-background, so a transfer can outlive the command that started it:
+For a background download:
 
 ```bash
-id=$(pikpak download --detach --path "/My Pack/Movies" --output /data)
-pikpak jobs list                 # id, state, progress, path
+id=$(pikpak download --detach --path "/My Pack/Movies" --output ./downloads)
 pikpak jobs status "$id"
-pikpak jobs wait "$id"           # blocks; exits with the job's own outcome
-pikpak jobs cancel "$id"         # the worker stops within a few seconds
+pikpak jobs wait "$id" --timeout-seconds 1800
+pikpak jobs cancel "$id"
+pikpak jobs list
 ```
 
-State lives under `PIKPAK_STATE_DIR` (default `.pikpak` beside your `.env`):
-`jobs/<id>.json`, `jobs/<id>.cancel`, and the worker's output in
-`logs/<id>.log`.
+Jobs and logs live in `.pikpak` beside the loaded `.env`, or in the current
+directory if none is loaded. Set `PIKPAK_STATE_DIR` to override this location.
+Cancellation preserves partials for the next run.
 
-## Library
+Use `--help` on any command for options, `--verbose` for debug logs, and
+`--no-progress` to disable progress. Scripts and agents should use `--json`;
+see [AGENTS.md](AGENTS.md) for output shapes and exit codes.
 
-Depend on it with `default-features = false` to leave out the CLI's own
-dependencies (clap, dotenvy, tracing-subscriber, humansize, anyhow).
+## Rust library
+
+Use `default-features = false` to omit CLI dependencies.
 
 ```rust,no_run
 use pikpak::Client;
-use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Build the client
     let client = Client::builder()
         .refresh_token("YOUR_REFRESH_TOKEN")
-        .timeout(Duration::from_secs(30))
-        .proxy("http://127.0.0.1:7890") // Optional proxy
         .build()?;
-
-    // 2. Query storage quota
     let quota = client.quota().await?;
-    println!("Total quota: {} bytes, used: {} bytes", quota.total, quota.used);
+    println!("Used: {} / {} bytes", quota.used, quota.total);
 
-    // 3. List files in the root directory
-    let root_files = client.list_folder("").await?; // Root uses empty string
-    for file in root_files {
-        println!("- {} (Kind: {:?}, Size: {} bytes)", file.name, file.kind, file.size);
-    }
-
-    // 4. Resolve a path and download it, resumably
     let file = client.resolve_path_info("/My Pack/video.mp4").await?;
-    if file.kind.is_file() {
-        let dest = std::path::Path::new("video.mp4");
-        let part = std::path::Path::new("video.mp4.part");
-        let bytes = client.download_file(&file, dest, part, &|_done, _total| {}).await?;
-        println!("Saved {bytes} bytes");
-    }
-
+    client.download_file(
+        &file,
+        std::path::Path::new("video.mp4"),
+        std::path::Path::new("video.mp4.part"),
+        &|_done, _total| {},
+    ).await?;
     Ok(())
 }
 ```
 
-- `download_file` resumes a partial left by an earlier call only while it still
-  matches the remote file, refreshes the time-limited link on each retry, and
-  has no total deadline — only a per-read stall timeout, so large transfers are
-  not cut off.
-- Persist each rotation as it happens with `ClientBuilder::on_refresh_token`;
-  recover from another process's rotation with
-  `ClientBuilder::refresh_token_source`.
-- The library writes only the paths you hand `download_file`; persisting tokens
-  is yours to do.
+Library users persist rotated tokens with `ClientBuilder::on_refresh_token` and
+reload external rotations with `ClientBuilder::refresh_token_source`.
+Downloads use a stall timeout rather than a total transfer deadline.
 
 ## License
 
-MIT — see [LICENSE](https://github.com/youming-ai/pikpak-downloader/blob/main/LICENSE).
+[MIT](LICENSE)

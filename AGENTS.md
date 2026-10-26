@@ -1,169 +1,104 @@
-# Driving `pikpak` from an agent
+# Agent contract
 
-This file is the machine contract. It is what a program — an agent, a script, a
-CI job — may rely on. Anything not stated here is an implementation detail.
+Use `pikpak --json <command>` for automation. The CLI never prompts or reads stdin.
+For installation and credential setup, see [README.md](README.md#setup).
 
-## Two rules
+## Output
 
-1. **stdout carries data, stderr carries narration.** Transfer progress, retry
-   notices, `Downloading:`/`Saved:` lines and warnings all go to stderr. stdout
-   is what you parse.
-2. **With `--json`, stdout carries exactly one JSON document per run** — the
-   result on success, the failure on error. One line, one document. A run that
-   fails emits only the failure; for a download that lost files the counts are
-   in `error.message`, because two documents on one stream is not a contract.
-   The only exceptions come from argument parsing, before any command runs:
-   `--help` and `--version` print plain text and exit 0, and a usage error
-   prints clap's message on stderr, nothing on stdout, and exits 2.
-
-The tool never prompts and never reads stdin, so it is safe to run unattended.
-
-## Invocation
-
-```bash
-pikpak [--json] [--no-progress] [--verbose] <command> [options]
-```
-
-| flag | effect |
-| --- | --- |
-| `--json` | Emit the JSON document on stdout. Global: it may precede or follow the subcommand. |
-| `--no-progress` | Never draw byte-level progress. It is drawn only when stderr is a terminal, and only there. |
-| `--verbose` | Debug logging on stderr. |
-
-## Exit codes
-
-Branch on these rather than on the message text. They are append-only.
-
-| code | `error.kind` | meaning | what to do |
-| --- | --- | --- | --- |
-| 0 | — | success | parse `result` |
-| 1 | `unexpected` | a bug, a response we could not parse, or one that contradicts itself (a listing that repeats a page) | report it; retrying rarely helps |
-| 2 | — | usage error (clap) | fix the arguments |
-| 3 | `auth` | token missing, blank, rejected or no longer refreshable | supply a fresh `PIKPAK_REFRESH_TOKEN` |
-| 4 | `not_found` | the remote path, the file's content (CDN 404) or the job id does not exist | fix the path or id |
-| 5 | `network` | transport failure, or the service overloaded or failing (429/5xx) | retry later |
-| 6 | `refused` | the service refused it for another reason — including a download link that stays rejected after refreshing | report it; do not retry blindly |
-| 7 | `io` | a local filesystem operation failed | fix permissions/space |
-| 8 | `timeout` | `jobs wait` hit the deadline you gave it | the job is still running; wait again or cancel |
-| 9 | `cancelled` | the job was cancelled before it finished | nothing to fix |
-
-## Documents
-
-Parse them as JSON: the order of fields is not part of the contract. (Today
-the CLI sorts them, as the examples below show; do not depend on that.)
-
-Failure — the process exit code equals `error.exit_code`:
+- stdout contains exactly one JSON document on one line: success or failure.
+- Progress, retries, warnings, and debug logs go to stderr.
+- Exceptions: `--help` and `--version` print text and exit 0. Invalid arguments
+  print to stderr, leave stdout empty, and exit 2.
+- Parse JSON without relying on field order. Branch on exit codes, not messages.
 
 ```json
-{"command":"ls","error":{"exit_code":3,"kind":"auth","message":"not configured: missing PIKPAK_REFRESH_TOKEN"},"ok":false}
+{"ok":true,"command":"quota","result":{"total":100,"used":40,"free":60,"usage_percent":40.0}}
 ```
 
-Success — always `{"ok":true,"command":<name>,"result":<payload>}`:
-
-```bash
-$ pikpak --json quota
-{"command":"quota","ok":true,"result":{"free":6345116277760,"total":10995116277760,"usage_percent":42.3,"used":4650000000000}}
+```json
+{"ok":false,"command":"ls","error":{"kind":"auth","exit_code":3,"message":"not configured: missing PIKPAK_REFRESH_TOKEN"}}
 ```
 
-`result` payloads:
+These are two separate example runs. The process exit code equals
+`error.exit_code` on failure. Codes are append-only.
 
-- **`quota`** — `{total, used, free, usage_percent}`. Bytes, always: `--raw`
-  and the human formatting only shape the text a person reads.
-  `usage_percent` is `null` when the account reports no capacity.
-- **`ls`** — `{path, entries: [{id, name, kind, size, modified_time, mime_type}]}`.
-  `kind` is `"file"`, `"folder"` or `"unknown"`; `modified_time` and `mime_type`
-  are `null` when the server did not report them. `path` is what you asked for.
-  An empty listing is `entries: []`, not an error.
-- **`download`** — `{output, files, downloaded, failed, bytes}`. Reported when the
-  run finished everything it planned. A non-empty file already on disk at its
-  listed size is skipped and counted in `downloaded`, so re-running a finished
-  download is cheap. Empty files are always fetched again: a listed size of 0
-  may mean the size was not reported. If some files failed, the run emits the
-  *failure* document instead, with the counts in `error.message`; there is never
-  a second document on stdout. An entry of a kind this tool does not model is
-  refused and counted as one failed file; the rest of the run still downloads.
+| Exit | `error.kind` | Meaning / action |
+| --- | --- | --- |
+| 0 | — | Success; parse `result` |
+| 1 | `unexpected` | Bug, malformed or contradictory response; report it |
+| 2 | — | Usage error; fix arguments |
+| 3 | `auth` | Missing, blank, rejected, or expired token; supply a fresh token |
+| 4 | `not_found` | Remote path, content, or job missing; fix path or ID |
+| 5 | `network` | Transport failure or HTTP 429/5xx; retry later |
+| 6 | `refused` | Service refusal, including a persistently rejected download link; investigate before retrying |
+| 7 | `io` | Local filesystem failure; check permissions and space |
+| 8 | `timeout` | Wait deadline reached; job continues, wait again or cancel |
+| 9 | `cancelled` | Job cancelled |
+
+## Commands and results
+
+Global flags may precede or follow the subcommand: `--json`, `--no-progress`,
+`--verbose`. Progress is drawn only on a terminal's stderr.
+
+| Command | `result` fields |
+| --- | --- |
+| `quota` | `total`, `used`, `free`, `usage_percent` |
+| `ls --path <path>` | `path`, `entries: [{id, name, kind, size, modified_time, mime_type}]` |
+| `download --path <path> --output <dir> -j 4` | `output`, `files`, `downloaded`, `failed`, `bytes` |
+| `download --detach --path <path> --output <dir>` | `job`, `log`, `output`, `path`, `started_at` |
+| `jobs list` | `jobs` (oldest first) |
+| `jobs status <id>` | `job` |
+| `jobs cancel <id>` | `cancelled`, `job` |
+| `jobs wait <id> --timeout-seconds <n>` | `job` on success; failure envelope otherwise |
+
+Job commands report `command` as `jobs.list`, `jobs.status`, `jobs.cancel`, or
+`jobs.wait`, including on failure.
+
+- Sizes are bytes, including JSON output with `--raw` or `--human`.
+  `usage_percent` is `null` when capacity is zero.
+- `ls.path` echoes the requested path. An empty folder has `entries: []`.
+  Entry `kind` is `file`, `folder`, or `unknown`; absent `modified_time` and
+  `mime_type` are `null`.
+- Downloads skip non-empty local files matching the listed size and count them
+  in `downloaded`. Empty files are fetched again: zero can mean an unknown size.
+- Failed downloads emit only the failure document, with counts in `error.message`.
+  Unknown entry kinds count as failed files; other entries still download.
 
 ## Credentials
 
-Read from the environment, or from the first `.env` in the working directory or
-its parents: `PIKPAK_REFRESH_TOKEN` (required), and optionally `PIKPAK_PROXY`,
-`PIKPAK_CLIENT_ID`, `PIKPAK_CLIENT_SECRET`, `PIKPAK_DEVICE_ID`. Without a
-device id the CLI saves one to that `.env` on its first run, so the account
-sees one device across runs instead of a new one each time.
+Environment values take precedence over the first `.env` found in the current
+directory or its parents. `PIKPAK_REFRESH_TOKEN` is required for remote commands.
+Optional settings are listed in README.md.
 
-Refresh tokens are **single-use**: every login rotates them, and this tool
-authenticates as the PikPak **Android** client. The CLI writes each replacement
-back into the `.env` it loaded, so give it a file to write to — a token supplied
-through the environment can only be printed, not persisted.
+Tokens are single-use and this tool uses the Android client. Keep tokens in a
+writable `.env` so replacements are saved; environment-only replacements are
+printed to stderr. The CLI saves a device ID to `.env` when one is absent.
 
-## Detached downloads
-
-A transfer that outlives your tool call: `--detach` starts a worker and returns
-immediately. The worker keeps running after that process exits.
-
-```console
-$ pikpak --json download --detach --path "/My Pack/Movies" --output /data
-{"command":"download","ok":true,"result":{"job":{…,"id":"1770000000-123456",…},"log":"/home/me/pikpak/.pikpak/logs/1770000000-123456.log","output":"/data","path":"/My Pack/Movies","started_at":1770000000}}
-```
-
-`result.job.id` is what every later call takes. The job's records live under
-`PIKPAK_STATE_DIR`, by default `.pikpak` beside the `.env` that was loaded (or
-in the working directory when there is none) — so any directory that finds the
-same `.env` finds the same jobs. Before this default, `.pikpak` was created in
-the working directory; jobs started from a subdirectory that way stay in that
-subdirectory's `.pikpak` and are not found from here:
-
-| path | what |
-| --- | --- |
-| `jobs/<id>.json` | the record: state, path, output, pid, timestamps, progress, error |
-| `jobs/<id>.cancel` | created by `jobs cancel`; the worker watches for it |
-| `logs/<id>.log` | everything the worker printed |
+## Background jobs
 
 ```bash
-pikpak --json jobs list                          # {"jobs":[…]}, oldest first
-pikpak --json jobs status <id>                   # {"job":{…}}
-pikpak --json jobs cancel <id>                   # {"cancelled":true,"job":{…}}
-pikpak --json jobs wait <id> --timeout-seconds 600
-```
-
-Each reports `command` as `jobs.list`, `jobs.status`, `jobs.cancel` or
-`jobs.wait` — the same name on success and on failure.
-
-- **States**: `running`, `succeeded`, `failed`, `cancelled`, `lost`. A `running`
-  job whose worker has not beat for ~30s is reported `lost` — never forever
-  running. The worker refreshes `updated_at` every 5s while it is alive, along
-  with the counts so far: `files` (planned; 0 until planning is done),
-  `downloaded`, `failed` and `bytes`. A finished job keeps its final counts,
-  failed or not.
-- **`jobs wait` exits with the outcome**: `0` succeeded, or the same code a
-  synchronous run would have produced (`3` auth, `5` network, …), `9` if it was
-  cancelled, `1` if its worker was lost, `8` if your deadline passed first. The record carries the worker's
-  own `exit_code` for exactly this.
-- **`jobs cancel` is cooperative**: it drops a marker and the worker exits at its
-  next check (within a few seconds), mid-transfer if need be. The partial, under
-  `<output>/.pikpak-parts/`, is left in place, so re-running the same download
-  resumes from the bytes already written. Cancelling a job
-  that already finished changes nothing and reports `"cancelled":false` with its
-  final state.
-- **`jobs list`/`status`/`cancel` need no credentials** — they only read the
-  state directory. That is deliberate: asking what is running must not fail
-  because the token has since rotated away.
-- **`jobs wait` with `--timeout-seconds 0`** (the default) waits indefinitely;
-  give it a value if your runtime has its own deadline.
-
-## Recipes
-
-```bash
-# Is the account reachable? Branch on the exit code, not the text.
-pikpak --json quota || case $? in 3) reauth;; 5) sleep 30;; esac
-
-# What is in a folder?
-pikpak --json ls --path "/My Pack" | jq -r '.result.entries[] | select(.kind=="file") | .id'
-
-# Download a folder, four files at a time.
-pikpak --json download --path "/My Pack/Movies" --output /data -j 4
-
-# Start it in the background, then follow it from anywhere.
-id=$(pikpak --json download --detach --path "/My Pack/Movies" --output /data | jq -r .result.job.id)
+id=$(pikpak --json download --detach --path "/My Pack/Movies" --output /data | jq -r '.result.job.id')
 pikpak --json jobs wait "$id" --timeout-seconds 1800
 ```
+
+The worker outlives the launching command. All `jobs` commands work without
+credentials. Use `result.job.id` for subsequent calls.
+
+- States: `running`, `succeeded`, `failed`, `cancelled`, `lost`.
+- Records include `id`, `state`, `path`, `output`, `jobs`, `pid`, `created_at`,
+  `updated_at`, `files`, `downloaded`, `failed`, `bytes`, `error`, and `exit_code`.
+  Timestamps are Unix seconds; `pid`, `error`, and `exit_code` may be `null`.
+- Heartbeats update every 5s with current counts; `files` is 0 until planning
+  completes. Final counts remain available even on failure. A running job with
+  no heartbeat for about 30s is reported `lost`.
+- `wait` exits with the job's outcome: 0 on success, its failure code otherwise,
+  9 for cancellation, 1 for a lost worker, or 8 if the wait deadline expires.
+  Timeout 0 (default) waits indefinitely; set a deadline for bounded tool calls.
+- Cancellation is cooperative and takes a few seconds. Partials remain under
+  `<output>/.pikpak-parts/` for resumption. Cancelling a finished job returns
+  `cancelled: false` and keeps its final state.
+
+State root: `PIKPAK_STATE_DIR`, else `.pikpak` beside the loaded `.env`, else
+`.pikpak` in the current directory. Records are `jobs/<id>.json`, cancellation
+markers `jobs/<id>.cancel`, and worker logs `logs/<id>.log`. Older jobs stored
+under a subdirectory's `.pikpak` remain there; point `PIKPAK_STATE_DIR` at it.
