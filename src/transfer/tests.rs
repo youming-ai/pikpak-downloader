@@ -299,6 +299,52 @@ fn test_client() -> crate::Client {
 }
 
 #[tokio::test]
+async fn download_attempt_rejects_oversized_body() {
+    let addr = spawn_raw_server(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nabcdef".to_vec(),
+    )
+    .await;
+    let dir = std::env::temp_dir().join(format!("pikpak-long-body-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let result = test_client()
+        .attempt(
+            &format!("http://{addr}/f"),
+            4,
+            &dir.join("f.part"),
+            &|_, _| {},
+        )
+        .await;
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(matches!(
+        result,
+        Err(super::Attempt::Fail(crate::Error::Protocol(_)))
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_partial_removal_preserves_the_old_identity() {
+    let dir = std::env::temp_dir().join(format!("pikpak-part-removal-{}", std::process::id()));
+    let part = dir.join("f.part");
+    // A nonempty directory cannot be removed with remove_file, regardless of
+    // whether the tests run as root. Its nonzero size enters the stale-part path.
+    std::fs::create_dir_all(&part).unwrap();
+    std::fs::write(part.join("old"), b"old content").unwrap();
+    let part_len = super::part_size(&part).await;
+    let old = br#"{"id":"old","size":6,"modified_time":null}"#;
+    let meta = super::identity_path(&part);
+    std::fs::write(&meta, old).unwrap();
+    let expected = super::PartIdentity::of(&file_info("new", "f", 6), 6);
+
+    let result = super::prepare_part(&part, &expected).await;
+    let recorded = std::fs::read(&meta).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(part_len > 0, "the stale-part path needs a nonempty part");
+    assert!(matches!(result, Err(crate::Error::Io { .. })));
+    assert_eq!(recorded, old, "never label old bytes with a new identity");
+}
+
+#[tokio::test]
 async fn download_attempt_restarts_when_part_is_oversized() {
     // Remote file is 4 bytes but the stale part holds 6. The 416 handler
     // must discard the part rather than declare the download complete:

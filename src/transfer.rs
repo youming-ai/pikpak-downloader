@@ -135,7 +135,11 @@ async fn prepare_part(part: &Path, expected: &PartIdentity) -> Result<()> {
                 part = %part.display(),
                 "partial file does not belong to this remote file; restarting from scratch"
             );
-            let _ = tokio::fs::remove_file(part).await;
+            // The old bytes must be gone before the sidecar names a new
+            // identity, or a later resume would append to someone else's file.
+            tokio::fs::remove_file(part)
+                .await
+                .map_err(io("failed to discard stale partial download"))?;
             let _ = tokio::fs::remove_file(&meta_path).await;
         }
     }
@@ -230,8 +234,8 @@ impl Client {
             .map_err(io("failed to finalize output file"))?;
         let _ = tokio::fs::remove_file(identity_path(part)).await;
 
-        // Report what actually landed rather than what was advertised: a resumed
-        // file can differ from the size the API claimed.
+        // Report what actually landed rather than what was advertised: a file
+        // listed with no size (zero) has no expected length to match.
         Ok(tokio::fs::metadata(dest)
             .await
             .map(|meta| meta.len())
@@ -342,6 +346,13 @@ impl Client {
                 received: downloaded,
                 expected: total,
             }));
+        }
+        // Extra bytes mean the server sent something other than the listed
+        // file; finalizing it would replace a good copy with a wrong one.
+        if total > 0 && downloaded > total {
+            return Err(Attempt::Fail(Error::Protocol(format!(
+                "received {downloaded} bytes, expected {total}"
+            ))));
         }
         Ok(())
     }

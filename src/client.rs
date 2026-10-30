@@ -331,10 +331,22 @@ impl Client {
 
         loop {
             let access = self.tokens.access_token().await?;
-            let captcha = self
-                .captcha
-                .token(action, expired_captcha.as_deref())
-                .await?;
+            let captcha = match self.captcha.token(action, expired_captcha.as_deref()).await {
+                Ok(captcha) => captcha,
+                // Captcha init carries the same bearer token, so a 401 there
+                // is the access token being rejected early: one shared retry.
+                Err(Error::Api { status: 401, .. }) if !auth_retried => {
+                    auth_retried = true;
+                    self.reject_access(action, "captcha init", &access).await;
+                    continue;
+                }
+                Err(Error::Api { status, message })
+                    if crate::auth::is_grant_rejection(&message) =>
+                {
+                    return Err(crate::auth::explain_auth_failure(status, &message));
+                }
+                Err(e) => return Err(e),
+            };
 
             let send = self
                 .http
@@ -376,12 +388,8 @@ impl Client {
             }
 
             if status == reqwest::StatusCode::UNAUTHORIZED && !auth_retried {
-                tracing::debug!(
-                    action = %action,
-                    "access token rejected, invalidating and retrying"
-                );
                 auth_retried = true;
-                self.tokens.invalidate_if_current(&access).await;
+                self.reject_access(action, "drive", &access).await;
                 continue;
             }
 
@@ -417,6 +425,17 @@ impl Client {
                 message: text,
             });
         }
+    }
+
+    /// Drop a rejected access token so the retry exchanges the refresh token
+    /// for a new one.
+    async fn reject_access(&self, action: &str, rejected_by: &str, access: &str) {
+        tracing::debug!(
+            action = %action,
+            rejected_by,
+            "access token rejected, invalidating and retrying"
+        );
+        self.tokens.invalidate_if_current(access).await;
     }
 
     /// Resolve a Unix-style path (e.g. `"/My Pack/video.mp4"`) to its entry,

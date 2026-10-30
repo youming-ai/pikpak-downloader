@@ -272,10 +272,20 @@ impl JobStore {
     /// Read one record as stored. The worker reads this way: it is the live
     /// worker, so it must never mistake its own record for a lost one.
     fn read(&self, id: &str) -> Result<JobRecord> {
+        // An ID that could not name a record is simply no job, not a
+        // filesystem failure to reach it.
+        let missing = || crate::output::Missing(format!("no job {id}"));
+        if !is_job_id(id) {
+            return Err(missing().into());
+        }
         let path = self.record_path(id);
-        let body =
-            std::fs::read(&path).map_err(|_| crate::output::Missing(format!("no job {id}")))?;
-        serde_json::from_slice(&body).with_context(|| format!("failed to read {}", path.display()))
+        match std::fs::read(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(missing().into()),
+            read => read
+                .map_err(anyhow::Error::from)
+                .and_then(|body| Ok(serde_json::from_slice(&body)?))
+                .with_context(|| format!("failed to read {}", path.display())),
+        }
     }
 
     /// The worker's heartbeat: refresh `updated_at`, record its pid and the
@@ -289,6 +299,23 @@ impl JobStore {
             self.save(&mut record)?;
         }
         Ok(())
+    }
+
+    /// Record the worker's outcome, with what the run got done.
+    fn finish(
+        &self,
+        id: &str,
+        tally: &Tally,
+        state: JobState,
+        error: Option<String>,
+        exit_code: u8,
+    ) -> Result<()> {
+        let mut record = self.read(id)?;
+        record.count(tally);
+        record.state = state;
+        record.error = error;
+        record.exit_code = Some(exit_code);
+        self.save(&mut record)
     }
 
     /// Every record, oldest first. Unreadable records are skipped rather than
@@ -365,6 +392,15 @@ impl JobStore {
             ));
         }
     }
+}
+
+/// Could this name a record? Anything else — a separator, a dot, an overlong
+/// name — would reach the filesystem as something other than one job's file.
+fn is_job_id(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// A unique, sortable id: epoch seconds plus microseconds.
@@ -708,12 +744,13 @@ pub(crate) async fn run_worker(
             };
             loop {
                 if store.cancel_requested(&store_id) {
-                    if let Ok(mut record) = store.read(&store_id) {
-                        record.state = JobState::Cancelled;
-                        record.error = Some("cancelled on request".to_string());
-                        record.exit_code = Some(crate::output::EXIT_CANCELLED);
-                        let _ = store.save(&mut record);
-                    }
+                    let _ = store.finish(
+                        &store_id,
+                        &tally,
+                        JobState::Cancelled,
+                        Some("cancelled on request".to_string()),
+                        crate::output::EXIT_CANCELLED,
+                    );
                     // The part file stays for a later resume; nothing else here
                     // is worth waiting for.
                     std::process::exit(crate::output::EXIT_OK.into());
@@ -737,22 +774,26 @@ pub(crate) async fn run_worker(
     // A cancel that arrived after the transfer finished changes nothing.
     store.clear_cancel(&id);
 
-    let mut record = store.read(&id)?;
     // Failed or not, the record keeps what the run got done.
-    record.count(&tally);
     match outcome {
         Ok(summary) => {
-            record.state = JobState::Succeeded;
-            record.error = None;
-            record.exit_code = Some(crate::output::EXIT_OK);
-            store.save(&mut record)?;
+            store.finish(
+                &id,
+                &tally,
+                JobState::Succeeded,
+                None,
+                crate::output::EXIT_OK,
+            )?;
             Ok(summary)
         }
         Err(error) => {
-            record.state = JobState::Failed;
-            record.error = Some(format!("{error:#}"));
-            record.exit_code = Some(crate::output::exit_code_for(&error).0);
-            let _ = store.save(&mut record);
+            let _ = store.finish(
+                &id,
+                &tally,
+                JobState::Failed,
+                Some(format!("{error:#}")),
+                crate::output::exit_code_for(&error).0,
+            );
             Err(error)
         }
     }

@@ -188,6 +188,34 @@ fn an_unknown_job_is_a_not_found_with_the_matching_exit_code() {
 }
 
 #[test]
+fn an_unreadable_job_reports_io_instead_of_not_found() {
+    let state = state_dir("unreadable");
+    std::fs::create_dir(state.join("jobs/existing.json")).unwrap();
+    let (code, stdout, stderr) = run(&state, &["--json", "jobs", "status", "existing"]);
+    let _ = std::fs::remove_dir_all(&state);
+    assert_eq!(code, 7, "stderr: {stderr}");
+    let doc = document(&stdout);
+    assert_eq!(doc["error"]["kind"], "io");
+    assert_eq!(doc["error"]["exit_code"], 7);
+}
+
+#[test]
+fn an_id_that_cannot_name_a_record_is_not_found() {
+    let state = state_dir("bad-id");
+    std::fs::write(state.join("jobs/x.json"), b"{}").unwrap();
+    let long = "9".repeat(300);
+    let runs: Vec<_> = ["x.json/y", "../x", long.as_str()]
+        .into_iter()
+        .map(|id| (id, run(&state, &["--json", "jobs", "status", id])))
+        .collect();
+    let _ = std::fs::remove_dir_all(&state);
+    for (id, (code, stdout, stderr)) in runs {
+        assert_eq!(code, 4, "{id}: stderr: {stderr}");
+        assert_eq!(document(&stdout)["error"]["kind"], "not_found", "{id}");
+    }
+}
+
+#[test]
 fn cancelling_writes_the_marker_the_worker_watches() {
     let state = state_dir("cancel");
     write_record(&state, "1-000001", "running", now());

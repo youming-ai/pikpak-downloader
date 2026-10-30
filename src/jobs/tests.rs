@@ -143,6 +143,41 @@ fn cancel_requests_are_recorded_and_noticed() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[test]
+fn cancellation_keeps_counts_completed_since_the_last_heartbeat() {
+    let root = temp_state("cancel-counts");
+    let store = JobStore::open(&root).unwrap();
+    let id = "1-000001";
+    store
+        .create(&record(id, JobState::Running, now_secs()))
+        .unwrap();
+    let tally = Tally::default();
+    store.beat(id, &tally).unwrap();
+    tally.files.store(5, Ordering::Relaxed);
+    tally.downloaded.store(2, Ordering::Relaxed);
+    tally.failed.store(1, Ordering::Relaxed);
+    tally.bytes.store(4096, Ordering::Relaxed);
+    store.request_cancel(id).unwrap();
+    store
+        .finish(
+            id,
+            &tally,
+            JobState::Cancelled,
+            Some("cancelled on request".to_string()),
+            crate::output::EXIT_CANCELLED,
+        )
+        .unwrap();
+
+    let job = store.get(id).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(job.state, JobState::Cancelled);
+    assert_eq!(job.exit_code, Some(crate::output::EXIT_CANCELLED));
+    assert_eq!(
+        (job.files, job.downloaded, job.failed, job.bytes),
+        (5, 2, 1, 4096)
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn the_state_directory_is_private() {

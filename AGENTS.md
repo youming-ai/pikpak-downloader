@@ -61,6 +61,7 @@ Job commands report `command` as `jobs.list`, `jobs.status`, `jobs.cancel`, or
   `mime_type` are `null`.
 - Downloads skip non-empty local files matching the listed size and count them
   in `downloaded`. Empty files are fetched again: zero can mean an unknown size.
+  A body longer than the listed size counts as a failed file and is not retried.
 - Failed downloads emit only the failure document, with counts in `error.message`.
   Unknown entry kinds count as failed files; other entries still download.
 
@@ -82,7 +83,8 @@ pikpak --json jobs wait "$id" --timeout-seconds 1800
 ```
 
 The worker outlives the launching command. All `jobs` commands work without
-credentials. Use `result.job.id` for subsequent calls.
+credentials. Use `result.job.id` for subsequent calls. `jobs list` skips an
+unreadable record; `status`, `cancel`, and `wait` report it as `io` (exit 7).
 
 - States: `running`, `succeeded`, `failed`, `cancelled`, `lost`.
 - Records include `id`, `state`, `path`, `output`, `jobs`, `pid`, `created_at`,

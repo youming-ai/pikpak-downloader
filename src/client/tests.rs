@@ -28,6 +28,7 @@ struct MockState {
     targets: Vec<String>,
     auth_calls: usize,
     captcha_calls: usize,
+    captcha_replies: VecDeque<(u16, String)>,
 }
 
 /// Scripted stand-in for the PikPak stack: auth, captcha init and drive.
@@ -61,11 +62,19 @@ impl Mock {
                             st.targets.push(request.target.clone());
                             if request.target.starts_with("/v1/auth/token") {
                                 st.auth_calls += 1;
-                                (200, crate::test_http::TOKEN_JSON.to_string())
+                                (
+                                    200,
+                                    crate::test_http::TOKEN_JSON.replace(
+                                        "\"access\"",
+                                        &format!("\"access-{}\"", st.auth_calls),
+                                    ),
+                                )
                             } else if request.target.starts_with("/v1/shield/captcha/init") {
                                 st.captcha_calls += 1;
                                 let token = format!("captcha-{}", st.captcha_calls);
-                                (200, format!(r#"{{"captcha_token":"{token}"}}"#))
+                                st.captcha_replies.pop_front().unwrap_or_else(|| {
+                                    (200, format!(r#"{{"captcha_token":"{token}"}}"#))
+                                })
                             } else {
                                 match st.drive.len() {
                                     0 => (200, "{}".to_string()),
@@ -111,6 +120,39 @@ impl Mock {
     fn captcha_calls(&self) -> usize {
         self.state.lock().unwrap().captcha_calls
     }
+}
+
+#[tokio::test]
+async fn captcha_401_refreshes_a_previously_cached_access_token() {
+    let mock = Mock::start(vec![
+        (200, r#"{"quota":{"limit":"100","usage":"0"}}"#.into()),
+        (200, page_json(&[], None)),
+    ])
+    .await;
+    let client = mock.client();
+    client.quota().await.unwrap();
+    mock.state
+        .lock()
+        .unwrap()
+        .captcha_replies
+        .push_back((401, "expired".into()));
+
+    assert!(client.list_folder("").await.unwrap().is_empty());
+    assert_eq!(mock.auth_calls(), 2);
+    assert_eq!(mock.captcha_calls(), 3);
+    assert_eq!(mock.drive_targets().len(), 2);
+}
+
+#[tokio::test]
+async fn captcha_401_retries_authentication_only_once() {
+    let mock = Mock::start(vec![]).await;
+    mock.state.lock().unwrap().captcha_replies =
+        vec![(401, "expired".into()), (401, "still expired".into())].into();
+    let result = mock.client().list_folder("").await;
+    assert!(matches!(result, Err(Error::Api { status: 401, .. })));
+    assert_eq!(mock.auth_calls(), 2);
+    assert_eq!(mock.captcha_calls(), 2);
+    assert!(mock.drive_targets().is_empty());
 }
 
 #[tokio::test]
@@ -442,6 +484,19 @@ async fn a_rejected_token_from_a_drive_call_explains_itself() {
     let text = err.to_string();
     assert!(text.contains("single-use"), "{text}");
     assert!(text.contains(".env"), "{text}");
+}
+
+#[tokio::test]
+async fn a_rejected_token_from_captcha_init_explains_itself() {
+    let body = r#"{"error":"invalid_grant","error_code":4126}"#;
+    let mock = Mock::start(vec![]).await;
+    mock.state.lock().unwrap().captcha_replies = vec![(400, body.to_string())].into();
+
+    let err = mock.client().list_folder("").await.unwrap_err();
+
+    assert!(matches!(err, Error::Auth(_)), "{err:?}");
+    assert!(err.to_string().contains("single-use"), "{err}");
+    assert!(mock.drive_targets().is_empty());
 }
 
 #[test]
